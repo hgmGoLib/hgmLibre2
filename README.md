@@ -4,9 +4,13 @@ A self-contained native [RE2](https://github.com/google/re2) regular-expression
 library for Go. It vendors RE2's C++ source and exposes it through cgo, so it
 needs **no abseil, no CMake, and downloads nothing at build time**.
 
-The public API mirrors the standard library `regexp` package, so a
-`*hgmLibre2.Regexp` is a drop-in replacement for `*regexp.Regexp` for the
-supported methods.
+The public API mirrors the standard library `regexp` package for the
+**listed string-only methods** (see [Supported API](#supported-api)), so a
+`*hgmLibre2.Regexp` can stand in for `*regexp.Regexp` as long as you only use
+those methods. It is *not* a full drop-in: the `bytes`/`io.Reader` variants and
+`Split`, `SubexpIndex`, `LiteralPrefix`, `Longest`, marshal/unmarshal, etc. are
+not provided, and a few edge-case semantics differ from stdlib — see
+[Caveats](#caveats).
 
 ## Why
 
@@ -64,7 +68,9 @@ type R = hgmLibre2.Regexp
 
 ## Supported API
 
-Same names and semantics as `regexp` (leftmost-longest RE2 matching, UTF-8):
+Same names and signatures as `regexp`. Matching is **leftmost-first**, the same
+as `regexp.Compile` (RE2's default Perl mode), *not* leftmost-longest — e.g.
+`(a|aa)` on `"aa"` yields `"a"`, just like stdlib. UTF-8 input.
 
 - `Compile`, `MustCompile`
 - `String`, `NumSubexp`, `SubexpNames`
@@ -72,14 +78,45 @@ Same names and semantics as `regexp` (leftmost-longest RE2 matching, UTF-8):
 - `FindString`, `FindStringIndex`, `FindStringSubmatch`, `FindStringSubmatchIndex`
 - `FindAllString`, `FindAllStringIndex`, `FindAllStringSubmatch`, `FindAllStringSubmatchIndex`
 - `ReplaceAllString`, `ReplaceAllStringFunc` (with `$1` / `${name}` / `$$` expansion)
+- `FreeC` — *not* in stdlib; see [Resource management](#resource-management)
 
 The test suite (`hgmLibre2_test.go`) cross-checks every method against the
 standard library `regexp` on a shared corpus of patterns and inputs; results
-must be identical.
+are identical on that corpus. `review_verify_test.go` additionally pins the
+known [Caveats](#caveats) below as differential tests.
 
 ```sh
 go test ./...
 ```
+
+## Caveats
+
+It runs the **native RE2 engine**, so a few corners differ from Go's
+`regexp` (which is a from-scratch reimplementation). These are intentional and
+covered by `review_verify_test.go`:
+
+- **Invalid UTF-8 input.** stdlib treats each invalid byte as one-byte
+  `U+FFFD` and lets `.` match it; native RE2 only matches whole valid runes, so
+  on e.g. `[]byte{0xff,'a',0xfe}` the pattern `.` finds just the `a`. If you
+  match on possibly-invalid UTF-8 and need stdlib's behavior, use stdlib.
+- **`\C` is accepted** (RE2 "any byte"); stdlib `regexp` rejects `\C` at
+  compile time. Patterns valid here may be rejected by stdlib and vice-versa
+  for a handful of RE2-only / stdlib-only escapes.
+- **Capture group names** of any length are returned in full (no truncation);
+  duplicate named groups are accepted, same as stdlib.
+
+## Resource management
+
+A `Regexp` holds a native RE2 object freed automatically by a finalizer, so for
+ordinary use you do nothing. When you compile a large number of patterns
+dynamically and want the native memory reclaimed promptly instead of waiting for
+GC, call `FreeC()` to release the C++ object immediately.
+
+`FreeC` is deliberately minimal and **unguarded**: it is not safe for concurrent
+use, and calling any method (or `FreeC` again *with a live match in flight*)
+after the object is freed is a use-after-free. `FreeC` itself is idempotent
+(a second call is a no-op). If you don't need prompt reclamation, don't call it
+and let the finalizer handle cleanup.
 
 ## Vendored RE2
 
