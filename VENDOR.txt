@@ -1,0 +1,20 @@
+hgmLibre2 — vendored RE2 source
+========================================
+来源 : https://github.com/google/re2  tag 2023-03-01 (abseil 之前最后一版(社区常用的避开 Abseil 版本), 纯 C++11, 自包含 util/)
+许可 : BSD-3-Clause, 见 RE2_LICENSE.txt
+取法 : git archive 2023-03-01 (一次性 vendor, 编译期不再下载远程源)
+
+布局
+----
+re2_*.cc / util_*.cc   : RE2 的 .cc (re2/*.cc + util/{rune,strutil}.cc), 拍平到本目录
+                         (cgo 只编 package 目录下的 .cc, 不递归子目录, 故拍平).
+                         已剔除: testing/ fuzzing/ util/pcre.* util/benchmark.* util/fuzz.cc util/test.*
+internal_include/re2/  : re2/*.h
+internal_include/util/ : util/*.h (logging/mutex/strutil/utf/util/flags/mix/malloc_counter)
+cre2.h / cre2.cpp      : 我们自己写的极小 C 包装 (不算改 RE2)
+hgmLibre2.go           : cgo Go API (Compile/MustCompile + Find/Replace 系列)
+
+升级 RE2 版本
+-------------
+重新 git archive 新 tag, 覆盖 re2_*.cc / util_*.cc / internal_include/**. 注意 2023-03 起 RE2 依赖
+abseil, 那之后不能再这样直接 cgo (会缺 absl/*), 要回到 cmake 方案. 故本方案钉死在 2023-03-01.
