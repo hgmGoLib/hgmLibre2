@@ -1,6 +1,7 @@
 // cre2.cpp — cre2.h 的实现, 直接调 vendored RE2 (2023-03-01, 无 abseil).
 #include "cre2.h"
 #include "re2/re2.h"
+#include <cstdlib>
 #include <map>
 #include <string>
 #include <vector>
@@ -68,6 +69,104 @@ int cre2_match_at(const cre2_re *h, const char *text, int textlen, int startpos,
 			match[2 * i + 1] = b + (int)sub[i].size();
 		}
 	}
+	return 1;
+}
+
+// utf8WidthGo 复刻 Go utf8.DecodeRuneInString 返回的【宽度】, 仅供空匹配推进:
+//   空串=0; 合法 rune=其字节数(1..4); 非法前导/截断/非法后续字节=1 (Go 对非法编码返回
+//   RuneError 且宽度 1). 不另判 overlong/surrogate/超范围 —— 那些只在【非法 UTF-8】上与 Go
+//   有别, 而本库对非法 UTF-8 的匹配语义本就按原生 RE2 (见 README caveats), 此处合法输入精确一致.
+static int utf8WidthGo(const char *s, int n) {
+	if (n <= 0) {
+		return 0;
+	}
+	unsigned char b0 = (unsigned char)s[0];
+	if (b0 < 0x80) {
+		return 1;
+	}
+	int w;
+	if ((b0 & 0xE0) == 0xC0) {
+		w = 2;
+	} else if ((b0 & 0xF0) == 0xE0) {
+		w = 3;
+	} else if ((b0 & 0xF8) == 0xF0) {
+		w = 4;
+	} else {
+		return 1; // 非法前导字节
+	}
+	if (w > n) {
+		return 1; // 截断
+	}
+	for (int k = 1; k < w; k++) {
+		if (((unsigned char)s[k] & 0xC0) != 0x80) {
+			return 1; // 非法后续字节
+		}
+	}
+	return w;
+}
+
+int cre2_match_all(const cre2_re *h, const char *text, int textlen, int nmatch, int maxn, int **out, int *nmatches) {
+	*out = NULL;
+	*nmatches = 0;
+	const char *base = text ? text : "";
+	re2::StringPiece full(base, textlen);
+	std::vector<re2::StringPiece> sub(nmatch);
+	std::vector<int> acc; // flat: 每处匹配 2*nmatch 个 int
+	int end = textlen;
+	int count = 0;
+	int prevMatchEnd = -1;
+	// 逐处匹配的循环整体留在 C 内 (原 Go allMatches 每处一次 cgo, 此处零 cgo).
+	// pos/i/prevMatchEnd 推进与 stdlib regexp.allMatches 逐字一致.
+	for (int pos = 0; (maxn < 0 || count < maxn) && pos <= end;) {
+		bool ok = h->re->Match(full, (size_t)pos, (size_t)textlen, RE2::UNANCHORED, sub.data(), nmatch);
+		if (!ok) {
+			break;
+		}
+		// group0 在成功匹配时必参与, data() 非 NULL.
+		int m0 = (int)(sub[0].data() - base);
+		int m1 = m0 + (int)sub[0].size();
+		bool accept = true;
+		if (m1 == m0) {
+			// 空匹配: 紧贴上一处匹配末尾的空匹配丢弃, 避免重复; 按 rune 宽度推进 pos.
+			if (m0 == prevMatchEnd) {
+				accept = false;
+			}
+			int width = utf8WidthGo(base + pos, end - pos);
+			if (width > 0) {
+				pos += width;
+			} else {
+				pos = end + 1;
+			}
+		} else {
+			pos = m1;
+		}
+		prevMatchEnd = m1;
+		if (accept) {
+			for (int i = 0; i < nmatch; i++) {
+				if (sub[i].data() == nullptr) {
+					acc.push_back(-1);
+					acc.push_back(-1);
+				} else {
+					int b = (int)(sub[i].data() - base);
+					acc.push_back(b);
+					acc.push_back(b + (int)sub[i].size());
+				}
+			}
+			count++;
+		}
+	}
+	if (count == 0) {
+		return 0;
+	}
+	int *buf = (int *)malloc(sizeof(int) * acc.size());
+	if (buf == NULL) {
+		return -1;
+	}
+	for (size_t i = 0; i < acc.size(); i++) {
+		buf[i] = acc[i];
+	}
+	*out = buf;
+	*nmatches = count;
 	return 1;
 }
 

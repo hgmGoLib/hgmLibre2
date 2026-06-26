@@ -4,12 +4,14 @@
 // 相比 go-re2 的 wazero 后端: 原生 cgo 路径不实例化 wazero runtime, 也不做 stdio 句柄探测,
 // 因此在无 std 句柄的环境 (如 Windows SCM service) 也能正常用; 同时是单文件静态链接.
 //
-// API 的方法签名与 stdlib regexp 完全一致 (Compile/MustCompile + Find/Replace 系列),
-// 可作为 `type R = hgmLibre2.Regexp` 直接替换 *regexp.Regexp. 语义对齐 stdlib (RE2 leftmost).
+// API 的方法签名与 stdlib regexp 的 string 系方法一致 (Compile/MustCompile + Find/Replace 系列),
+// 可作为 `type R = hgmLibre2.Regexp` 替换 *regexp.Regexp 上这批方法. 匹配选择是 leftmost-first
+// (同 regexp.Compile, 非 leftmost-longest). 注意它走原生 RE2 引擎, 在少数边角与 stdlib 不同:
+// 非法 UTF-8 输入上 . 的匹配、\C(任意字节)等按 RE2 语义而非 stdlib —— 详见 README 的 caveats.
 package hgmLibre2
 
 /*
-#cgo CXXFLAGS: -std=c++11 -O2 -DNDEBUG -I${SRCDIR}/internal_include
+#cgo CXXFLAGS: -std=c++11 -O2 -DNDEBUG -fno-exceptions -fno-rtti -I${SRCDIR}/internal_include
 #include <stdlib.h>
 #include "cre2.h"
 */
@@ -25,7 +27,12 @@ import (
 	"unsafe"
 )
 
-// Regexp 持有一个原生 RE2 句柄. 用 finalizer 释放 (与 go-re2 一致, 不强制 Close).
+// maxCInt 是 C.int 能表示的最大正值. Go 侧把 len/pos cast 成 C.int 前据此守卫,
+// 避免超 2GiB 字符串溢出成错误偏移甚至越界 (C ABI 用 int 传长度/偏移).
+const maxCInt = 1<<31 - 1
+
+// Regexp 持有一个原生 RE2 句柄. 默认靠 finalizer 释放 (不强制 Close);
+// 大量动态编译 pattern 想及时回收 native 内存时可显式调 FreeC.
 type Regexp struct {
 	h           *C.cre2_re
 	expr        string   // 源 pattern, String() 用
@@ -45,6 +52,9 @@ func strBytePtr(s string) *C.char {
 
 // Compile 编译一个 RE2 正则. 编译错误返回 error (不 panic).
 func Compile(pattern string) (*Regexp, error) {
+	if len(pattern) > maxCInt {
+		return nil, errors.New("re2native: pattern too large (>2GiB)")
+	}
 	p := strBytePtr(pattern)
 	h := C.cre2_new(p, C.int(len(pattern)))
 	runtime.KeepAlive(pattern)
@@ -60,17 +70,40 @@ func Compile(pattern string) (*Regexp, error) {
 	names := make([]string, ng+1)
 	var nbuf [256]C.char
 	for i := 1; i <= ng; i++ {
+		// cre2_group_name 回填 buf 并返回名字真实长度. 名字超过栈 buffer 时按真实长度
+		// 精确分配再取一次, 不截断 (超长命名捕获组的 SubexpNames/${name} 才不会失真).
 		n := int(C.cre2_group_name(h, C.int(i), &nbuf[0], C.int(len(nbuf))))
-		if n > 0 {
-			if n > len(nbuf) {
-				n = len(nbuf)
-			}
+		switch {
+		case n <= 0:
+			// 无名组, 留 ""
+		case n <= len(nbuf):
 			names[i] = C.GoStringN(&nbuf[0], C.int(n))
+		default:
+			big := make([]C.char, n)
+			n2 := int(C.cre2_group_name(h, C.int(i), &big[0], C.int(n)))
+			if n2 > n {
+				n2 = n
+			}
+			names[i] = C.GoStringN(&big[0], C.int(n2))
 		}
 	}
 	re := &Regexp{h: h, expr: pattern, numSubexp: ng, subexpNames: names}
 	runtime.SetFinalizer(re, func(r *Regexp) { C.cre2_free(r.h) })
 	return re, nil
+}
+
+// FreeC 立即释放内部的原生 RE2(C++)资源并清掉 finalizer. 用于大量动态编译 pattern、
+// 想及时回收 native 内存而不等 GC 的场景. 释放后该 Regexp 的所有方法不可再用.
+//
+// 注意(故意不做防护, 由调用方保证): 非线程安全, 不可与其它方法/另一个 FreeC 并发调用;
+// 释放后再调用任何方法是 use-after-free, 行为未定义. 不需要及时回收就别调, 交给 finalizer 兜底即可.
+func (re *Regexp) FreeC() {
+	if re.h == nil {
+		return
+	}
+	C.cre2_free(re.h)
+	re.h = nil
+	runtime.SetFinalizer(re, nil)
 }
 
 // MustCompile 同 Compile, 失败 panic. 对齐 go-re2/stdlib MustCompile.
@@ -94,6 +127,9 @@ func (re *Regexp) SubexpNames() []string { return re.subexpNames }
 // findFrom 返回从 pos 起【非锚定】下一处匹配的子组区间 (长度 2*(numSubexp+1) 的 [start,end) 对,
 // 未参与的组为 -1,-1), 无匹配返回 nil. 等价 stdlib doExecute(pos).
 func (re *Regexp) findFrom(s string, pos int) []int {
+	if len(s) > maxCInt { // 超 C.int 的输入直接当无匹配, 不让 len/pos 溢出成错偏移
+		return nil
+	}
 	nmatch := re.numSubexp + 1
 	cbuf := make([]C.int, 2*nmatch)
 	tp := strBytePtr(s)
@@ -123,6 +159,9 @@ func (re *Regexp) subStrings(s string, m []int) []string {
 
 // MatchString 报告 s 是否含任意匹配 (非锚定). 走快路径, 不取子组.
 func (re *Regexp) MatchString(s string) bool {
+	if len(s) > maxCInt {
+		return false
+	}
 	p := strBytePtr(s)
 	ok := C.cre2_partial_match(re.h, p, C.int(len(s))) != 0
 	runtime.KeepAlive(s)
@@ -162,35 +201,39 @@ func (re *Regexp) FindStringSubmatchIndex(s string) []int {
 	return re.findFrom(s, 0)
 }
 
-// allMatches 遍历所有匹配, 逐个回调 deliver (移植 stdlib regexp.allMatches 的空匹配推进逻辑).
+// allMatches 遍历所有匹配, 逐个回调 deliver (空匹配推进逻辑同 stdlib regexp.allMatches).
+//
+// 整个「逐处匹配」循环下沉到 C 的 cre2_match_all 里一次跑完: 原实现每处匹配一次
+// findFrom→cre2_match_at(每处一次 cgo 跨界), 大正文多命中时 cgo 调用次数 = 匹配数; 现压成
+// 单次 cgo (外加一次 C.free). 推进/去重语义与原 Go 循环逐字一致, 由库内对拍测试守.
 func (re *Regexp) allMatches(s string, n int, deliver func([]int)) {
-	end := len(s)
-	for pos, i, prevMatchEnd := 0, 0, -1; i < n && pos <= end; {
-		m := re.findFrom(s, pos)
-		if m == nil {
-			break
-		}
-		accept := true
-		if m[1] == m[0] {
-			// 空匹配: 紧贴上一处匹配末尾的空匹配丢弃, 避免重复.
-			if m[0] == prevMatchEnd {
-				accept = false
-			}
-			_, width := utf8.DecodeRuneInString(s[pos:])
-			if width > 0 {
-				pos += width
-			} else {
-				pos = end + 1
-			}
-		} else {
-			pos = m[1]
-		}
-		prevMatchEnd = m[1]
-		if accept {
-			deliver(m)
-			i++
-		}
+	if len(s) > maxCInt { // 超 C.int 的输入直接当无匹配, 不让 len/pos 溢出成错偏移
+		return
 	}
+	nmatch := re.numSubexp + 1
+	tp := strBytePtr(s)
+	var out *C.int
+	var cnt C.int
+	rc := C.cre2_match_all(re.h, tp, C.int(len(s)), C.int(nmatch), C.int(n), &out, &cnt)
+	runtime.KeepAlive(s)
+	runtime.KeepAlive(re)
+	if rc <= 0 || out == nil || cnt == 0 {
+		return // 无匹配 (rc==0) 或 malloc 失败 (rc<0): 当作无匹配, 同原循环 break.
+	}
+	count := int(cnt)
+	per := 2 * nmatch
+	flat := unsafe.Slice(out, count*per)
+	for k := 0; k < count; k++ {
+		// 每处分配独立 slice 交给 deliver (与原 findFrom 每次返回新 slice 的契约一致,
+		// 避免 deliver 留存切片时被后续覆盖).
+		m := make([]int, per)
+		baseIdx := k * per
+		for j := 0; j < per; j++ {
+			m[j] = int(flat[baseIdx+j])
+		}
+		deliver(m)
+	}
+	C.free(unsafe.Pointer(out))
 }
 
 // FindAllString 返回前 n 个匹配文本 (n<0 = 全部), 无匹配返回 nil.
