@@ -201,35 +201,39 @@ func (re *Regexp) FindStringSubmatchIndex(s string) []int {
 	return re.findFrom(s, 0)
 }
 
-// allMatches 遍历所有匹配, 逐个回调 deliver (移植 stdlib regexp.allMatches 的空匹配推进逻辑).
+// allMatches 遍历所有匹配, 逐个回调 deliver (空匹配推进逻辑同 stdlib regexp.allMatches).
+//
+// 整个「逐处匹配」循环下沉到 C 的 cre2_match_all 里一次跑完: 原实现每处匹配一次
+// findFrom→cre2_match_at(每处一次 cgo 跨界), 大正文多命中时 cgo 调用次数 = 匹配数; 现压成
+// 单次 cgo (外加一次 C.free). 推进/去重语义与原 Go 循环逐字一致, 由库内对拍测试守.
 func (re *Regexp) allMatches(s string, n int, deliver func([]int)) {
-	end := len(s)
-	for pos, i, prevMatchEnd := 0, 0, -1; i < n && pos <= end; {
-		m := re.findFrom(s, pos)
-		if m == nil {
-			break
-		}
-		accept := true
-		if m[1] == m[0] {
-			// 空匹配: 紧贴上一处匹配末尾的空匹配丢弃, 避免重复.
-			if m[0] == prevMatchEnd {
-				accept = false
-			}
-			_, width := utf8.DecodeRuneInString(s[pos:])
-			if width > 0 {
-				pos += width
-			} else {
-				pos = end + 1
-			}
-		} else {
-			pos = m[1]
-		}
-		prevMatchEnd = m[1]
-		if accept {
-			deliver(m)
-			i++
-		}
+	if len(s) > maxCInt { // 超 C.int 的输入直接当无匹配, 不让 len/pos 溢出成错偏移
+		return
 	}
+	nmatch := re.numSubexp + 1
+	tp := strBytePtr(s)
+	var out *C.int
+	var cnt C.int
+	rc := C.cre2_match_all(re.h, tp, C.int(len(s)), C.int(nmatch), C.int(n), &out, &cnt)
+	runtime.KeepAlive(s)
+	runtime.KeepAlive(re)
+	if rc <= 0 || out == nil || cnt == 0 {
+		return // 无匹配 (rc==0) 或 malloc 失败 (rc<0): 当作无匹配, 同原循环 break.
+	}
+	count := int(cnt)
+	per := 2 * nmatch
+	flat := unsafe.Slice(out, count*per)
+	for k := 0; k < count; k++ {
+		// 每处分配独立 slice 交给 deliver (与原 findFrom 每次返回新 slice 的契约一致,
+		// 避免 deliver 留存切片时被后续覆盖).
+		m := make([]int, per)
+		baseIdx := k * per
+		for j := 0; j < per; j++ {
+			m[j] = int(flat[baseIdx+j])
+		}
+		deliver(m)
+	}
+	C.free(unsafe.Pointer(out))
 }
 
 // FindAllString 返回前 n 个匹配文本 (n<0 = 全部), 无匹配返回 nil.
