@@ -367,6 +367,9 @@ func (re *Regexp) ReplaceAllStringFunc(src string, f func(string) string) string
 //
 // 结果惰性物化: 若 src 经过替换后【逐字节没有任何变化】(最常见: 全程无匹配 / 命中但删 0 个字符),
 // C 侧不分配也不拷贝, 本方法直接返回原 src (零分配)。仅在确有改动时才拷一次结果。
+//
+// 注意 repl 是 RE2 重写串 (交给 RE2 GlobalReplace), 捕获组引用用 \1..\9, 不是 ReplaceAllString 的
+// $1/${name} 语法。对常见的字面 repl (如 "") 二者无差别。
 func (find *Regexp) FindReplaceWithin(strip *Regexp, src, repl string) string {
 	if len(src) > maxCInt {
 		return src // 超 C.int 输入: 退化为原样 (同其它方法对超大输入的保守处理)

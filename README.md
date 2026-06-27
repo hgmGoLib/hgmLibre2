@@ -78,7 +78,44 @@ as `regexp.Compile` (RE2's default Perl mode), *not* leftmost-longest — e.g.
 - `FindString`, `FindStringIndex`, `FindStringSubmatch`, `FindStringSubmatchIndex`
 - `FindAllString`, `FindAllStringIndex`, `FindAllStringSubmatch`, `FindAllStringSubmatchIndex`
 - `ReplaceAllString`, `ReplaceAllStringFunc` (with `$1` / `${name}` / `$$` expansion)
+- `FindReplaceWithin` — *not* in stdlib; see [FindReplaceWithin](#findreplacewithin) below
 - `FreeC` — *not* in stdlib; see [Resource management](#resource-management)
+
+### FindReplaceWithin
+
+`find.FindReplaceWithin(strip, src, repl)` is exactly equivalent to the two-regex
+idiom
+
+```go
+find.ReplaceAllStringFunc(src, func(m string) string {
+    return strip.ReplaceAllString(m, repl)
+})
+```
+
+— locate each match of `find`, then run `strip`→`repl` *within* that matched
+segment — **but the whole outer loop and every inner replacement run in one
+cgo call**, instead of one cgo crossing per match plus one per separator. The
+algorithm is byte-for-byte identical: `find` can stay zero-capture so it still
+uses RE2's fastest no-submatch DFA, and `strip` still only edits inside the
+located segment.
+
+It is **lazy / zero-alloc on the no-change path**: the C++ side does not build
+or copy a result string until the first replacement that actually changes bytes.
+If `src` is unchanged (no match, or matched but `strip` removed nothing), it
+returns `src` verbatim with no allocation. Only a genuinely-modified input pays
+for one result buffer.
+
+One syntax note: `repl` is an **RE2 rewrite string** (passed to RE2's
+`GlobalReplace`), so capture references use `\1`..`\9` — *not* the `$1` / `${name}`
+syntax of `ReplaceAllString`. For the common literal `repl` (e.g. `""`) there is
+no difference.
+
+Motivating use case: prompt-injection "healing" — `find` = a separator-tolerant
+verb skeleton (`i[\s._-]{0,2}g…`), `strip` = the separator class, `repl = ""`.
+On the common path (normal traffic, no split verbs) it is allocation-free and
+matches the plain DFA scan throughput; on attack input (many split verbs) it is
+~2× faster than the nested-`ReplaceAllStringFunc` form with allocations
+collapsed from O(matches) to one.
 
 The test suite (`hgmLibre2_test.go`) cross-checks every method against the
 standard library `regexp` on a shared corpus of patterns and inputs; results

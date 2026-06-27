@@ -51,7 +51,8 @@ typedef struct {
  *   find.ReplaceAllStringFunc(text, func(m){ return strip.ReplaceAllString(m, repl) })
  * 把【外层 find 逐处匹配循环 + 每处匹配内层 strip 替换】整体压进一次 cgo 调用:
  *   - find 在 text 上做非锚定全匹配 (推进/空匹配去重语义同 cre2_match_all);
- *   - 对每处匹配的【整体文本 group0】用 strip 做 RE2::GlobalReplace → repl;
+ *   - 对每处匹配的【整体文本 group0】用 strip 做 RE2::GlobalReplace → repl (repl 是 RE2 重写串,
+ *     捕获组引用用 \1..\9, 非 $1 语法; 字面 repl 如 "" 无差别);
  *   - 匹配之外的部分原样拼接。
  * 算法与两正则嵌套版完全一致 (find 仍可零捕获组走最快 DFA, strip 仍只删字符类), 仅省 cgo 次数
  * 与 Go 侧 per-match 分配。典型用途: 注入愈合 (find=被分隔符拆开的动词骨架, strip=分隔符字符类,
