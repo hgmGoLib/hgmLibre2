@@ -361,28 +361,29 @@ func (re *Regexp) ReplaceAllStringFunc(src string, f func(string) string) string
 //	find.ReplaceAllStringFunc(src, func(m string) string { return strip.ReplaceAllString(m, repl) })
 //
 // 但把【外层 find 逐处匹配循环 + 每处匹配内层 strip 替换】整体下沉到 C++ (cre2_find_replace_within),
-// 全程只一次 cgo 跨界、Go 侧零 per-match 分配 (结果只在最后拷一次)。算法与上式逐字一致:
-// find 仍可零捕获组走最快 DFA, strip 仍只在【已命中段内】替换。典型用途: 注入愈合
-// (find=被分隔符拆开的动词骨架正则, strip=分隔符字符类, repl="")。
+// 全程只一次 cgo 跨界、Go 侧零 per-match 分配。算法与上式逐字一致: find 仍可零捕获组走最快 DFA,
+// strip 仍只在【已命中段内】替换。典型用途: 注入愈合 (find=被分隔符拆开的动词骨架正则,
+// strip=分隔符字符类, repl="")。
+//
+// 结果惰性物化: 若 src 经过替换后【逐字节没有任何变化】(最常见: 全程无匹配 / 命中但删 0 个字符),
+// C 侧不分配也不拷贝, 本方法直接返回原 src (零分配)。仅在确有改动时才拷一次结果。
 func (find *Regexp) FindReplaceWithin(strip *Regexp, src, repl string) string {
 	if len(src) > maxCInt {
 		return src // 超 C.int 输入: 退化为原样 (同其它方法对超大输入的保守处理)
 	}
 	sp := strBytePtr(src)
 	rp := strBytePtr(repl)
-	var out *C.char
-	var outlen C.int
-	rc := C.cre2_find_replace_within(find.h, strip.h, sp, C.int(len(src)), rp, C.int(len(repl)), &out, &outlen)
+	res := C.cre2_find_replace_within(find.h, strip.h, sp, C.int(len(src)), rp, C.int(len(repl)))
 	runtime.KeepAlive(src)
 	runtime.KeepAlive(repl)
 	runtime.KeepAlive(find)
 	runtime.KeepAlive(strip)
-	if rc <= 0 || out == nil {
-		return src // malloc 失败 (rc<0): 当作无改动, 返回原串
+	if res.changed == 0 || res.out == nil {
+		return src // 无改动 (含 rc<0 malloc 失败): 原样返回, 零分配
 	}
-	res := C.GoStringN(out, outlen) // 一次性拷出 C 缓冲
-	C.free(unsafe.Pointer(out))
-	return res
+	out := C.GoStringN(res.out, res.outlen) // 一次性拷出 C 缓冲
+	C.free(unsafe.Pointer(res.out))
+	return out
 }
 
 // expand 移植 stdlib regexp.expand: 把 template 里的 $1/${1}/$name/${name}/$$ 展开.

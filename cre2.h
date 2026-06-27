@@ -34,6 +34,19 @@ int cre2_match_at(const cre2_re *h, const char *text, int textlen, int startpos,
  * *nmatches = 匹配数, 返回 1; 无匹配返回 0(*out=NULL,*nmatches=0); malloc 失败返回 -1. */
 int cre2_match_all(const cre2_re *h, const char *text, int textlen, int nmatch, int maxn, int **out, int *nmatches);
 
+/* cre2_replace_result: cre2_find_replace_within 的返回值。
+ *   rc      : 1=正常完成; -1=malloc 失败 (调用方退回原串)。
+ *   changed : 1=结果与输入【有字节差异】(out 指向 malloc 缓冲, 调用方 free); 0=无任何改动。
+ *   outlen  : changed=1 时的结果字节数。
+ *   out     : changed=1 时 malloc 的结果缓冲 (调用方 free); changed=0 时为 NULL。
+ * 关键: changed=0 (含完全无匹配 / 命中但替换后逐字节不变) 时【不分配、不拷贝】, 调用方直接用原串。 */
+typedef struct {
+	int rc;
+	int changed;
+	int outlen;
+	char *out;
+} cre2_replace_result;
+
 /* cre2_find_replace_within: 复刻 Go 的
  *   find.ReplaceAllStringFunc(text, func(m){ return strip.ReplaceAllString(m, repl) })
  * 把【外层 find 逐处匹配循环 + 每处匹配内层 strip 替换】整体压进一次 cgo 调用:
@@ -42,10 +55,11 @@ int cre2_match_all(const cre2_re *h, const char *text, int textlen, int nmatch, 
  *   - 匹配之外的部分原样拼接。
  * 算法与两正则嵌套版完全一致 (find 仍可零捕获组走最快 DFA, strip 仍只删字符类), 仅省 cgo 次数
  * 与 Go 侧 per-match 分配。典型用途: 注入愈合 (find=被分隔符拆开的动词骨架, strip=分隔符字符类,
- * repl="")。成功时 *out 指向 malloc 的结果缓冲 (调用方 free), *outlen=结果字节数, 返回 1;
- * malloc 失败返回 -1。结果为空串时 *out 仍 malloc 1 字节占位、*outlen=0。 */
-int cre2_find_replace_within(const cre2_re *find, const cre2_re *strip, const char *text, int textlen,
-                             const char *repl, int replen, char **out, int *outlen);
+ * repl="")。
+ * 结果缓冲【惰性物化】: 扫描中遇到【第一处真正改变字节的替换】才开始建结果串; 在那之前 (含全程
+ * 无匹配的最常见主路径) 完全不分配 → 返回 changed=0, 调用方用原串。详见 cre2_replace_result。 */
+cre2_replace_result cre2_find_replace_within(const cre2_re *find, const cre2_re *strip, const char *text,
+                                             int textlen, const char *repl, int replen);
 
 void cre2_free(cre2_re *h);
 
