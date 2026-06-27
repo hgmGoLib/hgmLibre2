@@ -1,8 +1,10 @@
 // cre2.cpp — cre2.h 的实现, 直接调 vendored RE2 (2023-03-01, 无 abseil).
 #include "cre2.h"
 #include "re2/re2.h"
+#include "re2/set.h"
 #include <cstdlib>
 #include <map>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -175,6 +177,56 @@ void cre2_free(cre2_re *h) {
 		return;
 	}
 	delete h->re;
+	delete h;
+}
+
+// ── RE2::Set 包装 ────────────────────────────────────────────────────────────
+struct cre2_set {
+	RE2::Set *set;
+};
+
+cre2_set *cre2_set_new(void) {
+	RE2::Options opt;
+	opt.set_log_errors(false);
+	cre2_set *h = new (std::nothrow) cre2_set;
+	if (h == nullptr) {
+		return nullptr;
+	}
+	h->set = new (std::nothrow) RE2::Set(opt, RE2::UNANCHORED);
+	if (h->set == nullptr) {
+		delete h;
+		return nullptr;
+	}
+	return h;
+}
+
+int cre2_set_add(cre2_set *h, const char *pat, int patlen) {
+	re2::StringPiece sp(pat, patlen);
+	return h->set->Add(sp, NULL); // 返回 index 或 -1(解析失败)
+}
+
+int cre2_set_compile(cre2_set *h) { return h->set->Compile() ? 1 : 0; }
+
+int cre2_set_match(const cre2_set *h, const char *text, int textlen, int *out, int outcap) {
+	const char *base = text ? text : ""; // 空串也喂合法指针(同 cre2_match_at)
+	re2::StringPiece sp(base, textlen);
+	std::vector<int> v; // 无命中时 RE2 不填 → 空 vector 不分配
+	if (!h->set->Match(sp, &v)) {
+		return 0;
+	}
+	int n = (int)v.size();
+	int m = n < outcap ? n : outcap;
+	for (int i = 0; i < m; i++) {
+		out[i] = v[i];
+	}
+	return n;
+}
+
+void cre2_set_free(cre2_set *h) {
+	if (h == nullptr) {
+		return;
+	}
+	delete h->set;
 	delete h;
 }
 

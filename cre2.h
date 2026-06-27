@@ -36,6 +36,21 @@ int cre2_match_all(const cre2_re *h, const char *text, int textlen, int nmatch, 
 
 void cre2_free(cre2_re *h);
 
+/* ── RE2::Set: 多正则【一次扫描·返回哪几条命中】(litscan 的正则版) ──────────────
+ * 把 N 条正则编进一个 DFA, 一遍扫 text 得到命中的 pattern index 集合 (不锚定/partial)。
+ * 不返回位置 —— 只回答"哪些 pattern 命中"(需位置的调用方再对命中条单独取)。 */
+typedef struct cre2_set cre2_set;
+/* 建一个空 set (UNANCHORED · log_errors off)。OOM 返回 NULL。 */
+cre2_set *cre2_set_new(void);
+/* 加一条 pattern, 返回它的 index (从 0 顺序递增); 解析失败返回 -1 (不占 index)。 */
+int cre2_set_add(cre2_set *h, const char *pat, int patlen);
+/* 编译整个 set (Match 前必须调一次)。1=成功 0=失败(OOM)。 */
+int cre2_set_compile(cre2_set *h);
+/* 扫 text 一遍, 把命中的 pattern index 写进 out (容量 outcap, 调用方给 = pattern 数即够),
+ * 返回命中条数 (index 不重复 · 顺序不保证)。无命中返回 0。out 写入个数 = min(命中数, outcap)。 */
+int cre2_set_match(const cre2_set *h, const char *text, int textlen, int *out, int outcap);
+void cre2_set_free(cre2_set *h);
+
 #ifdef __cplusplus
 }
 #endif

@@ -57,7 +57,7 @@ func benchBody() string {
 	return b.String()
 }
 
-// BenchmarkFindAll_Batched: 现路径 (单次 cgo 批量全匹配).
+// BenchmarkFindAll_Batched: 现路径 (单次 cgo 批量全匹配 + 单块 flat 分配).
 func BenchmarkFindAll_Batched(b *testing.B) {
 	re := MustCompile(`[A-Za-z0-9_]{3,}`)
 	body := benchBody()
@@ -65,8 +65,7 @@ func BenchmarkFindAll_Batched(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		var res [][]int
-		re.allMatches(body, len(body)+1, func(m []int) { res = append(res, []int{m[0], m[1]}) })
+		res := re.FindAllStringIndex(body, -1)
 		if len(res) == 0 {
 			b.Fatal("no matches")
 		}
@@ -104,11 +103,11 @@ func TestBatchVsPerCallVsStdlib(t *testing.T) {
 		std := regexp.MustCompile(pat)
 		mine := MustCompile(pat)
 
-		// 逐处(老) vs 批量(新): 直接比较 deliver 序列.
-		var batched, perCall [][]int
-		mine.allMatches(body, len(body)+1, func(m []int) { batched = append(batched, append([]int(nil), m...)) })
+		// 逐处(老循环) vs 批量(新公开 API): 全 submatch index 对拍.
+		batched := mine.FindAllStringSubmatchIndex(body, -1)
+		var perCall [][]int
 		mine.allMatchesPerCall(body, len(body)+1, func(m []int) { perCall = append(perCall, append([]int(nil), m...)) })
-		eq(t, batched, perCall, "batched vs perCall pat="+pat)
+		eq(t, batched, perCall, "batched(FindAllStringSubmatchIndex) vs perCall pat="+pat)
 
 		// 批量(新) vs stdlib: 走公开 API.
 		eq(t, mine.FindAllStringIndex(body, -1), std.FindAllStringIndex(body, -1), "FindAllStringIndex vs stdlib pat="+pat)

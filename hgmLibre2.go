@@ -201,14 +201,20 @@ func (re *Regexp) FindStringSubmatchIndex(s string) []int {
 	return re.findFrom(s, 0)
 }
 
-// allMatches 遍历所有匹配, 逐个回调 deliver (空匹配推进逻辑同 stdlib regexp.allMatches).
+// matchAllFlat 跑批量全匹配 (单次 cgo), 把 C 返回的所有匹配 index 一次性拷进【单块】Go []int 返回:
+// 每处匹配 per=2*(numSubexp+1) 个 int (group0.start,group0.end, group1.start,...; 未参与组 -1,-1),
+// 顺序排布. 无匹配返回 nil,0.
 //
-// 整个「逐处匹配」循环下沉到 C 的 cre2_match_all 里一次跑完: 原实现每处匹配一次
-// findFrom→cre2_match_at(每处一次 cgo 跨界), 大正文多命中时 cgo 调用次数 = 匹配数; 现压成
-// 单次 cgo (外加一次 C.free). 推进/去重语义与原 Go 循环逐字一致, 由库内对拍测试守.
-func (re *Regexp) allMatches(s string, n int, deliver func([]int)) {
+// 两件事下沉/合并:
+//   1. 「逐处匹配」循环在 C 的 cre2_match_all 里一次跑完 → cgo 跨界从 O(匹配数) 压成 1 次.
+//   2. 结果只在这一块 flat 上分配一次; Find* 系列直接对它切片 (见各方法), 不再每匹配 make 小 slice
+//      → 分配次数从 O(匹配数) 压成 O(1). 大正文多命中时这是分配次数的大头 (defillage 等).
+//
+// 内存正确性: flat 是本次调用的局部块 (并发各自持有, 不挂 re); re.h 只读, RE2 Match 可并发.
+// cflat 是 C malloc 内存上的视图, 仅在 C.free 前一次性拷出, 拷完即 free, 不外泄 C 指针.
+func (re *Regexp) matchAllFlat(s string, n int) (flat []int, count int) {
 	if len(s) > maxCInt { // 超 C.int 的输入直接当无匹配, 不让 len/pos 溢出成错偏移
-		return
+		return nil, 0
 	}
 	nmatch := re.numSubexp + 1
 	tp := strBytePtr(s)
@@ -218,22 +224,17 @@ func (re *Regexp) allMatches(s string, n int, deliver func([]int)) {
 	runtime.KeepAlive(s)
 	runtime.KeepAlive(re)
 	if rc <= 0 || out == nil || cnt == 0 {
-		return // 无匹配 (rc==0) 或 malloc 失败 (rc<0): 当作无匹配, 同原循环 break.
+		return nil, 0 // 无匹配 (rc==0) 或 malloc 失败 (rc<0): 当作无匹配
 	}
-	count := int(cnt)
-	per := 2 * nmatch
-	flat := unsafe.Slice(out, count*per)
-	for k := 0; k < count; k++ {
-		// 每处分配独立 slice 交给 deliver (与原 findFrom 每次返回新 slice 的契约一致,
-		// 避免 deliver 留存切片时被后续覆盖).
-		m := make([]int, per)
-		baseIdx := k * per
-		for j := 0; j < per; j++ {
-			m[j] = int(flat[baseIdx+j])
-		}
-		deliver(m)
+	count = int(cnt)
+	total := count * 2 * nmatch
+	cflat := unsafe.Slice(out, total)
+	flat = make([]int, total)
+	for i := 0; i < total; i++ {
+		flat[i] = int(cflat[i])
 	}
 	C.free(unsafe.Pointer(out))
+	return flat, count
 }
 
 // FindAllString 返回前 n 个匹配文本 (n<0 = 全部), 无匹配返回 nil.
@@ -241,8 +242,16 @@ func (re *Regexp) FindAllString(s string, n int) []string {
 	if n < 0 {
 		n = len(s) + 1
 	}
-	var res []string
-	re.allMatches(s, n, func(m []int) { res = append(res, s[m[0]:m[1]]) })
+	flat, count := re.matchAllFlat(s, n)
+	if count == 0 {
+		return nil
+	}
+	per := 2 * (re.numSubexp + 1)
+	res := make([]string, count) // 单次分配; 各元素是 s 的子串 (零拷贝 header, 同 stdlib)
+	for k := 0; k < count; k++ {
+		base := k * per
+		res[k] = s[flat[base]:flat[base+1]]
+	}
 	return res
 }
 
@@ -251,8 +260,16 @@ func (re *Regexp) FindAllStringIndex(s string, n int) [][]int {
 	if n < 0 {
 		n = len(s) + 1
 	}
-	var res [][]int
-	re.allMatches(s, n, func(m []int) { res = append(res, []int{m[0], m[1]}) })
+	flat, count := re.matchAllFlat(s, n)
+	if count == 0 {
+		return nil
+	}
+	per := 2 * (re.numSubexp + 1)
+	res := make([][]int, count) // 单次分配外壳; 各元素切 flat 的 group0 段 (共享同一 backing)
+	for k := 0; k < count; k++ {
+		base := k * per
+		res[k] = flat[base : base+2 : base+2] // 限 cap 防外部 append 越写到下一匹配
+	}
 	return res
 }
 
@@ -261,8 +278,16 @@ func (re *Regexp) FindAllStringSubmatch(s string, n int) [][]string {
 	if n < 0 {
 		n = len(s) + 1
 	}
-	var res [][]string
-	re.allMatches(s, n, func(m []int) { res = append(res, re.subStrings(s, m)) })
+	flat, count := re.matchAllFlat(s, n)
+	if count == 0 {
+		return nil
+	}
+	per := 2 * (re.numSubexp + 1)
+	res := make([][]string, count)
+	for k := 0; k < count; k++ {
+		base := k * per
+		res[k] = re.subStrings(s, flat[base:base+per])
+	}
 	return res
 }
 
@@ -271,8 +296,16 @@ func (re *Regexp) FindAllStringSubmatchIndex(s string, n int) [][]int {
 	if n < 0 {
 		n = len(s) + 1
 	}
-	var res [][]int
-	re.allMatches(s, n, func(m []int) { res = append(res, append([]int(nil), m...)) })
+	flat, count := re.matchAllFlat(s, n)
+	if count == 0 {
+		return nil
+	}
+	per := 2 * (re.numSubexp + 1)
+	res := make([][]int, count) // 单次分配外壳; 各元素切 flat 的整 per 段 (共享同一 backing)
+	for k := 0; k < count; k++ {
+		base := k * per
+		res[k] = flat[base : base+per : base+per] // 限 cap 防 append 越界到下一匹配
+	}
 	return res
 }
 
