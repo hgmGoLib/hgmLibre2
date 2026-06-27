@@ -155,6 +155,21 @@ after the object is freed is a use-after-free. `FreeC` itself is idempotent
 (a second call is a no-op). If you don't need prompt reclamation, don't call it
 and let the finalizer handle cleanup.
 
+The native object is freed **exactly once** under every call ordering — there is
+no double-free between `FreeC` and the finalizer, for two independent reasons:
+
+- `FreeC` clears the finalizer (`runtime.SetFinalizer(re, nil)`) in the same call
+  that frees the object. Since you must hold a live reference to `re` to call
+  `FreeC`, the finalizer cannot already be scheduled, so clearing it always wins
+  and it never runs afterwards.
+- Even if a `nil` handle ever reached the underlying `cre2_free`, that function is
+  null-safe (it returns immediately on `nullptr`).
+
+Note the asymmetry this implies: only the free path tolerates a `nil` handle. The
+match/replace methods do **not** — calling any of them after `FreeC` dereferences
+a freed/`nil` RE2 and crashes. The null-tolerance exists solely so the finalizer
+can never misfire, not as a guard for post-free use.
+
 ## Vendored RE2
 
 The RE2 C++ source is vendored in this directory (see `VENDOR.txt` for the
