@@ -356,6 +356,35 @@ func (re *Regexp) ReplaceAllStringFunc(src string, f func(string) string) string
 	})
 }
 
+// FindReplaceWithin 等价于
+//
+//	find.ReplaceAllStringFunc(src, func(m string) string { return strip.ReplaceAllString(m, repl) })
+//
+// 但把【外层 find 逐处匹配循环 + 每处匹配内层 strip 替换】整体下沉到 C++ (cre2_find_replace_within),
+// 全程只一次 cgo 跨界、Go 侧零 per-match 分配 (结果只在最后拷一次)。算法与上式逐字一致:
+// find 仍可零捕获组走最快 DFA, strip 仍只在【已命中段内】替换。典型用途: 注入愈合
+// (find=被分隔符拆开的动词骨架正则, strip=分隔符字符类, repl="")。
+func (find *Regexp) FindReplaceWithin(strip *Regexp, src, repl string) string {
+	if len(src) > maxCInt {
+		return src // 超 C.int 输入: 退化为原样 (同其它方法对超大输入的保守处理)
+	}
+	sp := strBytePtr(src)
+	rp := strBytePtr(repl)
+	var out *C.char
+	var outlen C.int
+	rc := C.cre2_find_replace_within(find.h, strip.h, sp, C.int(len(src)), rp, C.int(len(repl)), &out, &outlen)
+	runtime.KeepAlive(src)
+	runtime.KeepAlive(repl)
+	runtime.KeepAlive(find)
+	runtime.KeepAlive(strip)
+	if rc <= 0 || out == nil {
+		return src // malloc 失败 (rc<0): 当作无改动, 返回原串
+	}
+	res := C.GoStringN(out, outlen) // 一次性拷出 C 缓冲
+	C.free(unsafe.Pointer(out))
+	return res
+}
+
 // expand 移植 stdlib regexp.expand: 把 template 里的 $1/${1}/$name/${name}/$$ 展开.
 func (re *Regexp) expand(dst []byte, template string, src string, match []int) []byte {
 	for len(template) > 0 {

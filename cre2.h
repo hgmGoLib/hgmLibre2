@@ -34,6 +34,19 @@ int cre2_match_at(const cre2_re *h, const char *text, int textlen, int startpos,
  * *nmatches = 匹配数, 返回 1; 无匹配返回 0(*out=NULL,*nmatches=0); malloc 失败返回 -1. */
 int cre2_match_all(const cre2_re *h, const char *text, int textlen, int nmatch, int maxn, int **out, int *nmatches);
 
+/* cre2_find_replace_within: 复刻 Go 的
+ *   find.ReplaceAllStringFunc(text, func(m){ return strip.ReplaceAllString(m, repl) })
+ * 把【外层 find 逐处匹配循环 + 每处匹配内层 strip 替换】整体压进一次 cgo 调用:
+ *   - find 在 text 上做非锚定全匹配 (推进/空匹配去重语义同 cre2_match_all);
+ *   - 对每处匹配的【整体文本 group0】用 strip 做 RE2::GlobalReplace → repl;
+ *   - 匹配之外的部分原样拼接。
+ * 算法与两正则嵌套版完全一致 (find 仍可零捕获组走最快 DFA, strip 仍只删字符类), 仅省 cgo 次数
+ * 与 Go 侧 per-match 分配。典型用途: 注入愈合 (find=被分隔符拆开的动词骨架, strip=分隔符字符类,
+ * repl="")。成功时 *out 指向 malloc 的结果缓冲 (调用方 free), *outlen=结果字节数, 返回 1;
+ * malloc 失败返回 -1。结果为空串时 *out 仍 malloc 1 字节占位、*outlen=0。 */
+int cre2_find_replace_within(const cre2_re *find, const cre2_re *strip, const char *text, int textlen,
+                             const char *repl, int replen, char **out, int *outlen);
+
 void cre2_free(cre2_re *h);
 
 /* ── RE2::Set: 多正则【一次扫描·返回哪几条命中】(litscan 的正则版) ──────────────

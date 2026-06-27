@@ -3,6 +3,7 @@
 #include "re2/re2.h"
 #include "re2/set.h"
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <new>
 #include <string>
@@ -169,6 +170,54 @@ int cre2_match_all(const cre2_re *h, const char *text, int textlen, int nmatch, 
 	}
 	*out = buf;
 	*nmatches = count;
+	return 1;
+}
+
+int cre2_find_replace_within(const cre2_re *find, const cre2_re *strip, const char *text, int textlen,
+                             const char *repl, int replen, char **out, int *outlen) {
+	*out = NULL;
+	*outlen = 0;
+	const char *base = text ? text : "";
+	re2::StringPiece full(base, textlen);
+	re2::StringPiece rewrite(repl ? repl : "", replen);
+	std::string result;
+	result.reserve((size_t)textlen);
+	int end = textlen;
+	int lastMatchEnd = 0;
+	re2::StringPiece g0[1]; // 只取 group0(整体匹配); find 是否有捕获组都不影响, 不退 submatch 跟踪
+	// 推进/写入条件与 Go replaceAllString(= stdlib regexp.replaceAll) 逐字一致, 整循环留在 C 内.
+	for (int searchPos = 0; searchPos <= end;) {
+		bool ok = find->re->Match(full, (size_t)searchPos, (size_t)textlen, RE2::UNANCHORED, g0, 1);
+		if (!ok) {
+			break;
+		}
+		int m0 = (int)(g0[0].data() - base);
+		int m1 = m0 + (int)g0[0].size();
+		result.append(base + lastMatchEnd, (size_t)(m0 - lastMatchEnd));
+		if (m1 > lastMatchEnd || m0 == 0) {
+			std::string seg(base + m0, (size_t)(m1 - m0));
+			RE2::GlobalReplace(&seg, *strip->re, rewrite); // 内层替换在 C 内, 不回 Go
+			result.append(seg);
+		}
+		lastMatchEnd = m1;
+		int width = utf8WidthGo(base + searchPos, end - searchPos);
+		if (searchPos + width > m1) {
+			searchPos += width;
+		} else if (searchPos + 1 > m1) {
+			searchPos++;
+		} else {
+			searchPos = m1;
+		}
+	}
+	result.append(base + lastMatchEnd, (size_t)(end - lastMatchEnd));
+	size_t sz = result.size();
+	char *buf = (char *)malloc(sz ? sz : 1); // 空结果也给 1 字节, 保证 *out 非 NULL
+	if (buf == NULL) {
+		return -1;
+	}
+	memcpy(buf, result.data(), sz);
+	*out = buf;
+	*outlen = (int)sz;
 	return 1;
 }
 
