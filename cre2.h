@@ -62,6 +62,16 @@ typedef struct {
 cre2_replace_result cre2_find_replace_within(const cre2_re *find, const cre2_re *strip, const char *text,
                                              int textlen, const char *repl, int replen);
 
+/* cre2_replace_all_literal: 复刻 Go 的 re.ReplaceAllString(text, repl), 但限 repl 为【字面串】
+ * (调用方已保证 repl 不含 '$', 故无 $1/${name} 展开). 把「逐处匹配 + 字面拼接」整循环压进一次 cgo:
+ *   - re 在 text 上做非锚定全匹配 (推进/空匹配去重语义同 cre2_find_replace_within);
+ *   - 每处命中段 [m0,m1) 整体换成 repl[0,replen) 的【原始字节】(不解释 \1/$1);
+ *   - 匹配之外原样拼接。
+ * 结果惰性物化 (同 cre2_find_replace_within): 全程无字节改动(无匹配/命中但 repl==命中段)→ changed=0,
+ * 不分配, 调用方用原串。返回值含义见 cre2_replace_result。 */
+cre2_replace_result cre2_replace_all_literal(const cre2_re *re, const char *text, int textlen,
+                                             const char *repl, int replen);
+
 void cre2_free(cre2_re *h);
 
 /* ── RE2::Set: 多正则【一次扫描·返回哪几条命中】(litscan 的正则版) ──────────────

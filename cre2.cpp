@@ -246,6 +246,76 @@ cre2_replace_result cre2_find_replace_within(const cre2_re *find, const cre2_re 
 	return res;
 }
 
+cre2_replace_result cre2_replace_all_literal(const cre2_re *re, const char *text, int textlen,
+                                             const char *repl, int replen) {
+	cre2_replace_result res;
+	res.rc = 1;
+	res.changed = 0;
+	res.outlen = 0;
+	res.out = NULL;
+	const char *base = text ? text : "";
+	re2::StringPiece full(base, textlen);
+	const char *rp = repl ? repl : "";
+	int end = textlen;
+	int lastMatchEnd = 0;
+	bool dirty = false; // 是否已遇到第一处改变字节的替换 (未脏前不建 result, 不分配)
+	std::string result;
+	re2::StringPiece g0[1]; // 只取 group0; repl 是字面串(不解释 \1/$1), 无需跟踪子组
+	// 推进/写入条件与 Go replaceAllString(= stdlib regexp.replaceAll) 逐字一致, 整循环留在 C 内.
+	for (int searchPos = 0; searchPos <= end;) {
+		bool ok = re->re->Match(full, (size_t)searchPos, (size_t)textlen, RE2::UNANCHORED, g0, 1);
+		if (!ok) {
+			break;
+		}
+		int m0 = (int)(g0[0].data() - base);
+		int m1 = m0 + (int)g0[0].size();
+		bool applied = (m1 > lastMatchEnd || m0 == 0); // 同 Go 写入条件 (空匹配去重)
+		if (applied) {
+			// 本处替换是否真的改变了字节 (repl 与命中段 [m0,m1) 逐字节相同 → 不变).
+			bool segChanged = (m1 - m0) != replen || memcmp(base + m0, rp, (size_t)replen) != 0;
+			if (!dirty) {
+				if (segChanged) {
+					// 首次改动: 物化 result, 补 [0:m0] 前缀 (此前内容逐字节 = 原串, 直接拷原串).
+					dirty = true;
+					result.reserve((size_t)textlen);
+					result.append(base, (size_t)m0);
+					result.append(rp, (size_t)replen);
+				} // else: 仍无改动, 不建 result, 继续扫
+			} else {
+				result.append(base + lastMatchEnd, (size_t)(m0 - lastMatchEnd));
+				result.append(rp, (size_t)replen);
+			}
+		} else if (dirty) {
+			// applied=false (空匹配跳过): 段不写, 只补 gap, 与 always-build 的推进一致.
+			result.append(base + lastMatchEnd, (size_t)(m0 - lastMatchEnd));
+		}
+		lastMatchEnd = m1;
+		int width = utf8WidthGo(base + searchPos, end - searchPos);
+		if (searchPos + width > m1) {
+			searchPos += width;
+		} else if (searchPos + 1 > m1) {
+			searchPos++;
+		} else {
+			searchPos = m1;
+		}
+	}
+	if (!dirty) {
+		return res; // 无任何字节改动: changed=0, out=NULL, 调用方用原串 (零分配)
+	}
+	result.append(base + lastMatchEnd, (size_t)(end - lastMatchEnd));
+	size_t sz = result.size();
+	char *buf = (char *)malloc(sz ? sz : 1); // 空结果也给 1 字节占位 (changed=1 但结果为空串)
+	if (buf == NULL) {
+		res.rc = -1;
+		return res;
+	}
+	memcpy(buf, result.data(), sz);
+	res.changed = 1;
+	res.outlen = (int)sz;
+	res.out = buf;
+	return res;
+}
+
 void cre2_free(cre2_re *h) {
 	if (h == nullptr) {
 		return;

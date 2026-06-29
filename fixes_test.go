@@ -24,9 +24,6 @@ func TestFix_LongGroupNameNoTruncation(t *testing.T) {
 			t.Errorf("len=%d: mine 组名长度=%d, 期望 %d (被截断?)", ln, len(gotMine[1]), ln)
 		}
 		eq(t, gotMine, gotStd, "SubexpNames 超长组名 len="+strings.Repeat("x", 0)+itoa(ln))
-		// ${name} 展开也应取到完整组名.
-		eq(t, mine.ReplaceAllString("a", "${"+name+"}"), std.ReplaceAllString("a", "${"+name+"}"),
-			"ReplaceAllString ${超长名} len="+itoa(ln))
 	}
 }
 

@@ -3,8 +3,9 @@
 要点速记 (详见 README.md):
 * 自带 cgo 的原生 RE2 正则库, 不用 go-re2 / 不用 abseil / 不用 cmake, 编译期不下载远程源
   (RE2 2023-03-01 已 vendored, 纯 C++11, zig 可交叉编译)。cgo 必须开启。
-* API 方法名/签名对齐 stdlib regexp 的 string 系方法; 匹配为 leftmost-first (同 regexp.Compile)。
-  支持方法清单见 README.md 的 Supported API。
+* API 方法名/签名对齐 stdlib regexp 的 string 系方法 (便于互读), 但【不是】*regexp.Regexp 的 drop-in;
+  匹配为 leftmost-first (同 regexp.Compile)。支持方法清单见 README.md 的 Supported API。
+  有意差异: ReplaceAllString 的 repl 是【字面】(不展开 $1/${name}/$$), 需捕获组替换用 ReplaceAllStringFunc。
 * 非 stdlib 的额外方法:
     - FindReplaceWithin(strip, src, repl): 等价 find.ReplaceAllStringFunc(src, m=>strip.ReplaceAllString(m,repl)),
       但整循环 + 段内替换下沉到一次 cgo; 无改动路径零分配直接复用原串。详见 README.md#findreplacewithin。

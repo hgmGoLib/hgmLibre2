@@ -1,7 +1,8 @@
 package hgmLibre2
 
 // hgmLibre2 的每个方法都与 stdlib regexp 逐一对拍 (两者都是 RE2 语义, 结果须完全一致),
-// 覆盖 9 个 Find/Replace 方法 + 边角 (空匹配/命名组/$展开/unicode/无匹配).
+// 覆盖 9 个 Find/Replace 方法 + 边角 (空匹配/命名组/unicode/无匹配); ReplaceAllString 为字面替换
+// (不展开 $1, 故意非 stdlib drop-in), 其字面性单独在 TestReplaceAllStringIsLiteral 钉死.
 // 公开库, 只用 stdlib testing, 不引入任何外部依赖.
 
 import (
@@ -51,8 +52,10 @@ var testInputs = []string{
 	"no match of note in this line",
 }
 
-// replTemplates: 喂给 ReplaceAllString 的替换串, 含字面/数字引用/命名引用/$$.
-var replTemplates = []string{"", " ", "X", "$1", "${1}", "[$1-$2]", "$key:$num", "$$", "$0"}
+// replTemplates: 喂给 ReplaceAllString 的替换串. 本库 ReplaceAllString 按【字面】替换 (不解释 $1/\1),
+// 故只用不含 '$' 的串与 stdlib 对拍 (无 '$' 时 stdlib 也逐字面, 二者一致); '$'/'\' 的字面性单独在
+// TestReplaceAllStringIsLiteral 里钉死 (不对拍 stdlib, 因 stdlib 会展开 $1).
+var replTemplates = []string{"", " ", "X", "<m>"}
 
 func TestMatchesStdlib(t *testing.T) {
 	for _, pat := range testPatterns {
@@ -95,6 +98,23 @@ func TestMatchesStdlib(t *testing.T) {
 			eq(t, mine.ReplaceAllStringFunc(in, f), std.ReplaceAllStringFunc(in, f),
 				msg("ReplaceAllStringFunc"))
 		}
+	}
+}
+
+// TestReplaceAllStringIsLiteral 钉死 ReplaceAllString 的 repl 是【纯字面】: $1/${name}/$$/\1 等都按原始
+// 字节插入, 不做任何展开/转义 (故意不是 stdlib drop-in)。期望值手算, 不对拍 stdlib (stdlib 会展开 $1)。
+func TestReplaceAllStringIsLiteral(t *testing.T) {
+	cases := []struct{ pat, src, repl, want string }{
+		{`a`, "banana", "$1X", "b$1Xn$1Xn$1X"},       // $1 当字面, 不取捕获组
+		{`(a)`, "aba", "[$1]", "[$1]b[$1]"},          // 有捕获组也不展开
+		{`o`, "foo", "$$", "f$$$$"},                  // $$ 不折叠成 $
+		{`x`, "axbxc", `\1`, `a\1b\1c`},              // RE2 的 \1 也不展开
+		{`(?P<k>\d+)`, "n=42", "${k}", "n=${k}"},     // ${name} 当字面
+		{`z`, "abc", "Q", "abc"},                     // 无匹配: 原样
+	}
+	for _, c := range cases {
+		got := MustCompile(c.pat).ReplaceAllString(c.src, c.repl)
+		eq(t, got, c.want, "ReplaceAllString literal pat="+c.pat+" repl="+c.repl)
 	}
 }
 

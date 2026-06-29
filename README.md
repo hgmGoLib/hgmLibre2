@@ -4,13 +4,14 @@ A self-contained native [RE2](https://github.com/google/re2) regular-expression
 library for Go. It vendors RE2's C++ source and exposes it through cgo, so it
 needs **no abseil, no CMake, and downloads nothing at build time**.
 
-The public API mirrors the standard library `regexp` package for the
-**listed string-only methods** (see [Supported API](#supported-api)), so a
-`*hgmLibre2.Regexp` can stand in for `*regexp.Regexp` as long as you only use
-those methods. It is *not* a full drop-in: the `bytes`/`io.Reader` variants and
-`Split`, `SubexpIndex`, `LiteralPrefix`, `Longest`, marshal/unmarshal, etc. are
-not provided, and a few edge-case semantics differ from stdlib — see
-[Caveats](#caveats).
+The listed string-only methods use the same **names and signatures** as the
+standard library `regexp` package (see [Supported API](#supported-api)), so the
+two are easy to read interchangeably. It is **not** a drop-in replacement for
+`*regexp.Regexp`, and not meant to be: the `bytes`/`io.Reader` variants,
+`SubexpIndex`, `LiteralPrefix`, `Longest`, marshal/unmarshal, etc. are not
+provided, and some semantics differ from stdlib on purpose — most notably
+**`ReplaceAllString` substitutes a *literal* `repl` (no `$1` / `${name}` / `$$`
+expansion)** — plus a few edge cases; see [Differences from stdlib](#differences-from-stdlib-regexp).
 
 ## Why
 
@@ -55,20 +56,13 @@ func main() {
 
 	fmt.Println(re.MatchString("a=1"))                 // true
 	fmt.Println(re.FindStringSubmatch("port=8080"))    // [port=8080 port 8080]
-	fmt.Println(re.ReplaceAllString("x=1 y=2", "$key")) // x y
+	fmt.Println(re.ReplaceAllString("x=1 y=2", "*"))   // * *  (repl is literal)
 }
-```
-
-Because the signatures match `regexp`, you can alias the type to swap engines in
-one place:
-
-```go
-type R = hgmLibre2.Regexp
 ```
 
 ## Supported API
 
-Same names and signatures as `regexp`. Matching is **leftmost-first**, the same
+The listed methods share their names and signatures with `regexp`. Matching is **leftmost-first**, the same
 as `regexp.Compile` (RE2's default Perl mode), *not* leftmost-longest — e.g.
 `(a|aa)` on `"aa"` yields `"a"`, just like stdlib. UTF-8 input.
 
@@ -77,7 +71,8 @@ as `regexp.Compile` (RE2's default Perl mode), *not* leftmost-longest — e.g.
 - `MatchString`
 - `FindString`, `FindStringIndex`, `FindStringSubmatch`, `FindStringSubmatchIndex`
 - `FindAllString`, `FindAllStringIndex`, `FindAllStringSubmatch`, `FindAllStringSubmatchIndex`
-- `ReplaceAllString`, `ReplaceAllStringFunc` (with `$1` / `${name}` / `$$` expansion)
+- `ReplaceAllString` (repl is **literal** — no `$1` / `${name}` / `$$` expansion, unlike stdlib), `ReplaceAllStringFunc`
+- `Split`
 - `FindReplaceWithin` — *not* in stdlib; see [FindReplaceWithin](#findreplacewithin) below
 - `FreeC` — *not* in stdlib; see [Resource management](#resource-management)
 
@@ -105,10 +100,13 @@ If `src` is unchanged (no match, or matched but `strip` removed nothing), it
 returns `src` verbatim with no allocation. Only a genuinely-modified input pays
 for one result buffer.
 
-One syntax note: `repl` is an **RE2 rewrite string** (passed to RE2's
-`GlobalReplace`), so capture references use `\1`..`\9` — *not* the `$1` / `${name}`
-syntax of `ReplaceAllString`. For the common literal `repl` (e.g. `""`) there is
-no difference.
+One syntax note: here `repl` is an **RE2 rewrite string**. (`RE2::GlobalReplace`
+is RE2's own built-in replace-all; its *rewrite* string is RE2's native
+substitution syntax: `\1`..`\9` expand to the corresponding capture group, `\0`
+to the whole match, `\\` is a literal backslash, everything else is literal.)
+So this differs from *both* stdlib's `$1` / `${name}` *and* this library's
+literal `ReplaceAllString` repl — three different conventions. For the common
+literal `repl` (e.g. `""`, which has no `\`), all three coincide.
 
 Motivating use case: prompt-injection "healing" — `find` = a separator-tolerant
 verb skeleton (`i[\s._-]{0,2}g…`), `strip` = the separator class, `repl = ""`.
@@ -119,28 +117,46 @@ collapsed from O(matches) to one.
 
 The test suite (`hgmLibre2_test.go`) cross-checks every method against the
 standard library `regexp` on a shared corpus of patterns and inputs; results
-are identical on that corpus. `review_verify_test.go` additionally pins the
-known [Caveats](#caveats) below as differential tests.
+are identical on that corpus (the corpus uses only literal `ReplaceAllString`
+repls, see the API difference below). `TestReplaceAllStringIsLiteral` pins the
+literal-repl behavior, and `review_verify_test.go` pins the engine-level
+[differences](#differences-from-stdlib-regexp) below as differential tests.
 
 ```sh
 go test ./...
 ```
 
-## Caveats
+## Differences from stdlib `regexp`
 
-It runs the **native RE2 engine**, so a few corners differ from Go's
-`regexp` (which is a from-scratch reimplementation). These are intentional and
-covered by `review_verify_test.go`:
+This is the complete list of concrete behavior differences from Go's standard
+library `regexp`. The first is an **API-design choice** (this library
+deliberately is not a drop-in); the rest follow from running the **native RE2
+engine** instead of Go's from-scratch reimplementation. All are intentional and
+covered by tests.
 
-- **Invalid UTF-8 input.** stdlib treats each invalid byte as one-byte
-  `U+FFFD` and lets `.` match it; native RE2 only matches whole valid runes, so
-  on e.g. `[]byte{0xff,'a',0xfe}` the pattern `.` finds just the `a`. If you
-  match on possibly-invalid UTF-8 and need stdlib's behavior, use stdlib.
-- **`\C` is accepted** (RE2 "any byte"); stdlib `regexp` rejects `\C` at
-  compile time. Patterns valid here may be rejected by stdlib and vice-versa
-  for a handful of RE2-only / stdlib-only escapes.
-- **Capture group names** of any length are returned in full (no truncation);
-  duplicate named groups are accepted, same as stdlib.
+1. **`ReplaceAllString` repl is literal — no `$` expansion.** stdlib expands
+   `$1` / `${name}` / `$$` in the replacement string; here `repl` is inserted
+   byte-for-byte with no expansion and no escaping (so `"$1"` stays `"$1"`,
+   `"$$"` stays `"$$"`). This is the one method that is *not* signature-compatible
+   in behavior. If you need capture-group substitution, use `ReplaceAllStringFunc`
+   and build the replacement yourself. (`FindReplaceWithin` is a different,
+   non-stdlib method and uses RE2's `\1` rewrite syntax — see its section above.)
+2. **Invalid UTF-8 input.** stdlib treats each invalid byte as one-byte
+   `U+FFFD` and lets `.` match it; native RE2 only matches whole valid runes, so
+   on e.g. `[]byte{0xff,'a',0xfe}` the pattern `.` finds just the `a`. If you
+   match on possibly-invalid UTF-8 and need stdlib's behavior, use stdlib.
+3. **`\C` is accepted** (RE2 "any byte"); stdlib `regexp` rejects `\C` at
+   compile time. More generally a handful of escapes are RE2-only or stdlib-only,
+   so a pattern valid in one may be rejected by the other.
+4. **2 GiB input limit.** Lengths/offsets cross the cgo boundary as 32-bit
+   `int`, so inputs (and patterns) longer than `2^31-1` bytes are conservatively
+   treated as *no match* / returned unchanged rather than matched. stdlib has no
+   such limit. (Irrelevant unless you feed multi-gigabyte strings.)
+
+Not a difference, but worth stating: matching is **leftmost-first** here, which
+is also stdlib's default (`regexp.Compile`); stdlib's opt-in leftmost-longest
+mode (`(*Regexp).Longest`) is not provided. Capture-group names of any length
+are returned in full and duplicate named groups are accepted — same as stdlib.
 
 ## Resource management
 
