@@ -51,3 +51,12 @@ func (ctx *FindStringIndex_ctx_t) FindStringIndex(re *Regexp, s string) []int {
 	ctx.ret[1] = int(cbuf[1])
 	return ctx.ret[:]
 }
+
+// FindIndex 同上面的 FindStringIndex, 但正文是 []byte (零拷贝喂给同一内核, 不做 string(b) 全量拷贝)。
+// 方法名对齐 stdlib 的 FindIndex ↔ FindStringIndex 对应关系。返回切片同样切自 ctx.ret,
+// 仅在下次用本 ctx 调用前有效。
+func (ctx *FindStringIndex_ctx_t) FindIndex(re *Regexp, b []byte) []int {
+	loc := ctx.FindStringIndex(re, bytesStr(b))
+	runtime.KeepAlive(b)
+	return loc
+}

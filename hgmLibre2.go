@@ -4,7 +4,8 @@
 // 相比 go-re2 的 wazero 后端: 原生 cgo 路径不实例化 wazero runtime, 也不做 stdio 句柄探测,
 // 因此在无 std 句柄的环境 (如 Windows SCM service) 也能正常用; 同时是单文件静态链接.
 //
-// API 方法名/签名与 stdlib regexp 的 string 系方法一致 (Compile/MustCompile + Find/Replace 系列),
+// API 方法名/签名与 stdlib regexp 的 string 系与 []byte 系方法一致 (Compile/MustCompile + Find/Replace
+// 系列; []byte 门面见 bytes.go, 与 string 系共用同一套匹配内核, 传 []byte 不产生拷贝),
 // 便于互读; 但【不是】*regexp.Regexp 的 drop-in, 也不打算是. 匹配选择是 leftmost-first
 // (同 regexp.Compile, 非 leftmost-longest). 与 stdlib 的有意差异: ReplaceAllString 的 repl 按【字面】
 // 替换 (不展开 $1/${name}/$$, 见该方法注释); 以及原生 RE2 引擎的边角 (非法 UTF-8 上 . 的匹配、\C
@@ -316,8 +317,20 @@ func (re *Regexp) FindAllStringSubmatchIndex(s string, n int) [][]int {
 // 整循环 (逐处匹配 + 字面拼接) 下沉 C++ (cre2_replace_all_literal), 单次 cgo; 惰性物化: 全程无字节
 // 改动 (无匹配 / repl 与命中段逐字节相同) 直接复用原 src, 零分配。
 func (re *Regexp) ReplaceAllString(src, repl string) string {
+	out, changed := re.replaceAllLiteralRaw(src, repl)
+	if !changed {
+		return src // 无改动: 原样返回, 零分配
+	}
+	return out
+}
+
+// replaceAllLiteralRaw 是 ReplaceAllString 与 ReplaceAll([]byte) 共用的内核: 跑一次 cgo 字面全替换,
+// 把 C 缓冲一次性拷成 Go string 后立即 free。changed=false 表示【逐字节无改动】—— 含无匹配、repl 与
+// 命中段相同、超 C.int 的超大输入、C 侧 malloc 失败这几种保守回退; 此时 out 为 "" 无意义, 由各门面
+// 自行返回原输入 (string 门面返回原 src, []byte 门面返回原 src 切片)。
+func (re *Regexp) replaceAllLiteralRaw(src, repl string) (out string, changed bool) {
 	if len(src) > maxCInt {
-		return src // 超 C.int 输入: 退化为原样 (同其它方法对超大输入的保守处理)
+		return "", false // 超 C.int 输入: 当无改动 (同其它方法对超大输入的保守处理)
 	}
 	sp := strBytePtr(src)
 	rp := strBytePtr(repl)
@@ -326,11 +339,11 @@ func (re *Regexp) ReplaceAllString(src, repl string) string {
 	runtime.KeepAlive(repl)
 	runtime.KeepAlive(re)
 	if res.changed == 0 || res.out == nil {
-		return src // 无改动 (含 rc<0 malloc 失败): 原样返回, 零分配
+		return "", false
 	}
-	out := C.GoStringN(res.out, res.outlen) // 一次性拷出 C 缓冲
+	out = C.GoStringN(res.out, res.outlen) // 一次性拷出 C 缓冲
 	C.free(unsafe.Pointer(res.out))
-	return out
+	return out, true
 }
 
 // ReplaceAllStringFunc 用 f(匹配文本) 的返回值替换所有匹配。f 是 Go 回调无法下沉 C++ (下沉需每处
@@ -371,8 +384,19 @@ func (re *Regexp) ReplaceAllStringFunc(src string, f func(string) string) string
 // 注意 repl 是 RE2 重写串 (交给 RE2 GlobalReplace), 捕获组引用用 \1..\9; 而 ReplaceAllString 的 repl
 // 是纯字面 (不解释任何引用)。对常见的字面 repl (如 "") 二者无差别。
 func (find *Regexp) FindReplaceWithin(strip *Regexp, src, repl string) string {
+	out, changed := find.findReplaceWithinRaw(strip, src, repl)
+	if !changed {
+		return src // 无改动: 原样返回, 零分配
+	}
+	return out
+}
+
+// findReplaceWithinRaw 是 FindReplaceWithin 与 FindReplaceWithinBytes 共用的内核: 跑一次 cgo
+// (外层 find 循环 + 段内 strip 替换全在 C++), 把 C 缓冲一次性拷成 Go string 后立即 free。
+// changed 的含义与回退情形同 replaceAllLiteralRaw。
+func (find *Regexp) findReplaceWithinRaw(strip *Regexp, src, repl string) (out string, changed bool) {
 	if len(src) > maxCInt {
-		return src // 超 C.int 输入: 退化为原样 (同其它方法对超大输入的保守处理)
+		return "", false // 超 C.int 输入: 当无改动 (同其它方法对超大输入的保守处理)
 	}
 	sp := strBytePtr(src)
 	rp := strBytePtr(repl)
@@ -382,9 +406,9 @@ func (find *Regexp) FindReplaceWithin(strip *Regexp, src, repl string) string {
 	runtime.KeepAlive(find)
 	runtime.KeepAlive(strip)
 	if res.changed == 0 || res.out == nil {
-		return src // 无改动 (含 rc<0 malloc 失败): 原样返回, 零分配
+		return "", false
 	}
-	out := C.GoStringN(res.out, res.outlen) // 一次性拷出 C 缓冲
+	out = C.GoStringN(res.out, res.outlen) // 一次性拷出 C 缓冲
 	C.free(unsafe.Pointer(res.out))
-	return out
+	return out, true
 }

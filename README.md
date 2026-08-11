@@ -4,10 +4,12 @@ A self-contained native [RE2](https://github.com/google/re2) regular-expression
 library for Go. It vendors RE2's C++ source and exposes it through cgo, so it
 needs **no abseil, no CMake, and downloads nothing at build time**.
 
-The listed string-only methods use the same **names and signatures** as the
-standard library `regexp` package (see [Supported API](#supported-api)), so the
-two are easy to read interchangeably. It is **not** a drop-in replacement for
-`*regexp.Regexp`, and not meant to be: the `bytes`/`io.Reader` variants,
+The listed methods use the same **names and signatures** as the standard library
+`regexp` package (see [Supported API](#supported-api)), so the two are easy to
+read interchangeably. Both the `string` and the `[]byte` families are provided,
+and they share one matching core — passing a `[]byte` costs no copy (see
+[Byte-slice methods](#byte-slice-methods)). It is **not** a drop-in replacement
+for `*regexp.Regexp`, and not meant to be: the `io.Reader` variants,
 `SubexpIndex`, `LiteralPrefix`, `Longest`, marshal/unmarshal, etc. are not
 provided, and some semantics differ from stdlib on purpose — most notably
 **`ReplaceAllString` substitutes a *literal* `repl` (no `$1` / `${name}` / `$$`
@@ -66,15 +68,45 @@ The listed methods share their names and signatures with `regexp`. Matching is *
 as `regexp.Compile` (RE2's default Perl mode), *not* leftmost-longest — e.g.
 `(a|aa)` on `"aa"` yields `"a"`, just like stdlib. UTF-8 input.
 
-- `Compile`, `MustCompile`
+- `Compile`, `MustCompile`, `QuoteMeta`
 - `String`, `NumSubexp`, `SubexpNames`
 - `MatchString`
 - `FindString`, `FindStringIndex`, `FindStringSubmatch`, `FindStringSubmatchIndex`
 - `FindAllString`, `FindAllStringIndex`, `FindAllStringSubmatch`, `FindAllStringSubmatchIndex`
 - `ReplaceAllString` (repl is **literal** — no `$1` / `${name}` / `$$` expansion, unlike stdlib), `ReplaceAllStringFunc`
 - `Split`
-- `FindReplaceWithin` — *not* in stdlib; see [FindReplaceWithin](#findreplacewithin) below
+- The `[]byte` counterparts of all of the above: `Match`, `Find`, `FindIndex`,
+  `FindSubmatch`, `FindSubmatchIndex`, `FindAll`, `FindAllIndex`,
+  `FindAllSubmatch`, `FindAllSubmatchIndex`, `ReplaceAll`, `ReplaceAllFunc` —
+  see [Byte-slice methods](#byte-slice-methods) below
+- `FindReplaceWithin` / `FindReplaceWithinBytes` — *not* in stdlib; see [FindReplaceWithin](#findreplacewithin) below
+- `RegexpSet` (`NewRegexpSet`, `Size`, `Match`, `MatchAny`, `MatchBytes`, `MatchAnyBytes`) — *not* in
+  stdlib; one DFA answering "which of these N patterns hit" in a single scan
+- `FindStringIndex_ctx_t` (`NewFindStringIndex_ctx`, `FindStringIndex`, `FindIndex`) — *not* in stdlib;
+  a scratch-reusing `FindStringIndex` that is steady-state allocation-free
 - `FreeC` — *not* in stdlib; see [Resource management](#resource-management)
+
+### Byte-slice methods
+
+The `[]byte` methods are a second facade over the **same** matching core, not a
+separate implementation. Matching only ever needs a byte pointer plus a length
+on the C side, so a `[]byte` is handed to RE2 directly: **no `string(b)` copy at
+any input size**, and results (`Find`, `FindSubmatch`, `FindAll`, …) are
+sub-slices of your input sharing its backing array, exactly like stdlib's
+`bytes` family. Two consequences worth knowing:
+
+- The input must not be mutated while a call is in flight (same rule as stdlib).
+- On the **no-change path**, `ReplaceAll` / `ReplaceAllFunc` /
+  `FindReplaceWithinBytes` return the original `src` slice with zero allocation
+  (matching this library's lazy-materialization style) rather than a fresh copy
+  as stdlib does — so do not write to the returned slice. Copy it if you need an
+  independently writable buffer. Everything else, including the `nil`-vs-empty
+  result conventions, matches stdlib and is pinned by differential tests in
+  `bytes_test.go`.
+
+Naming: where stdlib has the method, the stdlib name is used (`FindIndex` ↔
+`FindStringIndex`); this library's own methods take a `Bytes` suffix
+(`FindReplaceWithinBytes`, `RegexpSet.MatchBytes`).
 
 ### FindReplaceWithin
 
@@ -122,6 +154,13 @@ repls, see the API difference below). `TestReplaceAllStringIsLiteral` pins the
 literal-repl behavior, and `review_verify_test.go` pins the engine-level
 [differences](#differences-from-stdlib-regexp) below as differential tests.
 
+`bytes_test.go` does the same for the `[]byte` family over the same corpus — each
+method against both its stdlib counterpart and its own `string` twin — plus a
+hand-computed hit/miss pair per method (pinning `nil` vs empty), and the
+zero-copy contracts: results share the input's backing array, read-only methods
+never mutate the input, the no-change path reuses `src`, and `Match([]byte)`
+allocates less than `MatchString(string(b))`.
+
 ```sh
 go test ./...
 ```
@@ -129,7 +168,7 @@ go test ./...
 ## Differences from stdlib `regexp`
 
 This is the complete list of concrete behavior differences from Go's standard
-library `regexp`. The first is an **API-design choice** (this library
+library `regexp`. The first two are **API-design choices** (this library
 deliberately is not a drop-in); the rest follow from running the **native RE2
 engine** instead of Go's from-scratch reimplementation. All are intentional and
 covered by tests.
@@ -141,14 +180,22 @@ covered by tests.
    in behavior. If you need capture-group substitution, use `ReplaceAllStringFunc`
    and build the replacement yourself. (`FindReplaceWithin` is a different,
    non-stdlib method and uses RE2's `\1` rewrite syntax — see its section above.)
-2. **Invalid UTF-8 input.** stdlib treats each invalid byte as one-byte
+2. **`[]byte` replace methods reuse `src` on the no-change path.** stdlib's
+   `ReplaceAll` / `ReplaceAllFunc` always return a freshly allocated slice; here
+   an input that comes out byte-for-byte unchanged (no match, or a replacement
+   that changes nothing) is returned **as the original `src` slice**, allocation-free
+   — so the result must not be written to. The `string` methods have always
+   behaved this way; strings being immutable, it is only observable in the
+   `[]byte` family. Content-wise the results are identical, including the
+   `nil`-vs-empty conventions. See [Byte-slice methods](#byte-slice-methods).
+3. **Invalid UTF-8 input.** stdlib treats each invalid byte as one-byte
    `U+FFFD` and lets `.` match it; native RE2 only matches whole valid runes, so
    on e.g. `[]byte{0xff,'a',0xfe}` the pattern `.` finds just the `a`. If you
    match on possibly-invalid UTF-8 and need stdlib's behavior, use stdlib.
-3. **`\C` is accepted** (RE2 "any byte"); stdlib `regexp` rejects `\C` at
+4. **`\C` is accepted** (RE2 "any byte"); stdlib `regexp` rejects `\C` at
    compile time. More generally a handful of escapes are RE2-only or stdlib-only,
    so a pattern valid in one may be rejected by the other.
-4. **2 GiB input limit.** Lengths/offsets cross the cgo boundary as 32-bit
+5. **2 GiB input limit.** Lengths/offsets cross the cgo boundary as 32-bit
    `int`, so inputs (and patterns) longer than `2^31-1` bytes are conservatively
    treated as *no match* / returned unchanged rather than matched. stdlib has no
    such limit. (Irrelevant unless you feed multi-gigabyte strings.)

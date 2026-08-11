@@ -92,3 +92,16 @@ func (s *RegexpSet) Match(text string, buf []int32) []int32 {
 func (s *RegexpSet) MatchAny(text string, buf []int32) bool {
 	return len(s.Match(text, buf)) > 0
 }
+
+// MatchBytes 同 Match, 但正文是 []byte (零拷贝喂给同一内核, 不做 string(text) 全量拷贝)。
+// 供正文本来就是 []byte 的调用方直接用; 语义/返回值与 Match 完全一致。见 bytes.go 的说明。
+func (s *RegexpSet) MatchBytes(text []byte, buf []int32) []int32 {
+	hit := s.Match(bytesStr(text), buf)
+	runtime.KeepAlive(text)
+	return hit
+}
+
+// MatchAnyBytes 同 MatchAny, 但正文是 []byte。
+func (s *RegexpSet) MatchAnyBytes(text []byte, buf []int32) bool {
+	return len(s.MatchBytes(text, buf)) > 0
+}
