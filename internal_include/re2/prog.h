@@ -10,6 +10,7 @@
 // expression symbolically.
 
 #include <stdint.h>
+#include <atomic>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -18,6 +19,7 @@
 
 #include "util/util.h"
 #include "util/logging.h"
+#include "re2/dfa_stats.h"
 #include "re2/pod_array.h"
 #include "re2/re2.h"
 #include "re2/sparse_array.h"
@@ -290,9 +292,21 @@ class Prog {
   // If the DFA runs out of memory, sets *failed to true and returns false.
   // If matches != NULL and kind == kManyMatch and there is a match,
   // SearchDFA fills matches with the match IDs of the final matching state.
+  // stats != NULL 时, 顺便把这一次扫描的 DFA 计数填进去 (见 re2/dfa_stats.h)。
+  // 不传 = 与上游行为逐字节一致, 零开销。
   bool SearchDFA(const StringPiece& text, const StringPiece& context,
                  Anchor anchor, MatchKind kind, StringPiece* match0,
-                 bool* failed, SparseSet* matches);
+                 bool* failed, SparseSet* matches,
+                 DFAScanStats* stats = NULL);
+
+  // 查这个 Prog 上某一 kind 的 DFA 缓存水位 (没建出来则 out->built=false)。
+  // 只读, 会短暂拿 DFA 的读锁; 可以在扫描并发进行时调。
+  void GetDFAMemInfo(MatchKind kind, DFAMemInfo* out);
+
+  // 查这个 kind 的 DFA 的建状态归因 (见 re2/dfa_stats.h 的 DFAAttribInfo)。
+  // 与 GetDFAMemInfo 一样: 【不会】替你把 DFA 建出来, 没建就返回 built=false。
+  // out->pat_states / pat_insts / pat_cap 由调用方填好再传进来。
+  void GetDFAAttribInfo(MatchKind kind, DFAAttribInfo* out);
 
   // The callback issued after building each DFA state with BuildEntireDFA().
   // If next is null, then the memory budget has been exhausted and building
@@ -446,6 +460,10 @@ class Prog {
 
   std::once_flag dfa_first_once_;
   std::once_flag dfa_longest_once_;
+  // GetDFAMemInfo 用: 只想【看一眼】缓存水位, 不想因为查询而把 DFA 建出来。
+  // call_once 的 flag 没有"问一下建了没"的接口, 所以另立一个 release/acquire 的标志。
+  std::atomic<bool> dfa_first_ready_{false};
+  std::atomic<bool> dfa_longest_ready_{false};
 
   Prog(const Prog&) = delete;
   Prog& operator=(const Prog&) = delete;

@@ -375,7 +375,7 @@ func (re *Regexp) ReplaceAllStringFunc(src string, f func(string) string) string
 //
 // 但把【外层 find 逐处匹配循环 + 每处匹配内层 strip 替换】整体下沉到 C++ (cre2_find_replace_within),
 // 全程只一次 cgo 跨界、Go 侧零 per-match 分配。算法与上式逐字一致: find 仍可零捕获组走最快 DFA,
-// strip 仍只在【已命中段内】替换。典型用途: 注入愈合 (find=被分隔符拆开的动词骨架正则,
+// strip 仍只在【已命中段内】替换。典型用途: 去混淆还原 (find=被分隔符拆开的关键词骨架正则,
 // strip=分隔符字符类, repl="")。
 //
 // 结果惰性物化: 若 src 经过替换后【逐字节没有任何变化】(最常见: 全程无匹配 / 命中但删 0 个字符),

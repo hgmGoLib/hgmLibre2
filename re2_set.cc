@@ -5,6 +5,7 @@
 #include "re2/set.h"
 
 #include <stddef.h>
+#include <string.h>
 #include <algorithm>
 #include <memory>
 #include <utility>
@@ -122,11 +123,39 @@ bool RE2::Set::Compile() {
 }
 
 bool RE2::Set::Match(const StringPiece& text, std::vector<int>* v) const {
-  return Match(text, v, NULL);
+  return Match(text, v, NULL, NULL);
 }
 
 bool RE2::Set::Match(const StringPiece& text, std::vector<int>* v,
                      ErrorInfo* error_info) const {
+  return Match(text, v, error_info, NULL);
+}
+
+// 没扫过就没有 DFA —— 这时候【不建】, 直接报 built=false。
+void RE2::Set::MemInfo(DFAMemInfo* out) const {
+  memset(out, 0, sizeof *out);
+  if (!compiled_ || prog_ == NULL)
+    return;
+  prog_->GetDFAMemInfo(Prog::kManyMatch, out);
+}
+
+void RE2::Set::AttribInfo(DFAAttribInfo* out) const {
+  int64_t* ps = out->pat_states;
+  int64_t* pi = out->pat_insts;
+  int cap = out->pat_cap;
+  memset(out, 0, sizeof *out);
+  out->pat_states = ps;
+  out->pat_insts = pi;
+  out->pat_cap = cap;
+  if (!compiled_ || prog_ == NULL)
+    return;
+  prog_->GetDFAAttribInfo(Prog::kManyMatch, out);
+}
+
+bool RE2::Set::Match(const StringPiece& text, std::vector<int>* v,
+                     ErrorInfo* error_info, DFAScanStats* stats) const {
+  if (stats != NULL)
+    memset(stats, 0, sizeof *stats);
   if (!compiled_) {
     if (error_info != NULL)
       error_info->kind = kNotCompiled;
@@ -143,7 +172,7 @@ bool RE2::Set::Match(const StringPiece& text, std::vector<int>* v,
     v->clear();
   }
   bool ret = prog_->SearchDFA(text, text, Prog::kAnchored, Prog::kManyMatch,
-                              NULL, &dfa_failed, matches.get());
+                              NULL, &dfa_failed, matches.get(), stats);
   if (dfa_failed) {
     if (options_.log_errors())
       LOG(ERROR) << "DFA out of memory: "

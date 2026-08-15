@@ -173,6 +173,14 @@ int cre2_match_all(const cre2_re *h, const char *text, int textlen, int nmatch, 
 	return 1;
 }
 
+cre2_match_all_result cre2_match_all_r(const cre2_re *h, const char *text, int textlen, int nmatch, int maxn) {
+	cre2_match_all_result res;
+	res.out = NULL;
+	res.nmatches = 0;
+	res.rc = cre2_match_all(h, text, textlen, nmatch, maxn, &res.out, &res.nmatches);
+	return res;
+}
+
 cre2_replace_result cre2_find_replace_within(const cre2_re *find, const cre2_re *strip, const char *text,
                                              int textlen, const char *repl, int replen) {
 	cre2_replace_result res;
@@ -329,9 +337,12 @@ struct cre2_set {
 	RE2::Set *set;
 };
 
-cre2_set *cre2_set_new(void) {
+cre2_set *cre2_set_new(int64_t max_mem) {
 	RE2::Options opt;
 	opt.set_log_errors(false);
+	if (max_mem > 0) {
+		opt.set_max_mem(max_mem); // <=0 保持 RE2 默认 kDefaultMaxMem=8MB
+	}
 	cre2_set *h = new (std::nothrow) cre2_set;
 	if (h == nullptr) {
 		return nullptr;
@@ -364,6 +375,63 @@ int cre2_set_match(const cre2_set *h, const char *text, int textlen, int *out, i
 		out[i] = v[i];
 	}
 	return n;
+}
+
+int cre2_set_match_stats(const cre2_set *h, const char *text, int textlen,
+                         int *out, int outcap, cre2_scan_stats *st) {
+	const char *base = text ? text : "";
+	re2::StringPiece sp(base, textlen);
+	std::vector<int> v;
+	re2::DFAScanStats s;
+	bool ok = h->set->Match(sp, &v, NULL, st ? &s : NULL);
+	if (st != nullptr) {
+		st->Flushes = s.flushes;
+		st->Grows = s.grows;
+		st->StatesBuilt = s.states_built;
+		st->Bytes = s.bytes;
+		st->StatesEnd = s.states_end;
+		st->StateBudget = s.state_budget;
+		st->MemLeft = s.mem_left;
+	}
+	if (!ok) {
+		return 0;
+	}
+	int n = (int)v.size();
+	int m = n < outcap ? n : outcap;
+	for (int i = 0; i < m; i++) {
+		out[i] = v[i];
+	}
+	return n;
+}
+
+void cre2_set_mem_info(const cre2_set *h, cre2_set_mem *out) {
+	re2::DFAMemInfo mi;
+	h->set->MemInfo(&mi);
+	out->Built = mi.built ? 1 : 0;
+	out->StateBudget = mi.state_budget;
+	out->MemLeft = mi.mem_left;
+	out->States = mi.states;
+	out->ArenaCap = mi.arena_cap;
+	out->FlushesTotal = mi.flushes_total;
+	out->StatesBuiltTotal = mi.states_built_total;
+}
+
+void cre2_set_attrib_info(const cre2_set *h, cre2_set_attrib *agg,
+                          int64_t *pat_states, int64_t *pat_insts, int cap) {
+	re2::DFAAttribInfo ai;
+	ai.pat_states = pat_states;
+	ai.pat_insts = pat_insts;
+	ai.pat_cap = (pat_states != nullptr || pat_insts != nullptr) ? cap : 0;
+	h->set->AttribInfo(&ai);
+	agg->Enabled = ai.enabled ? 1 : 0;
+	agg->Built = ai.built ? 1 : 0;
+	agg->NPat = ai.npat;
+	agg->StatesTotal = ai.states_total;
+	agg->SharedInsts = ai.shared_insts;
+	agg->NInstSum = ai.ninst_sum;
+	agg->NInstMax = ai.ninst_max;
+	memcpy(agg->NInstHist, ai.ninst_hist, sizeof agg->NInstHist);
+	memcpy(agg->BirthHist, ai.birth_hist, sizeof agg->BirthHist);
 }
 
 void cre2_set_free(cre2_set *h) {

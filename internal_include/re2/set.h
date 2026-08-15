@@ -10,6 +10,7 @@
 #include <utility>
 #include <vector>
 
+#include "re2/dfa_stats.h"
 #include "re2/re2.h"
 
 namespace re2 {
@@ -68,6 +69,21 @@ class RE2::Set {
   // example, because they might wish to handle that case differently.
   bool Match(const StringPiece& text, std::vector<int>* v,
              ErrorInfo* error_info) const;
+
+  // ── hgmLibre2 追加 (非上游 re2) ──
+  // 同上, 外加把【这一次扫描】的 DFA 计数填进 stats (见 re2/dfa_stats.h)。
+  // stats 由调用方在栈上开一个即可, 不必清零; 传 NULL 等价于上面那个重载。
+  bool Match(const StringPiece& text, std::vector<int>* v,
+             ErrorInfo* error_info, DFAScanStats* stats) const;
+
+  // 查这个 Set 的 DFA 缓存水位 + 生涯累计 (没扫过则 out->built=false)。
+  // 只读, 短暂拿 DFA 的读锁, 可以和扫描并发调。
+  void MemInfo(DFAMemInfo* out) const;
+
+  // 查"这几万个状态是谁造的、有多贵、在正文哪一段造的" (见 re2/dfa_stats.h 的 DFAAttribInfo)。
+  // 需要 -DRE2_DFA_ATTRIB=1 编译, 否则只返回 enabled=false。
+  // out->pat_states / pat_insts / pat_cap 由调用方填好缓冲区再传进来。
+  void AttribInfo(DFAAttribInfo* out) const;
 
  private:
   typedef std::pair<std::string, re2::Regexp*> Elem;
