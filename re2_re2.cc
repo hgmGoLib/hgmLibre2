@@ -137,6 +137,10 @@ static std::string trunc(const StringPiece& pattern) {
 
 
 RE2::RE2(const char* pattern) {
+  // [backport re2 79741d6] Handle NULL explicitly to keep callers working
+  // no matter what StringPiece is (or becomes) underneath.
+  if (pattern == NULL)
+    pattern = "";
   Init(pattern, DefaultOptions);
 }
 
@@ -1056,7 +1060,9 @@ bool RE2::Rewrite(std::string* out,
       out->push_back('\\');
     } else {
       if (options_.log_errors())
-        LOG(ERROR) << "invalid rewrite pattern: " << rewrite.data();
+        // [backport re2 433ab9c] rewrite is not NUL-terminated: passing
+        // .data() to the logger read past the end of the buffer.
+        LOG(ERROR) << "invalid rewrite pattern: " << rewrite;
       return false;
     }
   }

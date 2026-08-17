@@ -4,6 +4,17 @@
 要点速记 (详见 README.md):
 * 自带 cgo 的原生 RE2 正则库, 不用 go-re2 / 不用 abseil / 不用 cmake, 编译期不下载远程源
   (RE2 2023-03-01 已 vendored, 纯 C++11, zig 可交叉编译)。cgo 必须开启。
+  另摘了上游 2023-03-01 之后的几条真修复 (交替因式分解丢大小写的静默漏报 / (?<name>) / 空宽计数重复
+  不再展开 ...), 逐条判据与"没摘哪些、为什么"见 VENDOR.txt 的"从上游摘回来的修复"一节。
+  另从上游【尚未合并的 PR】摘了 3 条 (最值钱的一条: 反向扫描的"太慢就退回 NFA"启发式因为
+  p - resetp 是负数而从来没生效过 —— 修完某类 pattern 扫 1MB 从 234ms 掉到 34ms), 判据同上,
+  对拍见 upstream_backport_test.go。
+* 并发: 一个 *Regexp 给多个 goroutine 共用是安全的, 但不是线性扩展 —— 每次 DFA 搜索都要拿一次
+  cache_mutex_ 读锁 (pthread_rwlock), 读者计数在同一条 cache line 上。16 goroutine 扫 14 字节:
+  共用 43ns/op, 每 goroutine 各一个 9.5ns/op。【照常共用一个包级变量就行】: 差值才 33ns, 而各建
+  一个要多付一次编译 + 每份一套独立 DFA 状态缓存 (内存峰值和 max_mem 预算都乘以 worker 数),
+  不划算。真被 profile 指到这把锁再说。根治要改读者同步方式 (分片读者计数 / epoch), 现状与实测
+  见 README.md 的 "Concurrency" 一节与 contention_bench_test.go。
 * API 方法名/签名对齐 stdlib regexp 的 string 系与 []byte 系方法 (便于互读), 但【不是】*regexp.Regexp 的 drop-in;
   匹配为 leftmost-first (同 regexp.Compile)。支持方法清单见 README.md 的 Supported API。
   有意差异: ReplaceAllString 的 repl 是【字面】(不展开 $1/${name}/$$), 需捕获组替换用 ReplaceAllStringFunc。

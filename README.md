@@ -526,11 +526,76 @@ covered by tests.
    `int`, so inputs (and patterns) longer than `2^31-1` bytes are conservatively
    treated as *no match* / returned unchanged rather than matched. stdlib has no
    such limit. (Irrelevant unless you feed multi-gigabyte strings.)
+6. **Case-folded literals fold over the full Unicode orbit when they are merged
+   into a character class.** When a case-folded literal is one branch of an
+   alternation that RE2 factors into a single character class, the class picks up
+   every fold-equivalent rune, not just the ASCII pair: `\w|[kK]` also matches
+   U+212A KELVIN SIGN, where stdlib matches only `k`/`K`. (`[sS]|\w` has always
+   matched U+017F this way.) This is upstream RE2 behavior and only shows up for
+   non-ASCII fold-equivalents.
+7. **Capture names may be non-ASCII.** `(?P<中文>a)` compiles here; stdlib has
+   rejected non-ASCII capture names since Go 1.22. Both forms of named group —
+   `(?P<name>expr)` and `(?<name>expr)` — are accepted, as in stdlib (Go 1.22+).
+8. **No nesting-depth limit.** stdlib rejects patterns whose parse tree nests
+   deeper than 1000 (`expression nests too deeply`, Go 1.19+); this library
+   accepts them. 200 000 nested groups compile in ~100 ms with linear memory and
+   no stack growth (parsing, simplification and teardown are all iterative), and
+   400 000 fails cleanly on the capture-group limit — so this is only a matter of
+   *accepting more* than stdlib, not a robustness gap. If you compile untrusted
+   patterns and want stdlib's ceiling, check the depth yourself before compiling.
 
 Not a difference, but worth stating: matching is **leftmost-first** here, which
 is also stdlib's default (`regexp.Compile`); stdlib's opt-in leftmost-longest
 mode (`(*Regexp).Longest`) is not provided. Capture-group names of any length
 are returned in full and duplicate named groups are accepted — same as stdlib.
+
+## Concurrency: sharing one `Regexp` is fine (it just doesn't scale linearly)
+
+Share one package-level `*Regexp`, the way you would with stdlib. This section
+exists to explain a scaling curve, not to ask you to do anything about it.
+
+A `Regexp` is safe to use from multiple goroutines, but it does not scale
+*linearly*. Every DFA search takes a **read lock** on that `Regexp`'s DFA state cache
+(`DFA::cache_mutex_`, a `pthread_rwlock` on Linux); the lock exists only so the
+rare whole-cache flush can run exclusively, yet every single search pays for it.
+Read locks do not exclude each other, but the reader count is an atomic on one
+shared cache line, so with enough goroutines that line ping-pongs between cores
+and the "concurrent" searches serialize.
+
+Measured on a 20-core Ryzen 5900X, non-matching pattern, ns/op:
+
+| | 14-byte input | 4 KB input |
+|---|---|---|
+| one shared `*Regexp`, 1 goroutine | 69–74 | 453–467 |
+| one shared `*Regexp`, 16 goroutines | 42–77 | 62–69 |
+| one `*Regexp` per goroutine, 16 | 9.5–13 | 38–51 |
+| stdlib `*regexp.Regexp` shared, 16 | 4.3–4.5 | 67–70 |
+
+Compiling the read lock out (measurement only) makes the shared case match the
+per-goroutine case exactly (8.0–8.5 ns at 16 goroutines), so the entire gap is
+that one lock. Short inputs suffer most, but even 4 KB inputs lose ~1.6×.
+
+**This is not a reason to stop sharing.** The whole effect is ~33 ns per call at
+16 goroutines on 14-byte inputs, and buying it back is a bad trade in most
+programs: one `*Regexp` per worker means one compile per worker (microseconds to
+milliseconds each, and the pattern is usually compiled once at init today), one
+**separate DFA state cache** per worker — so the peak native memory and the
+`max_mem` budget you tuned both multiply by the worker count — and lifetime
+management (pooling, `FreeC`) that a package-level variable doesn't need. A
+shared `Regexp` also *reuses* cached DFA states across goroutines; N private
+copies each rebuild them.
+
+Only consider per-worker copies if a profile actually points at this lock — i.e.
+regex matching is a top cost in your program, inputs are short, and the
+concurrency is high. Otherwise keep the one shared variable. Correctness,
+`RegexpSet`, and low concurrency are unaffected either way.
+
+Note what the stdlib column does *not* say: at 14 bytes a single cgo call
+(~50 ns) already costs more than the whole match, so stdlib wins there whatever
+the locking does; that row is a scaling reference, not a throughput comparison.
+At 4 KB the shared case is level with stdlib and the per-goroutine case is
+~1.7× faster. This is upstream RE2 issue #569; the benchmark that produces the
+table is `contention_bench_test.go`.
 
 ## Resource management
 
@@ -566,6 +631,23 @@ The RE2 C++ source is vendored in this directory (see `VENDOR.txt` for the
 exact layout and how to upgrade). It is pinned to RE2 tag `2023-03-01`, the last
 release before RE2 took an abseil dependency; later releases cannot be compiled
 this way directly.
+
+A small set of **later upstream fixes is backported** on top of that tag — the
+ones that are real fixes rather than abseil churn, most notably a silent
+false-negative in alternation factoring (`0a|0[aA]` used not to match `"0A"`),
+support for `(?<name>expr)`, and not expanding counted repetitions of
+zero-width operators (`\b{1000}`). Each site is tagged `[backport re2 <commit>]`
+in the source; `VENDOR.txt` lists them, together with the upstream commits that
+were deliberately *not* taken and why.
+
+Three further fixes come from upstream pull requests that are still **open**
+(tagged `[backport re2 PR#NNN]`), reproduced and cross-checked against stdlib
+here before being taken. The one that mattered: RE2's "if the DFA is rebuilding
+its cache this fast, fall back to the NFA" heuristic compared `p - resetp`, which
+is negative during the **reverse** scan that locates a match's start — so the
+heuristic had never fired in that direction and the reverse DFA would flush
+itself indefinitely. Fixing it takes `(?s)a[a-d]{24}b[a-d]*` over 1 MB from 43
+flushes / 234 ms to 1 flush / 34 ms, with identical results.
 
 ### Local changes to the DFA
 

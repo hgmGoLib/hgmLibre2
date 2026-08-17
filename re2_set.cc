@@ -156,7 +156,10 @@ bool RE2::Set::Match(const StringPiece& text, std::vector<int>* v,
                      ErrorInfo* error_info, DFAScanStats* stats) const {
   if (stats != NULL)
     memset(stats, 0, sizeof *stats);
-  if (!compiled_) {
+  // [backport re2 PR#636] Compile() 一进门就把 compiled_ 置了 true, 失败时 prog_ 仍是空 ——
+  // 只看 compiled_ 的话这里会空指针解引用。本库从 Go 侧走不到 (NewRegexpSetMaxMem 见到
+  // Compile 失败就把整个 set 释放掉了), 但同文件的 MemInfo/AttribInfo 都是查两个条件, 补齐。
+  if (!compiled_ || prog_ == NULL) {
     if (error_info != NULL)
       error_info->kind = kNotCompiled;
     LOG(DFATAL) << "RE2::Set::Match() called before compiling";

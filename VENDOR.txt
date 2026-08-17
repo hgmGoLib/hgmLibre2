@@ -25,15 +25,128 @@ re2_dfa.cc             : ①转移表槽位 8 字节 State* → 4 字节 arena �
 internal_include/re2/prog.h : 追加 SearchDFA 的可选出参 + GetDFAMemInfo / GetDFAAttribInfo 声明
 internal_include/re2/set.h  : 追加 Match 的可选出参 + MemInfo / AttribInfo 声明
 re2_set.cc             : 上面那两个声明的实现 (转发给 Prog)
-除上面五个文件外, 其余 re2_*.cc / util_*.cc / 头文件本库未再改动。
 改动的语义保证: 命中集与原版(-DRE2_DFA_NEXT_BITS=64 -DRE2_DFA_ARENA=0 编出来的那份)逐位一致,
 按 pattern 表 × 语料 × 预算的矩阵对拍钉死。
+
+另有一批【从上游摘回来的修复】(2026-08-17 打, 见下一节), 也落在上游文件里:
+re2_parse.cc · re2_simplify.cc · re2_regexp.cc · re2_re2.cc · re2_dfa.cc · re2_set.cc
+这批与上面那些"我们自己的改动"性质不同 —— 升级到含这些 commit 的 RE2 时【应当丢掉】,
+不要再往新版上打。源码里每处都用 `[backport re2 <commit>]` 标了出处, 直接 grep 就能找齐:
+    grep -rn "backport re2" *.cc
+⚠ 其中标成 `[backport re2 PR#NNN]` 的三条是从上游【尚未合并的 PR】摘的 (我们自己复现+对拍过),
+  升级后新版里很可能仍然没有, 那三条要逐条重新判断而不是无脑丢掉。
+除上述文件外, 其余 re2_*.cc / util_*.cc / 头文件本库未再改动。
+
+从上游摘回来的修复 (RE2 2023-03-01 之后的 commit, 无 abseil 依赖)
+-----------------------------------------------------------------
+上游 2023-03-01 之后到 2026 年只有 41 个 commit 碰过 re2/ + util/, 其中绝大多数是 abseil 迁移
+(absl::string_view / absl::Mutex / ABSL_LOG / flat_hash_*) 和格式整理, 与我们无关。真正有内容的
+就下面这几条, 都是纯 C++11 能落地的:
+
+9d0b5bf  交替因式分解丢大小写 (upstream issue 467)   → re2_parse.cc  🔴【静默漏报, 最值钱的一条】
+         `0a|0[aA]` 里 [aA] 解析成 litfold{a}, 与前一支的 'a' 并进同一个字符类时,
+         AddFoldedRange 看见 'a' 已在类里就提前返回, 'A' 再没进去 ⇒ 整条 pattern 匹配不到 "0A"。
+         (`[a-c]|[aA]` 同理匹配不到 "A"。) 改法: 折叠字面量先进一个空的 CharClassBuilder 再 merge。
+f9550c3  Latin-1 折叠 + 因式分解的 flag 传递          → re2_parse.cc
+         ①Latin-1 下的大小写折叠不再借用 Unicode 折叠环 (会跑出 Latin-1 之外);
+         ②字符类并进因式分解结果时按 parse_flags 折叠, 合出来的类去掉 FoldCase (免得再折一次)。
+         本库 Go API 只走 UTF-8, 但 ② 是通用路径, 和 9d0b5bf 是一件事的两半。
+0ff0fab  LeadingString 丢 Latin1 flag (issue 477)     → re2_parse.cc  (Latin-1 前缀加速走错)
+6148386  支持 (?<name>expr) 命名组                    → re2_parse.cc + re2_regexp.cc
+         stdlib 从 Go 1.22 起认这个写法, 本库原来只认 (?P<name>expr) —— 实打实的口径差。
+         配套的 regexp.cc 改动: TopEqual 比较组名要比较字符串本身而不是指针。
+c042630  环视断言报 kRegexpBadPerlOp                  → re2_parse.cc
+         `(?<=foo)` 原来会掉进 (?<name>) 那条分支报 "invalid named capture", 现在报
+         "invalid perl operator: (?<=" (依然不支持环视, 只是错误说得对)。
+e664633  空宽算子的计数重复不再展开                    → re2_simplify.cc
+         `\b{1000}` 原来老实展开成 1004 条指令 (语义上等于 `\b`), 现在 min/max 直接压到 1。
+         实测编译 `(?:\b){200}foo(?:$){50}`: 21.5µs → 2.7µs (8×), 指令数 1004 → 5。
+         用户可控 pattern 的场景下这条顺带堵掉一个廉价的编译期放大。
+433ab9c  日志里 rewrite.data() 读越界                  → re2_re2.cc  (防御性)
+         Rewrite 失败时 `LOG(ERROR) << rewrite.data()` 把 StringPiece 当 C 字符串打 —— 我们的
+         rewrite 是 Go 内存上的指针+长度, 没有结尾 NUL, 会一路读到下一个 0 字节 (信息泄漏/段错误)。
+         本库 cre2.cpp 两处都 set_log_errors(false), 今天【打不到】, 属于把地雷提前拆了。
+79741d6  RE2(NULL) 显式当空串处理                     → re2_re2.cc  (防御性, 我们不走这个构造)
+24d460a  DFA 匹配记录路径少一次 kind_ 比较             → re2_dfa.cc
+         params->matches != NULL 已经蕴含 kManyMatch (全库只有 re2_set.cc 传非 NULL), 判据冗余。
+         性能上量不出来 (matches==NULL 时短路本来就命中), 属于跟上游对齐。
+
+第二批 (2026-08-17 晚): 从上游【尚未合并的 open PR】里摘的。这三条上游没 review 过,
+是我们自己复现 + 对拍确认的 (对拍见 upstream_backport_test.go)。
+
+PR#609   反向扫描的 slow-bail 判据方向错             → re2_dfa.cc  🔴【本轮最值钱】
+         "缓存刚清空又立刻装满就退回 NFA" 这条启发式算的是 p - resetp, 而反向扫描 p 是递减的,
+         负数转 size_t 后判据恒假 ⇒ 【这条启发式在反向扫描里从来没生效过】, 反向 DFA 撞上
+         状态爆炸时只会一遍遍清空重建, 没有出口。run_forward 是模板参数, 修完热循环不多指令。
+         实测 `(?s)a[a-d]{24}b[a-d]*` 扫 1MB: flush 43 次 234ms → flush 1 次 34ms (7×),
+         结果与 stdlib 逐位一致。全套测试套里反向 flush 次数原本是 0, 所以以前没量到。
+PR#648   `\p` / `\P` 后跟坏 UTF-8 时漏检              → re2_parse.cc
+         StringPieceToRune 出错返回 -1, 而这一处写的是 `if (!x)` (只有 0 才为真) ⇒ 错误分支
+         永远不走。同文件另外 15 处调用都是 `< 0`。后果是错误码不对: `\p\xff` 报成
+         "invalid character class range" 而不是 stdlib 那样的 "invalid UTF-8"。
+PR#636   Set::Compile 失败后 compiled_ 仍是 true      → re2_set.cc  (防御性, Go 侧走不到)
+         Compile 一进门就置 compiled_=true, 失败时 prog_ 是空; Match 只查 compiled_ 就解引用。
+         Go 侧 NewRegexpSetMaxMem 见到失败会释放整个 handle 并返回 error, 够不着这条路;
+         同文件 MemInfo/AttribInfo 本来就查两个条件, 这次把 Match 补齐。
+
+明确【没有】摘的:
+b059ae8  把 inst_ 从 State 那块内存里挪出去 —— 我们的 RE2_DFA_INST_OUT 已经做了同一件事,
+         而且更进一步 (挪进第二块 arena, State 定长, 槽位能压到 2 字节), 上游这条是子集。
+         🔸 那要不要把 RE2_DFA_INST_OUT 默认开起来"对齐上游"? 【不要】。上游那条的收益全在
+         "malloc 的 size class 打包"上 (commit message 自己这么说的), 而我们根本不 malloc
+         单个 State (从 arena 顺序切), 它要治的病我们没有。实测: 只加 -DRE2_DFA_INST_OUT=1
+         会连带把下标改成序号 (ORDINAL 默认 1), 健康档 547 → 378 MB/s (掉 30%); 写成
+         +ORDINAL=0 才持平, 而那是【逐项持平】—— 吞吐 / 0-flush 门槛 / 同预算状态数 / 峰值 RSS
+         四项全在噪声内, 零收益。它继续作为 2 字节槽的前提条件留着, 默认关。
+         实测数据与复现方法见 README.md 的 "Local changes to the DFA" 一节。
+PR#612   Workq::mark() 的 last_was_mark_ 少了个取反 —— 是真 bug 也真在跑 (全测试套 59740 次
+         mark 插入里有 10741 次 / 18% 是本该去重的连续重复), 但实测新建状态数只差 0.012%
+         (10134768 → 10133583)。买不到东西, 不值得再多一条本地 diff。数据见新 doc §5.1。
+PR#607   尾部 `.*` 的快速路径 (506 行, 动 compile/prog/re2) —— 实测本库与 stdlib 同档
+         (18KB 输入上我们还快 25%), 不存在相对退化; 而补丁未经 review、语义判据很细,
+         剥错一次就是静默错结果。要做该自己做 + 自己出对拍。
+PR#623   解析期嵌套深度上限 —— 判据(只数括号)与 stdlib(算树高)对不齐, 抄了也不一致。
+         但它引出一条以前没记的 stdlib 口径差, 已写进 README 差异清单第 8 条。
+PR#626/#627/#616/#637/#614/#646/#653/#630 等 —— 或不可达 (FilteredRE2 / RE2::Arg /
+         PossibleMatchRange 本库都没导出), 或只在 DCHECK 里 (-DNDEBUG 下全被编掉),
+         或要 abseil。逐条判据见新 doc §2。
+issue#596 / issue#589 (两份崩溃报告) —— 都崩在 absl::flat_hash_* 的 ASan generation 指针上,
+         我们这份是 abseil 之前的 std 容器, 实测两个 POC 都不复现 (见新 doc §3)。
+issue#569 (共享一个 RE2 对象时锁争用) —— 【本库同病且更重】, 不是一条补丁能解决的, 单独立项:
+         16 goroutine 共用一个 *Regexp 扫 14 字节 43ns/op, 每 goroutine 各一个 9.5ns/op,
+         把 DFA::cache_mutex_ 的读锁编掉后共用 8.4ns/op ⇒ 差距 100% 来自那把 pthread_rwlock。
+         【但不建议调用者改写法】: 差值才 33ns, 各建一个要多付编译 + 每份一套 DFA 缓存
+         (内存峰值 x worker 数), 不划算; README 写的是"照常共用一个包级变量"。
+         根治方案 (分片读者计数 / epoch) 见新 doc §6。
+         基准: contention_bench_test.go。
+880c551  BitState::ShouldVisit 提load 微优化 —— 摘过来实测在 g++ 15.2 -O2/x86-64 上【没有收益】:
+         5 组 pattern × 2 种输入长度各跑 5 轮, 全部落在噪声内, 其中
+         `(?:[a-z]*[0-9])+([A-Z])(.*)` @200B 稳定【慢 5%】(min 1146ns → 1202ns, 十轮不重叠)。
+         故回退, 保持 re2_bitstate.cc 与上游 2023-03-01 逐字节一致。
+35bb195  Unicode 15.1.0 表 —— 会让 (?i) 的折叠环多出 U+0390↔U+1FD3 / U+03B0↔U+1FE3 / U+FB05↔U+FB06。
+         Go 1.26 的 unicode.Version 还是 15.0.0, stdlib 这三对【不折叠】, 现状与 stdlib 一致;
+         摘了反而偏离 stdlib。本库以 stdlib 口径为准 ⇒ 不摘。
+a57a1d6  PrefilterTree 用 absl::flat_hash_set 替掉 std::map —— 要 absl, 且只影响 FilteredRE2 (未导出)。
+652b816  RE2::Set::Size —— Go 侧 RegexpSet.Size() 早就有了 (自己记的条数), 重复。
+其余 (4f5fd7a/630d011/71f37d0/2a029e2/137ea7f/08d338f/09de536/2d39b70/f31c2c6/928a015/
+6bb550b/67570de/85dd7ad/2c25a64/c986ecd/6598a8e/1c1ffbe/b673de3/826ad10/0f3bf78/315514c/
+6dbafa4/49d776b/7df5539/61c4644/972a15c/f0402c0) 全是 abseil 迁移 / 注释 / 格式 / 测试脚手架。
+
+这批修复的对拍: upstream_backport_test.go (每条都拿 stdlib regexp 当 ground truth), 另外
+C++ 侧做过 4000 条随机 pattern × 24 份随机输入的 pre/post 全量对拍 (匹配位置 + 子组 + 替换结果),
+只有上面几条修复对应的用例发生变化, 其余逐字节相同。
+
+⚠️ 这批修复带来的一处【与 stdlib 的新差异】(上游行为, 已知并接受):
+   折叠字面量并进字符类时用的是完整 Unicode 折叠环, 于是 `\w|[kK]` 现在也匹配 U+212A (开尔文号),
+   stdlib 不匹配。同类现象在修复前就有 (`[sS]|\w` 一直匹配 U+017F), 这次只是变一致了。
+   只影响"折叠字面量与别的分支合并成字符类"这一种形状, 且只多命中 ASCII 之外的折叠等价字符。
 
 升级 RE2 版本
 -------------
 重新 git archive 新 tag, 覆盖 re2_*.cc / util_*.cc / internal_include/**. 注意 2023-03 起 RE2 依赖
 abseil, 那之后不能再这样直接 cgo (会缺 absl/*), 要回到 cmake 方案. 故本方案钉死在 2023-03-01.
-🔴 覆盖前先把上面"已改动的上游文件"那五个的 diff 存下来, 覆盖后重新打上去。
+🔴 覆盖前先把上面"已改动的上游文件"那五个的 diff 存下来, 覆盖后重新打上去
+   (`[backport re2 ...]` 标着的那批【不要】重打, 新版里本来就有)。
    漏掉头文件 (prog.h/set.h/dfa_stats.h) 会编译报错, 看得见; 但只漏掉 re2_dfa.cc 的话
    【一样编得过】—— 槽位悄悄退回 8 字节指针, 同预算装下的状态数掉回 1/1.74, 原本 0 flush
    的档可能开始 thrash, 除了变慢没有任何症状。所以升级后务必按 README 的方法重新量一遍

@@ -400,7 +400,14 @@ static bool TopEqual(Regexp* a, Regexp* b) {
              a->max() == b->max();
 
     case kRegexpCapture:
-      return a->cap() == b->cap() && a->name() == b->name();
+      // [backport re2 6148386] compare the names, not the pointers.
+      if (a->name() == NULL || b->name() == NULL) {
+        // One pointer is null, so the other pointer should also be null.
+        return a->cap() == b->cap() && a->name() == b->name();
+      } else {
+        // Neither pointer is null, so compare the pointees for equality.
+        return a->cap() == b->cap() && *a->name() == *b->name();
+      }
 
     case kRegexpHaveMatch:
       return a->match_id() == b->match_id();
