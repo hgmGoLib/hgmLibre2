@@ -55,6 +55,25 @@
       【建状态】—— 同一档 0 flush 下, 全新正文 23.7ms/份 vs 重扫同一批 0.36ms/份 (66 倍)。
       所以把预算调到 0 flush 是"别掉下悬崖"(必做, 且几乎不花物理内存), 不是"快 100 倍";
       每个请求都是新正文的场景, 那 23.7ms 就是上限, 要再快只能让【表】少造状态或者少扫正文。
+    - MatchReverse / MatchReverseBytes / MatchReverseStats, NewRegexpSetReverse(MaxMem):
+      【反着扫】—— 答案与 MatchString / 正向 Set 逐位相同, 但 DFA 从正文末尾往前走【原始 buffer】
+      (不反转正文、不复制正文, 多字节 UTF-8 也不会被拆散: 反向程序是 RE2 编译器自己编的)。
+      为的是 `S B{m,n} L` 这个形状 —— 起始类窄于重复类的计数重复, 正向 DFA 状态数对界指数,
+      反向线性。实测 [A-Za-z][A-Za-z0-9]{2,19}key × 120 份 8KB 语料: 正向 35149 状态 / 5.35MB,
+      反向 45 状态 / 0.01MB, 命中集一致。
+      ⚠ 只回答"命中没有 / 哪几条命中", 不回答"在哪" (反向只知道匹配左端)。要位置就用它当便宜的门,
+      少数命中的再正向 FindStringIndex 一次。
+      ⚠ 方向是【每条 pattern 各自】的决定: (?s).{20}key 正向 21 状态 / 反向 1,
+      key(?s).{20} 正好反过来。拿真语料各建一个单条 set 比 MemInfo().States 就知道该往哪边放。
+      ⚠ 这跟"自己把 pattern 倒着写 + 把正文倒过来"不是一回事, 而且库这条更省: RE2 的 Simplify
+      把 x{2,19} 展成"必需拷贝在前", 反序之后可选嵌套跑到读取顺序前面, 活跃起点集合互相嵌套
+      而不是任意子集。同一条语言同一串字节实测 17 状态 vs 手写反转 25247 状态。
+      详见 README.md#scanning-backwards。
+    - CompileMaxMem(pattern, maxMem) / MaxMem(): 单条 Regexp 的内存预算 (以前只有 Set 能调,
+      单条硬吃 RE2 默认 8MB)。同一个旋钮抬两条天花板 (编译期指令数上限 + 运行期 DFA 状态缓存额度),
+      口径与 NewRegexpSetMaxMem 完全一致。实测同上那条 pattern × 60 份 16KB 语料:
+      默认 8MB 下 flush 6 次, 256MB 下 0 次; 而反着扫在默认预算下就 0 次 (状态峰值 9)。
+      —— 调预算是拿内存换, 换方向不花钱, 形状允许就先换方向。
     - FreeC: 显式释放 native 句柄 (否则靠 finalizer)。
     - RegexpSet: N 条正则编进一个 DFA, 一遍扫回答"哪几条命中"。详见 README.md#regexpset。
       条数多到 NewRegexpSet 报 "set compile failed (out of memory)" 时,【不要拆成两个 set】
@@ -65,11 +84,18 @@
       Match/MatchAny/MatchBytes/MatchAnyBytes 不返回 error: Compile 过了之后运行期 DFA 不会爆
       (RE2 对 set 的 DFA 只 flush 缓存不 bail; 且 CompileSet 编译期就跑过 DFA 冒烟测试) —— 依据与
       实测见 README.md 的 "Why Match has no error return"。
-* vendored 的 re2 里【只有 re2_dfa.cc 不是上游原样】: 转移表槽位从 8 字节指针改成 4 字节
-  arena 下标 + arena 按需增长。同预算多装 1.74 倍状态 (0-flush 门槛降一档), 健康档吞吐不降,
-  峰值 RSS 约 -30%。命中集与原版逐位一致 (跨 pattern 表/语料/预算矩阵对拍钉死)。
+* vendored 的 re2 里改过的上游文件只有这几个 (完整清单与升级时怎么重打见 VENDOR.txt):
+  re2_dfa.cc 是大头 —— 转移表槽位从 8 字节指针改成 4 字节 arena 下标 + arena 按需增长。
+  同预算多装 1.74 倍状态 (0-flush 门槛降一档), 健康档吞吐不降, 峰值 RSS 约 -30%。
+  命中集与原版逐位一致 (跨 pattern 表/语料/预算矩阵对拍钉死)。
   要编原版对照: CGO_CXXFLAGS="-O2 -DRE2_DFA_NEXT_BITS=64 -DRE2_DFA_ARENA=0"。详见 README.md。
+  其余几处是【纯追加】: prog.h / set.h / re2_set.cc 上的观测出参与访问器, 外加
+  re2_compile.cc / re2_set.cc 上给 Prog::CompileSet 和 RE2::Set 加的 reversed (反着扫, 见上)。
 * 与 stdlib 的边角差异 (非法 UTF-8 上 . 的匹配、\C 等) 见 README.md 的 Caveats。
 * 测试: go test ./... (每个方法对拍 stdlib regexp; FindReplaceWithin 对拍 stdlib 等价嵌套写法;
   []byte 系见 bytes_test.go: 同语料下双向对拍 stdlib 与自家 string 孪生 + 每方法手算的命中/不命中
-  一对 (钉死 nil vs 空切片) + 零拷贝契约 (共享底层/输入不被改写/无改动复用 src/比 string(b) 少分配))。
+  一对 (钉死 nil vs 空切片) + 零拷贝契约 (共享底层/输入不被改写/无改动复用 src/比 string(b) 少分配);
+  反着扫见 reverse_test.go: 正反答案逐位对拍 (含 ^ $ \A \z (?m)^ \b (?i) (?s) 与多字节 UTF-8)
+  + 状态数确实塌下来 + 方向是每条 pattern 各自的决定 + 库的反向比手写反转便宜 100 倍以上
+  + 反向 DFA 放弃时退回正向且答案不变; 单条内存预算见 maxmem_test.go: 读回/编译失败/语义不变
+  + "默认预算 flush、给够就 0 flush" 这条曲线)。

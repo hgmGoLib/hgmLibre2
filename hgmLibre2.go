@@ -27,6 +27,10 @@ import (
 	"unsafe"
 )
 
+// DefaultMaxMem 是 RE2 的默认内存预算 (RE2::Options::kDefaultMaxMem = 8MB)。
+// Compile 用的就是它; CompileMaxMem 传 <=0 也回落到它。
+const DefaultMaxMem int64 = 8 << 20
+
 // maxCInt 是 C.int 能表示的最大正值. Go 侧把 len/pos cast 成 C.int 前据此守卫,
 // 避免超 2GiB 字符串溢出成错误偏移甚至越界 (C ABI 用 int 传长度/偏移).
 const maxCInt = 1<<31 - 1
@@ -51,12 +55,33 @@ func strBytePtr(s string) *C.char {
 }
 
 // Compile 编译一个 RE2 正则. 编译错误返回 error (不 panic).
-func Compile(pattern string) (*Regexp, error) {
+// 内存预算 = RE2 默认 DefaultMaxMem (8MB); 要自己定预算用 CompileMaxMem.
+func Compile(pattern string) (*Regexp, error) { return CompileMaxMem(pattern, 0) }
+
+// CompileMaxMem 同 Compile, 但显式指定这一条 pattern 的内存预算 maxMem (字节; <=0 = 用默认 8MB)。
+//
+// maxMem 就是 RE2::Options::max_mem, 一个旋钮同时抬两条天花板:
+//   - 编译期: 这条 pattern 的程序指令条数上限。撞了 → 本函数返回 error
+//     ("pattern too large - compile failed"), 翻倍重试即可。
+//   - 运行期: 剩下的额度给 DFA 状态缓存 (正向 prog 拿 2/3, 反向 prog 拿 1/3)。缓存装不下
+//     当前语料走出来的状态集时 DFA 不是 LRU 淘汰而是【整表清空重建】—— 结果仍然正确,
+//     所以调用方看不见任何信号, 但吞吐是几十倍的悬崖 (见 dfastats.go 的开头)。
+//
+// 什么时候需要动它: 单条 pattern 里有【起始类窄于重复类】的计数重复 (如
+// `[A-Za-z][A-Za-z0-9]{2,19}key`) 时, 正向 DFA 的状态数对界指数增长, 默认 8MB 装不下,
+// 于是每份新正文都把缓存冲垮一次。两条出路二选一或都用:
+//   - 把预算调大 (本函数), 用内存换掉 thrash;
+//   - 反着扫 (CompileReverse 编一个 RegexpReverse), 让状态数从指数塌回线性 ——
+//     这一条不花内存, 但只回答"命中没有"。
+//
+// 怎么标定: 拿一批【互不相同】的真语料单线程跑一遍, 看 RegexpReverse.MatchStats/ScanStats 的
+// Flushes 或进程级 DFAStats().Resets 增量; >0 就翻倍重来, 直到增量归零。
+func CompileMaxMem(pattern string, maxMem int64) (*Regexp, error) {
 	if len(pattern) > maxCInt {
 		return nil, errors.New("re2native: pattern too large (>2GiB)")
 	}
 	p := strBytePtr(pattern)
-	h := C.cre2_new(p, C.int(len(pattern)))
+	h := C.cre2_new_max_mem(p, C.int(len(pattern)), C.int64_t(maxMem))
 	runtime.KeepAlive(pattern)
 	if h == nil {
 		return nil, errors.New("re2native: out of memory")
@@ -104,6 +129,13 @@ func (re *Regexp) FreeC() {
 	C.cre2_free(re.h)
 	re.h = nil
 	runtime.SetFinalizer(re, nil)
+}
+
+// MaxMem 返回这条 Regexp 编译时实际生效的内存预算 (字节)。Compile 出来的就是 DefaultMaxMem。
+func (re *Regexp) MaxMem() int64 {
+	n := int64(C.cre2_max_mem(re.h))
+	runtime.KeepAlive(re)
+	return n
 }
 
 // MustCompile 同 Compile, 失败 panic. 对齐 go-re2/stdlib MustCompile.

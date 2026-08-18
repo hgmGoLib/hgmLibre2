@@ -2,30 +2,52 @@
 #include "cre2.h"
 #include "re2/re2.h"
 #include "re2/set.h"
+// 反着扫要直接用 re2 的内部件: Regexp::Parse + Regexp::CompileToReverseProg + Prog::SearchDFA。
+// 走 RE2 对象本身不行 —— 它的 rprog_ 是从【剥掉必需前缀之后】的 suffix_regexp_ 编的,
+// 只在"已经知道匹配右端在哪"的场景下用, 拿来当整篇非锚定搜索会漏。
+#include "re2/prog.h"
+#include "re2/regexp.h"
+#include "re2/stringpiece.h"
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <new>
 #include <string>
 #include <vector>
 
 struct cre2_re {
 	RE2 *re;
+	int64_t max_mem;         // 这个 handle 编译时用的 RE2::Options::max_mem
+	// 反向程序惰性建: 大多数 handle 一辈子不走反向, 不该白付一次编译。
+	re2::Regexp *rre;        // pattern 的独立解析 (只给 rprog 用)
+	re2::Prog *rprog;        // 反向程序; 建失败留 NULL → 退回正向
+	std::once_flag ronce;
 };
 
 extern "C" {
 
-cre2_re *cre2_new(const char *pat, int patlen) {
+cre2_re *cre2_new_max_mem(const char *pat, int patlen, int64_t max_mem) {
 	re2::StringPiece sp(pat, patlen);
 	RE2::Options opt;
 	opt.set_log_errors(false); // 别往 stderr 喷, 错误走 cre2_error 取
-	cre2_re *h = new (std::nothrow) cre2_re;
+	if (max_mem > 0) {
+		opt.set_max_mem(max_mem); // <=0 保持 RE2 默认 kDefaultMaxMem=8MB
+	}
+	cre2_re *h = new (std::nothrow) cre2_re();
 	if (h == nullptr) {
 		return nullptr;
 	}
 	h->re = new RE2(sp, opt);
+	h->max_mem = h->re->options().max_mem(); // 回读: <=0 时是 RE2 填的默认值
+	h->rre = nullptr;
+	h->rprog = nullptr;
 	return h;
 }
+
+cre2_re *cre2_new(const char *pat, int patlen) { return cre2_new_max_mem(pat, patlen, 0); }
+
+int64_t cre2_max_mem(const cre2_re *h) { return h->max_mem; }
 
 int cre2_ok(const cre2_re *h) { return h->re->ok() ? 1 : 0; }
 
@@ -328,8 +350,73 @@ void cre2_free(cre2_re *h) {
 	if (h == nullptr) {
 		return;
 	}
+	delete h->rprog;
+	if (h->rre != nullptr) {
+		h->rre->Decref();
+	}
 	delete h->re;
 	delete h;
+}
+
+// ── 反着扫 (单条) ────────────────────────────────────────────────────────────
+// 惰性把 pattern 再解析一遍并编成【反向程序】。用完整 pattern 而不是 RE2 的 suffix_regexp_,
+// 理由见文件头的 include 注释。编不出来就留 NULL, 调用方退回正向 —— 反向只是加速手段, 不是语义。
+static re2::Prog *cre2_rev_prog(const cre2_re *h) {
+	cre2_re *m = const_cast<cre2_re *>(h);
+	std::call_once(m->ronce, [m]() {
+		if (!m->re->ok()) {
+			return;
+		}
+		re2::Regexp::ParseFlags pf = static_cast<re2::Regexp::ParseFlags>(m->re->options().ParseFlags());
+		re2::RegexpStatus st;
+		re2::StringPiece pat(m->re->pattern());
+		re2::Regexp *rre = re2::Regexp::Parse(pat, pf, &st);
+		if (rre == nullptr) {
+			return; // RE2 自己已经编过一遍了, 走到这里说明 pattern 本来就坏 —— re->ok() 会是 false
+		}
+		re2::Prog *prog = rre->CompileToReverseProg(m->max_mem);
+		if (prog == nullptr) {
+			rre->Decref();
+			return;
+		}
+		m->rre = rre;
+		m->rprog = prog;
+	});
+	return m->rprog;
+}
+
+cre2_rev_match_result cre2_partial_match_reverse(const cre2_re *h, const char *text, int textlen, int want_stats) {
+	cre2_rev_match_result r;
+	memset(&r, 0, sizeof r);
+	const char *base = text ? text : ""; // 空串也喂合法指针 (同 cre2_match_at)
+	re2::StringPiece sp(base, textlen);
+	re2::Prog *prog = cre2_rev_prog(h);
+	if (prog != nullptr) {
+		bool failed = false;
+		re2::DFAScanStats st;
+		// text==context: 让 ^ / $ / \b 看到的是整篇正文的边界。
+		// SearchDFA 内部对 reversed_ 程序会把 caret/dollar 换回来, 并在 pattern 带 ^ 时
+		// 走 endmatch 检查 (要求反向搜索的落点正好是 text 起点) —— 锚定语义不用我们自己补。
+		bool ok = prog->SearchDFA(sp, sp, re2::Prog::kUnanchored, re2::Prog::kFirstMatch, NULL, &failed, NULL,
+		                          want_stats ? &st : NULL);
+		if (!failed) {
+			r.Matched = ok ? 1 : 0;
+			if (want_stats) {
+				r.Stats.Flushes = st.flushes;
+				r.Stats.Grows = st.grows;
+				r.Stats.StatesBuilt = st.states_built;
+				r.Stats.Bytes = st.bytes;
+				r.Stats.StatesEnd = st.states_end;
+				r.Stats.StateBudget = st.state_budget;
+				r.Stats.MemLeft = st.mem_left;
+			}
+			return r;
+		}
+		// failed = 反向 DFA 中途放弃 (预算不够, RE2 对 kFirstMatch 有"造状态太慢就 bail"的启发式)。
+	}
+	r.FellBack = 1;
+	r.Matched = RE2::PartialMatch(sp, *h->re) ? 1 : 0;
+	return r;
 }
 
 // ── RE2::Set 包装 ────────────────────────────────────────────────────────────
@@ -337,7 +424,7 @@ struct cre2_set {
 	RE2::Set *set;
 };
 
-cre2_set *cre2_set_new(int64_t max_mem) {
+cre2_set *cre2_set_new_ex(int64_t max_mem, int reversed) {
 	RE2::Options opt;
 	opt.set_log_errors(false);
 	if (max_mem > 0) {
@@ -347,13 +434,17 @@ cre2_set *cre2_set_new(int64_t max_mem) {
 	if (h == nullptr) {
 		return nullptr;
 	}
-	h->set = new (std::nothrow) RE2::Set(opt, RE2::UNANCHORED);
+	h->set = new (std::nothrow) RE2::Set(opt, RE2::UNANCHORED, reversed != 0);
 	if (h->set == nullptr) {
 		delete h;
 		return nullptr;
 	}
 	return h;
 }
+
+cre2_set *cre2_set_new(int64_t max_mem) { return cre2_set_new_ex(max_mem, 0); }
+
+int cre2_set_reversed(const cre2_set *h) { return h->set->reversed() ? 1 : 0; }
 
 int cre2_set_add(cre2_set *h, const char *pat, int patlen) {
 	re2::StringPiece sp(pat, patlen);
@@ -375,6 +466,15 @@ int cre2_set_match(const cre2_set *h, const char *text, int textlen, int *out, i
 		out[i] = v[i];
 	}
 	return n;
+}
+
+int cre2_set_match_any(const cre2_set *h, const char *text, int textlen) {
+	const char *base = text ? text : "";
+	re2::StringPiece sp(base, textlen);
+	// v=NULL: Set::Match 不建 SparseSet → Prog::SearchDFA 里 matches==NULL 把 want_earliest_match
+	// 打开 → DFA 命中第一个位置就返回, 正文剩下的字节根本不看。DFA 缓存与 cre2_set_match 共用
+	// (kManyMatch 那一份), 所以这条快路径不会额外占一份状态缓存。
+	return h->set->Match(sp, NULL) ? 1 : 0;
 }
 
 int cre2_set_match_stats(const cre2_set *h, const char *text, int textlen,

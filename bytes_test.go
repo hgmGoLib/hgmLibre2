@@ -189,7 +189,7 @@ func TestRegexpSetBytes(t *testing.T) {
 
 	// 命中: 只有 bar 那条
 	eq(t, set.MatchBytes([]byte("xx bar xx"), buf), []int32{1}, "MatchBytes 命中")
-	eq(t, set.MatchAnyBytes([]byte("xx bar xx"), buf), true, "MatchAnyBytes 命中")
+	eq(t, set.MatchAnyBytes([]byte("xx bar xx")), true, "MatchAnyBytes 命中")
 
 	// 命中多条
 	got := set.MatchBytes([]byte("zed foo7 bar"), buf)
@@ -197,7 +197,7 @@ func TestRegexpSetBytes(t *testing.T) {
 
 	// 不命中
 	eq(t, set.MatchBytes([]byte("nothing at all"), buf), []int32{}, "MatchBytes 不命中应为空")
-	eq(t, set.MatchAnyBytes([]byte("nothing at all"), buf), false, "MatchAnyBytes 不命中")
+	eq(t, set.MatchAnyBytes([]byte("nothing at all")), false, "MatchAnyBytes 不命中")
 
 	// 与 string 版一致
 	for _, in := range testInputs {

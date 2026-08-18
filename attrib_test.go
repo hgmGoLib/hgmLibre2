@@ -33,7 +33,7 @@ func TestAttrib_DisabledIsHonest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	buf := make([]int32, set.Size())
+	buf := make([]int32, set.GetPatternLen())
 	set.Match(attribBody(pats), buf)
 
 	a := set.Attrib()
@@ -56,7 +56,7 @@ func TestAttrib_RanksTheExpensivePattern(t *testing.T) {
 	}
 
 	body := attribBody(pats[:20]) + "kwZz" + strings.Repeat("y", 300)
-	buf := make([]int32, set.Size())
+	buf := make([]int32, set.GetPatternLen())
 	set.Match(body, buf)
 
 	a := set.Attrib()
@@ -119,7 +119,7 @@ func TestAttrib_SameMatchesAsPlain(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := attribBody(pats) + "tgtAa"
-	buf := make([]int32, set.Size())
+	buf := make([]int32, set.GetPatternLen())
 	got := append([]int32(nil), set.Match(body, buf)...)
 
 	// 逐条单独跑一遍作对照

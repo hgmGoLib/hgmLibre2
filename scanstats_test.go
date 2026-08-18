@@ -6,6 +6,7 @@
 package hgmLibre2
 
 import (
+	"sort"
 	"sync"
 	"testing"
 )
@@ -22,7 +23,7 @@ func TestScanStats_AttributesFlushToTheCall(t *testing.T) {
 	if err != nil {
 		t.Fatalf("建集失败: %v", err)
 	}
-	buf := make([]int32, set.Size())
+	buf := make([]int32, set.GetPatternLen())
 
 	DFAStatsZero()
 	var st ScanStats
@@ -66,7 +67,7 @@ func TestScanStats_QuietWhenBudgetFits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("建集失败: %v", err)
 	}
-	buf := make([]int32, set.Size())
+	buf := make([]int32, set.GetPatternLen())
 	for _, b := range bodies {
 		set.Match(b, buf)
 	}
@@ -95,8 +96,8 @@ func TestScanStats_PerSetAttribution(t *testing.T) {
 	if err != nil {
 		t.Fatalf("建宽集失败: %v", err)
 	}
-	bufA := make([]int32, starved.Size())
-	bufB := make([]int32, fat.Size())
+	bufA := make([]int32, starved.GetPatternLen())
+	bufB := make([]int32, fat.GetPatternLen())
 	for _, b := range bodies { // 把宽集热身好
 		fat.Match(b, bufB)
 	}
@@ -148,7 +149,7 @@ func TestSetMemInfo_TracksUsage(t *testing.T) {
 	if again := set.MemInfo(); again.States != before.States || again.StatesBuiltTotal != before.StatesBuiltTotal {
 		t.Fatalf("连查两次水位就变了 —— 查询在制造状态: %+v -> %+v", before, again)
 	}
-	buf := make([]int32, set.Size())
+	buf := make([]int32, set.GetPatternLen())
 	var st ScanStats
 	var built int64
 	for _, b := range bodies {
@@ -186,8 +187,8 @@ func TestScanStats_SameResultAsMatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("建集失败: %v", err)
 	}
-	a := make([]int32, set.Size())
-	b := make([]int32, set.Size())
+	a := make([]int32, set.GetPatternLen())
+	b := make([]int32, set.GetPatternLen())
 	var st ScanStats
 	for i, body := range bodies {
 		want := append([]int32(nil), set.Match(body, a)...)
@@ -220,7 +221,7 @@ func TestScanStats_ConcurrentDoesNotCrash(t *testing.T) {
 		wg.Add(1)
 		go func(w int) {
 			defer wg.Done()
-			buf := make([]int32, set.Size())
+			buf := make([]int32, set.GetPatternLen())
 			var st ScanStats
 			for r := 0; r < 3; r++ {
 				for _, b := range bodies {
@@ -239,5 +240,84 @@ func TestScanStats_ConcurrentDoesNotCrash(t *testing.T) {
 	t.Logf("并发 %d 线程合计 flush %d 次, Set 生涯 %d 次: %+v", nw, sum, mi.FlushesTotal, mi)
 	if sum != mi.FlushesTotal {
 		t.Fatalf("并发下 per-scan 合计 %d != 生涯 %d", sum, mi.FlushesTotal)
+	}
+}
+
+// TestScanStats_MatchStatsBytesMatchesStringVersion — MatchStatsBytes 是 MatchStats 的 []byte
+// 零拷贝壳, 它唯一能出的错就是"壳没接对": 索引不一致、计数没回填、或者 nil st 的短路走岔。
+//
+// 计数怎么比: DFA 状态缓存是跨调用复用的, 冷启动那次会 StatesBuilt>0, 第二次就是 0 —— 直接拿
+// 两次调用对比会假阳。所以先把两种正文都热身过一遍, 再比【热态】读数: 此时两边都该是
+// Flushes=0 / StatesBuilt=0, 且 Bytes / StateBudget / StatesEnd / MemLeft 逐字段相等。
+func TestScanStats_MatchStatsBytesMatchesStringVersion(t *testing.T) {
+	set, err := NewRegexpSetMaxMem([]string{`bar[0-9]`, `zed[a-z]{3}`, `foo`, `^head`}, 64<<20)
+	if err != nil {
+		t.Fatalf("建集失败: %v", err)
+	}
+	buf := make([]int32, set.GetPatternLen())
+	inputs := []string{"", "nothing at all", "bar7", "xx foo xx", "zedabc bar1", "head foo zedxyz bar9"}
+
+	// 热身: 让两条路都跑一遍, 把冷启动要建的状态建完。
+	var warm ScanStats
+	for _, in := range inputs {
+		set.MatchStats(in, buf, &warm)
+		set.MatchStatsBytes([]byte(in), buf, &warm)
+	}
+
+	for _, in := range inputs {
+		var stS, stB ScanStats
+		gotS := append([]int32(nil), set.MatchStats(in, buf, &stS)...)
+		gotB := append([]int32(nil), set.MatchStatsBytes([]byte(in), buf, &stB)...)
+		sort.Slice(gotS, func(i, j int) bool { return gotS[i] < gotS[j] })
+		sort.Slice(gotB, func(i, j int) bool { return gotB[i] < gotB[j] })
+		if len(gotS) != len(gotB) {
+			t.Fatalf("in=%q: MatchStatsBytes 命中 %v, MatchStats 命中 %v", in, gotB, gotS)
+		}
+		for i := range gotS {
+			if gotS[i] != gotB[i] {
+				t.Fatalf("in=%q: 命中集不一致 bytes=%v string=%v", in, gotB, gotS)
+			}
+		}
+		if stB.Bytes != int64(len(in)) {
+			t.Fatalf("in=%q: MatchStatsBytes 的 Bytes=%d 应为 %d", in, stB.Bytes, len(in))
+		}
+		if stB != stS {
+			t.Fatalf("in=%q: 热态下两条路的 ScanStats 应当逐字段相等\n bytes =%+v\n string=%+v", in, stB, stS)
+		}
+		if stB.Flushes != 0 || stB.StatesBuilt != 0 {
+			t.Fatalf("in=%q: 64MB 预算 + 热身后不该再有 flush/建状态, 实得 %+v", in, stB)
+		}
+		if stB.FellBack {
+			t.Fatalf("in=%q: RegexpSet 的 MatchStats 不存在退回, FellBack 必须恒为 false", in)
+		}
+	}
+
+	// st=nil 走的是 MatchBytes 短路, 结果仍要与带 st 的一致。
+	for _, in := range inputs {
+		var st ScanStats
+		want := set.MatchStatsBytes([]byte(in), buf, &st)
+		got := set.MatchStatsBytes([]byte(in), buf, nil)
+		if len(got) != len(want) {
+			t.Fatalf("in=%q: st=nil 时命中 %v, 带 st 时 %v", in, got, want)
+		}
+	}
+
+	// nil / 空 []byte: 不许 panic, 且与空 string 一路。
+	var st ScanStats
+	if n := len(set.MatchStatsBytes(nil, buf, &st)); n != 0 {
+		t.Fatalf("nil []byte 不该命中, 实得 %d 条", n)
+	}
+	if st.Bytes != 0 {
+		t.Fatalf("nil []byte 的 Bytes 应为 0, 实得 %d", st.Bytes)
+	}
+	if n := len(set.MatchStatsBytes([]byte{}, buf, &st)); n != 0 {
+		t.Fatalf("空 []byte 不该命中, 实得 %d 条", n)
+	}
+
+	// buf 给得比 pattern 数小时内部会自己扩, 不能因为 []byte 这层壳就丢结果。
+	var small []int32
+	var stSmall ScanStats
+	if n := len(set.MatchStatsBytes([]byte("head foo zedxyz bar9"), small, &stSmall)); n != 4 {
+		t.Fatalf("buf 为 nil 时应当自扩并命中 4 条, 实得 %d", n)
 	}
 }

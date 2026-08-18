@@ -131,7 +131,7 @@ func TestSetHitsMatchTruthUnderStarvedBudget(t *testing.T) {
 	if err != nil {
 		t.Fatalf("建集失败: %v", err)
 	}
-	buf := make([]int32, set.Size())
+	buf := make([]int32, set.GetPatternLen())
 	var st ScanStats
 	var flushes, grows, built int64
 	for round := 0; round < 2; round++ { // 第二轮: flush 之后重建出来的状态照样得对
@@ -177,7 +177,7 @@ func TestSetHitsMatchTruthConcurrent(t *testing.T) {
 		wg.Add(1)
 		go func(k int) {
 			defer wg.Done()
-			buf := make([]int32, set.Size())
+			buf := make([]int32, set.GetPatternLen())
 			var st ScanStats
 			for round := 0; round < 3; round++ {
 				for i := range bodies {

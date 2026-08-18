@@ -69,6 +69,8 @@ as `regexp.Compile` (RE2's default Perl mode), *not* leftmost-longest — e.g.
 `(a|aa)` on `"aa"` yields `"a"`, just like stdlib. UTF-8 input.
 
 - `Compile`, `MustCompile`, `QuoteMeta`
+- `CompileMaxMem` / `MaxMem` — *not* in stdlib; the RE2 memory budget for **one** pattern
+  (`Compile` uses RE2's 8 MB default); see [Scanning backwards](#scanning-backwards) for when it matters
 - `String`, `NumSubexp`, `SubexpNames`
 - `MatchString`
 - `FindString`, `FindStringIndex`, `FindStringSubmatch`, `FindStringSubmatchIndex`
@@ -80,9 +82,10 @@ as `regexp.Compile` (RE2's default Perl mode), *not* leftmost-longest — e.g.
   `FindAllSubmatch`, `FindAllSubmatchIndex`, `ReplaceAll`, `ReplaceAllFunc` —
   see [Byte-slice methods](#byte-slice-methods) below
 - `FindReplaceWithin` / `FindReplaceWithinBytes` — *not* in stdlib; see [FindReplaceWithin](#findreplacewithin) below
-- `RegexpSet` (`NewRegexpSet`, `NewRegexpSetMaxMem`, `Size`, `Match`, `MatchAny`, `MatchBytes`,
-  `MatchAnyBytes`) — *not* in stdlib; one DFA answering "which of these N patterns hit" in a
-  single scan; see [RegexpSet](#regexpset) below
+- `RegexpSet` (`NewRegexpSet`, `NewRegexpSetMaxMem`, `GetPatternLen`, `Match`, `MatchAny`,
+  `MatchBytes`, `MatchAnyBytes`) — *not* in stdlib; one DFA answering "which of these N patterns
+  hit" in a single scan; `MatchAny` drops the indices and returns at the **first** hit position
+  instead of scanning to the end; see [RegexpSet](#regexpset) below
 - `RegexpSet.MatchStats` / `MatchStatsBytes` (`ScanStats`) and `RegexpSet.MemInfo` (`SetMemInfo`)
   — *not* in stdlib; **per-scan** and **per-Set** DFA counters (flushes, states built, budget
   left); see [Measuring a Set](#measuring-a-set) below
@@ -95,6 +98,12 @@ as `regexp.Compile` (RE2's default Perl mode), *not* leftmost-longest — e.g.
   a scratch-reusing `FindStringIndex` that is steady-state allocation-free
 - `AppendAllStringIndexFlat` — *not* in stdlib; `FindAllStringIndex` without the intermediate
   `[][]int`; see [AppendAllStringIndexFlat](#appendallstringindexflat) below
+- `RegexpReverse` (`CompileReverse`, `CompileReverseMaxMem`, `MustCompileReverse`, `MatchString`,
+  `Match`, `MatchStats`) — *not* in stdlib; a **separate object** that gives the same yes/no
+  answer as a forward `Regexp`, with the DFA walking the **original buffer back to front**;
+  see [Scanning backwards](#scanning-backwards) below
+- `NewRegexpSetReverseMaxMem` / `RegexpSet.Reverse` — *not* in stdlib;
+  the same for a whole set; see [Scanning backwards](#scanning-backwards) below
 - `FreeC` — *not* in stdlib; see [Resource management](#resource-management)
 
 ### Byte-slice methods
@@ -393,6 +402,95 @@ scan alone forced 5 679 state-cache flushes. Across every run: zero
 oracle exactly, every time. The same DFA-failure hook *does* fire, as expected,
 for single-`Regexp` matching under a starved budget — and there it is harmless,
 because a lone `RE2` falls back to the NFA and still returns the correct answer.
+
+### Scanning backwards
+
+`S B{m,n} L` — a counted repeat whose **start class is strictly narrower than
+its repeat class**, ending in a literal — is the shape that blows the state
+count up. `[A-Za-z][A-Za-z0-9]{2,19}key` is the canonical one: every letter can
+open a candidate match, every following alphanumeric keeps it alive, so a DFA
+state has to remember *which* of the last 20 offsets are still live. That set is
+an arbitrary subset, so the state count is exponential in the bound.
+
+No rewrite fixes this. `(a|b)*a(a|b)^k` needs 2^k states in *any* DFA, minimal
+included, so it is a property of the language and not of RE2. But the **reverse**
+language, `(a|b)^k a(a|b)*`, needs k+2. Direction is the lever.
+
+Forward and reverse are **two objects**, not two methods on one — a pattern's two
+directions are two programs with two DFA caches, and a pattern normally only ever
+runs in one of them:
+
+```go
+rev, _ := hgmLibre2.CompileReverse(`[A-Za-z][A-Za-z0-9]{2,19}key`)
+hit := rev.MatchString(text)          // same answer a forward Regexp would give
+
+set, _ := hgmLibre2.NewRegexpSetReverseMaxMem(patterns, hgmLibre2.DefaultSetMaxMem)
+idx := set.Match(text, buf)           // same hit set as a forward set
+```
+
+The reverse program is built by RE2's own compiler (concatenations reversed,
+`^`/`$` swapped, `\b` unchanged, multi-byte UTF-8 sequences re-encoded
+back-to-front) and the DFA then walks **your buffer** from the end. Nothing is
+copied and nothing is reversed by the caller.
+
+Measured on 120 distinct 8 KB bodies, one pattern per set so the memory is
+attributable:
+
+| | states | state cache | hit set |
+|---|---:|---:|---|
+| forward | 35 149 | 5.35 MB | 16 |
+| reverse | 45 | 0.01 MB | 16 |
+
+**What it costs you.** Reverse answers "is there a match", not "where". There is
+no `Find` on `RegexpReverse` and none is planned: a reverse scan stops at the
+left edge of a match and never learns the right one, and it meets the *last*
+match in the input first — so a reverse `Find` could only ever be rightmost,
+which is a different semantics from the forward leftmost-first one. Use reverse
+as the cheap gate and run `FindStringIndex` on a forward `Regexp` for the few
+inputs that hit; positions keep the forward semantics.
+
+**Direction is a per-pattern decision, not a global switch.** The mirror shape
+loses by the same mechanism it wins by: on a corpus containing no `key`,
+`(?s).{20}key` costs 21 states forward and 1 reverse, while `key(?s).{20}` costs
+1 forward and 21 reverse. Measure both directions on real input — build a
+one-pattern set each way and compare `MemInfo().States` — then put each pattern
+in whichever set matches its cheap direction. Two scans over the input still
+beat one scan that is thrashing.
+
+**This is not "reverse the pattern text yourself".** Writing the pattern
+backwards and reversing the input gets the same *answer* but not the same cost.
+RE2's `Simplify` expands `x{2,19}` with the mandatory copies first and the
+optional nest after; reversing the concatenation moves that optional nest to the
+*front* of the read order, and the live-start sets then nest inside one another
+instead of forming arbitrary subsets. Same language, same bytes, different
+automaton: 17 states through this API versus 25 247 for the hand-rolled version
+(`TestReverseIsNotHandRolledTextReversal`). Hand-rolled reversal also splits
+multi-byte UTF-8 and needs a second copy of the input.
+
+**Why a separate type.** A reverse scan runs a *second* `Prog`
+(`Regexp::CompileToReverseProg`), and a DFA state cache belongs to its `Prog`
+(`Prog::dfa_first_` / `dfa_longest_`) — so the two directions are two programs
+and two caches no matter how the Go API is shaped. `RegexpReverse` makes that
+visible: one object, one direction, one cache, and the caller can see from the
+type which direction the pattern is running. Want both directions for the same
+pattern? Compile both objects.
+
+**Budgets and the fallback.** The reverse program is compiled lazily on the first
+scan, with the budget from `CompileReverseMaxMem` (`CompileReverse` gives it
+RE2's 8 MB default). If the reverse DFA gives up mid-scan — RE2 bails out of a
+`Prog` search that is building states faster than it consumes input — the object
+silently falls back to one forward match of its own. The answer is always
+correct; `MatchStats` reports `FellBack` so you can tell that a scan did not get
+the saving. `RegexpSet` never bails (RE2 only flushes for `kManyMatch`), so a
+reverse set has no fallback path.
+
+**The other lever is memory.** `CompileMaxMem` raises the budget for a single
+pattern the way `NewRegexpSetMaxMem` does for a set — same knob, same two
+ceilings ([Sizing `maxMem`](#sizing-maxmem)). On the pattern above, 60 distinct
+16 KB bodies flush the cache 6 times at the 8 MB default and 0 times at 256 MB.
+Reverse scanning gets to 0 flushes at the *default* budget, with a peak of 9
+states. Raising the budget buys throughput with RAM; scanning backwards buys it
+with nothing, when the shape allows.
 
 ### AppendAllStringIndexFlat
 

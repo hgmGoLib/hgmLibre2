@@ -33,7 +33,7 @@ type RegexpSet struct {
 
 // DefaultSetMaxMem 是 RE2 的默认内存预算 (RE2::Options::kDefaultMaxMem = 8MB)。
 // NewRegexpSet 用的就是它; NewRegexpSetMaxMem 传 <=0 也回落到它。
-const DefaultSetMaxMem int64 = 8 << 20
+const DefaultSetMaxMem int64 = DefaultMaxMem
 
 // NewRegexpSet 把 patterns 顺序编进一个 RE2::Set (内存预算 = RE2 默认 8MB)。任一条解析失败 /
 // 编译失败 → 返回 error (并释放已分配的 native 资源)。Match 输出的 index 即 patterns 的下标。
@@ -55,10 +55,20 @@ func NewRegexpSet(patterns []string) (*RegexpSet, error) {
 // 怎么定: 从默认 8MB 起, 撞了就翻倍 (16/32/64MB) 直到 Compile 通过。构建期一次性开销, 之后常驻
 // 只读; 内存换的是"一个 set 装下整表" —— 拆成两个 set 要扫两遍正文, 更贵。
 func NewRegexpSetMaxMem(patterns []string, maxMem int64) (*RegexpSet, error) {
+	return newRegexpSet(patterns, maxMem, false)
+}
+
+// newRegexpSet 是正向 (NewRegexpSetMaxMem) 与反向 (NewRegexpSetReverseMaxMem) 共用的构建体。
+// 两者只差 cre2_set_new_ex 的 reversed 位, 其余 (逐条 Add · 编译 · finalizer · 错误文案) 一样。
+func newRegexpSet(patterns []string, maxMem int64, reversed bool) (*RegexpSet, error) {
 	if maxMem <= 0 {
 		maxMem = DefaultSetMaxMem
 	}
-	h := C.cre2_set_new(C.int64_t(maxMem))
+	crev := C.int(0)
+	if reversed {
+		crev = C.int(1)
+	}
+	h := C.cre2_set_new_ex(C.int64_t(maxMem), crev)
 	if h == nil {
 		return nil, errors.New("re2native: set out of memory")
 	}
@@ -88,8 +98,8 @@ func NewRegexpSetMaxMem(patterns []string, maxMem int64) (*RegexpSet, error) {
 	return s, nil
 }
 
-// Size 返回集合里的 pattern 数。
-func (s *RegexpSet) Size() int { return s.size }
+// GetPatternLen 返回集合里的 pattern 条数 (= Match 输出 index 的上界, 也是 buf 该开的长度)。
+func (s *RegexpSet) GetPatternLen() int { return s.size }
 
 // Match 扫 text 一遍, 把命中的 pattern index 写进 buf (传入复用切片避免每次分配) 并返回其前缀切片。
 // 返回切片里每个元素是 patterns 的下标 (无序 · 不重复)。无命中返回长度 0 的切片。
@@ -143,6 +153,10 @@ type ScanStats struct {
 	// MemLeft 是扫完时的剩余额度。已用 = StateBudget - MemLeft; MemLeft 见底就是下次 Flush 的前夜。
 	StateBudget int64
 	MemLeft     int64
+	// FellBack 只有 (*RegexpReverse).MatchStats 会置 true: 反向 DFA 这次没跑成 (反向程序
+	// 编译不出来 / DFA 中途放弃), 结果是退回正向 MatchString 得到的 —— 答案仍然正确, 只是
+	// 这次没省到状态, 其余字段全 0。RegexpSet 的 MatchStats 恒为 false。
+	FellBack bool
 }
 
 // MatchStats 同 Match, 外加把【这一次扫描】的 DFA 计数写进 st (st 可为 nil)。
@@ -337,9 +351,22 @@ func (s *RegexpSet) MemInfo() SetMemInfo {
 	}
 }
 
-// MatchAny 报告 text 是否命中集合里【任一】正则 (一次扫描 · 不取具体 index · 走快路径)。
-func (s *RegexpSet) MatchAny(text string, buf []int32) bool {
-	return len(s.Match(text, buf)) > 0
+// MatchAny 报告 text 是否命中集合里【任一】正则 —— 【第一个命中位置就返回】, 不把正文扫完。
+//
+// 与 len(Match(...))>0 的差别不只是省一个切片: Match 要回答"哪几条", DFA 必须走到正文末尾才
+// 知道命中集全不全; MatchAny 不取 index, 底下 RE2 的 SearchDFA 就打开 want_earliest_match,
+// 扫到第一个命中位置立刻收工 —— 命中越早、正文越长, 省得越多 (不命中仍然是全扫一遍)。
+// 因为不回填 index, 这里也不需要调用方传 buf。
+//
+// 走的是与 Match 同一份 DFA 状态缓存 (kManyMatch 那一份), 不会因为多这条快路径而多占一份。
+func (s *RegexpSet) MatchAny(text string) bool {
+	if s.size == 0 || len(text) > maxCInt {
+		return false
+	}
+	hit := C.cre2_set_match_any(s.h, strBytePtr(text), C.int(len(text))) != 0
+	runtime.KeepAlive(text)
+	runtime.KeepAlive(s)
+	return hit
 }
 
 // MatchBytes 同 Match, 但正文是 []byte (零拷贝喂给同一内核, 不做 string(text) 全量拷贝)。
@@ -350,7 +377,9 @@ func (s *RegexpSet) MatchBytes(text []byte, buf []int32) []int32 {
 	return hit
 }
 
-// MatchAnyBytes 同 MatchAny, 但正文是 []byte。
-func (s *RegexpSet) MatchAnyBytes(text []byte, buf []int32) bool {
-	return len(s.MatchBytes(text, buf)) > 0
+// MatchAnyBytes 同 MatchAny, 但正文是 []byte (零拷贝)。
+func (s *RegexpSet) MatchAnyBytes(text []byte) bool {
+	hit := s.MatchAny(bytesStr(text))
+	runtime.KeepAlive(text)
+	return hit
 }

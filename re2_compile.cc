@@ -105,7 +105,8 @@ class Compiler : public Regexp::Walker<Frag> {
 
   // Compiles alternation of all the re to a new Prog.
   // Each re has a match with an id equal to its index in the vector.
-  static Prog* CompileSet(Regexp* re, RE2::Anchor anchor, int64_t max_mem);
+  static Prog* CompileSet(Regexp* re, RE2::Anchor anchor, int64_t max_mem,
+                          bool reversed);
 
   // Interface for Regexp::Walker, which helps traverse the Regexp.
   // The walk is purely post-recursive: given the machines for the
@@ -1212,9 +1213,16 @@ Frag Compiler::DotStar() {
 }
 
 // Compiles RE set to Prog.
-Prog* Compiler::CompileSet(Regexp* re, RE2::Anchor anchor, int64_t max_mem) {
+Prog* Compiler::CompileSet(Regexp* re, RE2::Anchor anchor, int64_t max_mem,
+                           bool reversed) {
+  // ── hgmLibre2 追加 ── 反向 set 只支持 UNANCHORED: ANCHOR_START/ANCHOR_BOTH 会让
+  // PostVisit 在 HaveMatch 前面 Cat 一个 \z, 反序之后位置就错了。调用方 (cre2) 只用 UNANCHORED。
+  if (reversed && anchor != RE2::UNANCHORED)
+    return NULL;
+
   Compiler c;
   c.Setup(re->parse_flags(), max_mem, anchor);
+  c.reversed_ = reversed;
 
   Regexp* sre = re->Simplify();
   if (sre == NULL)
@@ -1225,8 +1233,13 @@ Prog* Compiler::CompileSet(Regexp* re, RE2::Anchor anchor, int64_t max_mem) {
   if (c.failed_)
     return NULL;
 
+  // 与 Compiler::Compile 同一个手法: 走完 pattern 树就把 reversed_ 关掉, 让后面这几个
+  // Cat (DotStar 前缀) 按【程序执行顺序】拼, 而不是再被反序一次。
+  c.reversed_ = false;
+
   c.prog_->set_anchor_start(true);
   c.prog_->set_anchor_end(true);
+  c.prog_->set_reversed(reversed);
 
   if (anchor == RE2::UNANCHORED) {
     // Prepend .* or else the expression will effectively be anchored.
@@ -1254,8 +1267,9 @@ Prog* Compiler::CompileSet(Regexp* re, RE2::Anchor anchor, int64_t max_mem) {
   return prog;
 }
 
-Prog* Prog::CompileSet(Regexp* re, RE2::Anchor anchor, int64_t max_mem) {
-  return Compiler::CompileSet(re, anchor, max_mem);
+Prog* Prog::CompileSet(Regexp* re, RE2::Anchor anchor, int64_t max_mem,
+                       bool reversed) {
+  return Compiler::CompileSet(re, anchor, max_mem, reversed);
 }
 
 }  // namespace re2

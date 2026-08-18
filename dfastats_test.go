@@ -86,7 +86,7 @@ func TestDFAStats_ThrashIsVisible(t *testing.T) {
 	if err != nil {
 		t.Fatalf("建集失败: %v", err)
 	}
-	buf := make([]int32, set.Size())
+	buf := make([]int32, set.GetPatternLen())
 	DFAStatsZero()
 	for _, b := range bodies {
 		set.Match(b, buf)
@@ -113,7 +113,7 @@ func TestDFAStats_QuietWhenBudgetFits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("建集失败: %v", err)
 	}
-	buf := make([]int32, set.Size())
+	buf := make([]int32, set.GetPatternLen())
 	for _, b := range bodies { // 热身: 先把这批语料的状态集走出来
 		set.Match(b, buf)
 	}

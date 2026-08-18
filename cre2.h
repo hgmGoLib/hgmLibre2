@@ -12,8 +12,16 @@ extern "C" {
 
 typedef struct cre2_re cre2_re;
 
-/* 编译 pattern (pat,patlen). 永不返回 NULL(分配失败才 NULL); 编译错误用 cre2_ok 检测. */
+/* 编译 pattern (pat,patlen). 永不返回 NULL(分配失败才 NULL); 编译错误用 cre2_ok 检测.
+ * 内存预算 = RE2 默认 kDefaultMaxMem (8MB). */
 cre2_re *cre2_new(const char *pat, int patlen);
+/* 同 cre2_new, 但显式给 RE2::Options::max_mem (字节; <=0 = 用 RE2 默认 8MB).
+ * 一个旋钮同时抬两条天花板: 编译期程序指令上限 + 运行期 DFA 状态缓存额度.
+ * 单条 pattern 撞上状态爆炸时, 默认 8MB 会让 DFA 反复整表清空 (结果仍对, 吞吐掉两个数量级),
+ * 而调用方在 cre2_dfa_stats 之外拿不到任何按对象的读数 —— 所以先得能把预算调大. */
+cre2_re *cre2_new_max_mem(const char *pat, int patlen, int64_t max_mem);
+/* 这个 handle 编译时用的 max_mem (字节). */
+int64_t cre2_max_mem(const cre2_re *h);
 /* 1=编译成功 0=失败. */
 int cre2_ok(const cre2_re *h);
 /* 失败原因, NUL 结尾, 有效期直到 cre2_free. */
@@ -108,6 +116,10 @@ int cre2_set_compile(cre2_set *h);
 /* 扫 text 一遍, 把命中的 pattern index 写进 out (容量 outcap, 调用方给 = pattern 数即够),
  * 返回命中条数 (index 不重复 · 顺序不保证)。无命中返回 0。out 写入个数 = min(命中数, outcap)。 */
 int cre2_set_match(const cre2_set *h, const char *text, int textlen, int *out, int outcap);
+/* 只问"有没有任一条命中", 不取 index。1=命中 0=没命中(或 DFA 放弃)。
+ * 走的是同一份 kManyMatch DFA 缓存, 但不传 matches 集合 —— RE2 的 Prog::SearchDFA 见 matches==NULL
+ * 就把 want_earliest_match 打开, DFA 扫到【第一个】命中位置立刻收工, 不再把正文剩下的部分扫完。 */
+int cre2_set_match_any(const cre2_set *h, const char *text, int textlen);
 void cre2_set_free(cre2_set *h);
 
 /* ── 按对象归因的 DFA 计数 (per-Set / per-scan) ────────────────────────────────
@@ -165,6 +177,37 @@ typedef struct {
  *   pat_insts[i]  = 这些独占指令一共出现了多少次 (加权, 反映它对"状态变胖"的贡献) */
 void cre2_set_attrib_info(const cre2_set *h, cre2_set_attrib *agg,
                           int64_t *pat_states, int64_t *pat_insts, int cap);
+
+/* ── 反着扫 (reverse DFA): 让 DFA 从正文末尾往前走【原始 buffer】 ──────────────
+ * 为什么要它: `S B{m,n}L` 这种【起始类窄于重复类】的计数重复 (如 [A-Za-z][A-Za-z0-9]{2,19}key),
+ * 正向 DFA 的活跃起点集会退化成任意子集 → 状态数对 n 指数; 同一条语言反过来读只要线性
+ * (Myhill-Nerode 层面的不对称, 不是实现问题, 任何等价改写都消不掉)。
+ * 反向由 RE2 编译器自己做: 所有 concat 反序、^ 与 $ 对调、\b 不变、多字节 UTF-8 的字节序列
+ * 也一并反过来编 —— 所以【调用方不需要反转正文】, 也不会把 UTF-8 拆散。
+ * 语义: 只回答"命中/哪几条命中", 不回答"在哪"。要位置的调用方拿到结果后再正向取一次。
+ */
+
+/* cre2_rev_match_result: cre2_partial_match_reverse 的按值返回值 (按值是为了不把 Go 指针交出去)。
+ *   Matched  : 1=命中 0=不命中。
+ *   FellBack : 1 = 反向 DFA 这次没跑成 (反向程序编译失败 / DFA 中途放弃), 结果是退回
+ *              正向 RE2::PartialMatch 得到的 —— 结果仍然正确, 只是这次没省到状态。
+ *   Stats    : want_stats!=0 时填这一次扫描的计数 (FellBack=1 时全 0)。 */
+typedef struct {
+	int32_t Matched;
+	int32_t FellBack;
+	cre2_scan_stats Stats;
+} cre2_rev_match_result;
+
+/* 反向非锚定匹配: 语义与 cre2_partial_match 逐字相同 (正文任意位置命中即 1), 但 DFA 反着跑。
+ * 反向程序在首次调用时惰性编出来 (线程安全), 预算用 handle 的 max_mem。 */
+cre2_rev_match_result cre2_partial_match_reverse(const cre2_re *h, const char *text, int textlen, int want_stats);
+
+/* 建一个空 set, reversed!=0 时整个 set 反向编译 (Match 从末尾往前扫原始 buffer)。
+ * cre2_set_new(mm) == cre2_set_new_ex(mm, 0)。其余 API (add/compile/match/stats/mem_info/attrib)
+ * 对反向 set 一律照常可用, 命中集与正向逐位相同。 */
+cre2_set *cre2_set_new_ex(int64_t max_mem, int reversed);
+/* 这个 set 是不是反向编译的。 */
+int cre2_set_reversed(const cre2_set *h);
 
 /* ── DFA 状态缓存计数 (可观测 · 进程级) ────────────────────────────────────────
  * RE2 的 DFA 状态缓存满了不是 LRU 淘汰, 而是【整表清空】重建 (DFA::ResetCache):

@@ -36,7 +36,16 @@ class RE2::Set {
   };
 
   Set(const RE2::Options& options, RE2::Anchor anchor);
+  // ── hgmLibre2 追加 (非上游 re2) ──
+  // reversed=true: 把整个 set 编成【反向程序】, Match 从 text 末尾往前扫【原始 buffer】。
+  // 命中集语义与正向完全相同 (仍然只回答"哪几条命中", 不回答"在哪"), 但对
+  // "起始类窄于重复类的计数重复" 这类形状, 状态数从指数塌回线性。
+  // 只支持 anchor==UNANCHORED; 其余 anchor 下 Compile() 返回 false。
+  Set(const RE2::Options& options, RE2::Anchor anchor, bool reversed);
   ~Set();
+
+  // 这个 Set 是不是反向编译的 (见上面的三参构造)。
+  bool reversed() const { return reversed_; }
 
   // Not copyable.
   Set(const Set&) = delete;
@@ -90,6 +99,7 @@ class RE2::Set {
 
   RE2::Options options_;
   RE2::Anchor anchor_;
+  bool reversed_;   // ── hgmLibre2 追加 ── 反向编译 (见三参构造)
   std::vector<Elem> elem_;
   bool compiled_;
   int size_;

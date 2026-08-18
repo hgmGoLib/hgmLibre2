@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRegexpSet_EquivPerPattern(t *testing.T) {
@@ -87,8 +88,8 @@ func TestRegexpSetMaxMem(t *testing.T) {
 	if err != nil {
 		t.Fatalf("8MB 预算应装得下: %v", err)
 	}
-	if set.Size() != len(patterns) {
-		t.Fatalf("Size=%d want %d", set.Size(), len(patterns))
+	if set.GetPatternLen() != len(patterns) {
+		t.Fatalf("GetPatternLen=%d want %d", set.GetPatternLen(), len(patterns))
 	}
 	compiled := make([]*Regexp, len(patterns))
 	for i, p := range patterns {
@@ -136,4 +137,72 @@ func TestRegexpSet_Empty(t *testing.T) {
 	if got := set.Match("anything", nil); len(got) != 0 {
 		t.Errorf("空集合应无命中, got %v", got)
 	}
+}
+
+// TestRegexpSetMatchAny_EquivAndEarlyExit 钉住 MatchAny 的两件事:
+//  1. 语义: 与 len(Match)>0 逐例一致 (包括空集合 / 空正文 / 不命中);
+//  2. 行为: 命中在正文最前面时【不把正文扫完】—— 这是它与 len(Match)>0 的实质差别。
+//     Match 要回答"哪几条", DFA 必须走到末尾; MatchAny 不取 index, RE2 打开 want_earliest_match,
+//     第一个命中位置就收工。用 8MB 正文 + 开头就命中来量: 两者差着几个数量级, 阈值取 20x 已经很松。
+func TestRegexpSetMatchAny_EquivAndEarlyExit(t *testing.T) {
+	patterns := []string{`bar[0-9]`, `zed[a-z]{3}`, `foo`}
+	set, err := NewRegexpSet(patterns)
+	if err != nil {
+		t.Fatalf("NewRegexpSet: %v", err)
+	}
+	var buf []int32
+	for _, in := range []string{"", "nothing at all", "bar7", "xx foo xx", "zedabc bar1", "ba r7"} {
+		want := len(set.Match(in, buf)) > 0
+		if got := set.MatchAny(in); got != want {
+			t.Errorf("MatchAny(%q)=%v want %v", in, got, want)
+		}
+		if got := set.MatchAnyBytes([]byte(in)); got != want {
+			t.Errorf("MatchAnyBytes(%q)=%v want %v", in, got, want)
+		}
+	}
+	empty, err := NewRegexpSet(nil)
+	if err != nil {
+		t.Fatalf("空集合 New: %v", err)
+	}
+	if empty.MatchAny("anything") || empty.MatchAnyBytes([]byte("anything")) {
+		t.Error("空集合不该命中")
+	}
+
+	// 早退的证据: 命中在第 0 字节, 后面跟 8MB 与任何 pattern 无关的字节。
+	tail := make([]byte, 8<<20)
+	x := uint32(12345)
+	for i := range tail {
+		x = x*1664525 + 1013904223
+		tail[i] = 'a' + byte(x>>24)%26 // 只用字母, 免得意外造出别的形状
+	}
+	long := "bar7" + string(tail)
+	// 各拿一个【新建】的 set, 免得共用 DFA 缓存后先跑的那个把状态都建好了。
+	setAny, err := NewRegexpSet(patterns)
+	if err != nil {
+		t.Fatalf("NewRegexpSet: %v", err)
+	}
+	setAll, err := NewRegexpSet(patterns)
+	if err != nil {
+		t.Fatalf("NewRegexpSet: %v", err)
+	}
+	tAny := timeIt(func() {
+		if !setAny.MatchAny(long) {
+			t.Fatal("长正文开头就命中, MatchAny 该是 true")
+		}
+	})
+	tAll := timeIt(func() {
+		if len(setAll.Match(long, nil)) == 0 {
+			t.Fatal("长正文开头就命中, Match 该有命中")
+		}
+	})
+	t.Logf("MatchAny=%v  Match=%v (8MB 正文, 命中在第 0 字节)", tAny, tAll)
+	if tAny*20 > tAll {
+		t.Errorf("MatchAny 看起来没有早退: MatchAny=%v Match=%v (期望至少快 20 倍)", tAny, tAll)
+	}
+}
+
+func timeIt(f func()) time.Duration {
+	t0 := time.Now()
+	f()
+	return time.Since(t0)
 }

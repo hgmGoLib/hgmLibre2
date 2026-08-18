@@ -380,7 +380,18 @@ class Prog {
 
   // Compiles a collection of regexps to Prog.  Each regexp will have
   // its own Match instruction recording the index in the output vector.
-  static Prog* CompileSet(Regexp* re, RE2::Anchor anchor, int64_t max_mem);
+  //
+  // ── hgmLibre2 追加 (非上游 re2): reversed ──
+  // reversed=true 编出【反着跑】的 set 程序 (所有 concat 反序, ^/$ 与 \b 由编译器自行对调),
+  // SearchDFA 会据此把 run_forward 置 false, 从 text 末尾往前逐字节走【原始 buffer】——
+  // 调用方不需要自己反转正文, 也不会踩到多字节 UTF-8 被拆散的坑。
+  // 用途: 起始类窄于重复类的计数重复 (如 [A-Za-z][A-Za-z0-9]{2,19}key) 正向 DFA 状态数指数,
+  // 反向只要线性; 命中集 (哪几条 pattern 命中) 与正向逐位相同。
+  // 限制: reversed=true 时只支持 anchor==RE2::UNANCHORED, 其余 anchor 返回 NULL。
+  // 配套: RE2::Set 在 reversed 模式下必须把 HaveMatch 节点【前置】而不是后置 (见 set.cc),
+  // 否则反序之后 Match 指令会跑到 pattern 前面, 一进门就命中。
+  static Prog* CompileSet(Regexp* re, RE2::Anchor anchor, int64_t max_mem,
+                          bool reversed = false);
 
   // Flattens the Prog from "tree" form to "list" form. This is an in-place
   // operation in the sense that the old instructions are lost.

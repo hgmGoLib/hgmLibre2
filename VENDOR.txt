@@ -23,8 +23,21 @@ re2_dfa.cc             : ①转移表槽位 8 字节 State* → 4 字节 arena �
                          ②per-Set / per-scan 计数 (flush 次数 / 新建状态数 / 额度水位)
                          ③编译期开关后面的排障采集 (RE2_DFA_ATTRIB / TRACE / HOTSTATS, 默认全关)
 internal_include/re2/prog.h : 追加 SearchDFA 的可选出参 + GetDFAMemInfo / GetDFAAttribInfo 声明
+                         + Prog::CompileSet 追加 reversed 参数 (默认 false, 上游调用点不受影响)
 internal_include/re2/set.h  : 追加 Match 的可选出参 + MemInfo / AttribInfo 声明
-re2_set.cc             : 上面那两个声明的实现 (转发给 Prog)
+                         + RE2::Set 三参构造 (reversed) 与 reversed() 访问器
+re2_set.cc             : 上面那两个声明的实现 (转发给 Prog); 反向模式下 Add() 把 HaveMatch
+                         节点【前置】而不是后置 (反序编译会把 concat 翻过来, 后置的 Match
+                         会跑到 pattern 前面 → 一进门就命中)
+re2_compile.cc         : Compiler::CompileSet / Prog::CompileSet 追加 reversed —— 走完 pattern 树
+                         就把 reversed_ 关掉再拼 DotStar 前缀 (与上游 Compiler::Compile 同一手法),
+                         并在 Finish 前 set_reversed。反向 set 只支持 UNANCHORED, 其余 anchor 返回 NULL。
+                         用途见 README.md 的 "Scanning backwards"。
+cre2.cpp 直接用了 re2 的内部件 (Regexp::Parse / CompileToReverseProg / Prog::SearchDFA) 做
+单条 pattern 的反向匹配 —— 不是改上游, 但升级 RE2 时这三个内部 API 的签名要一起看。
+不能走 RE2 对象自己的 rprog_: 那是从【剥掉必需前缀之后】的 suffix_regexp_ 编的, 只在
+"已经知道匹配右端在哪"的场景下用, 拿来当整篇非锚定搜索会漏。
+
 改动的语义保证: 命中集与原版(-DRE2_DFA_NEXT_BITS=64 -DRE2_DFA_ARENA=0 编出来的那份)逐位一致,
 按 pattern 表 × 语料 × 预算的矩阵对拍钉死。
 
@@ -127,7 +140,7 @@ issue#569 (共享一个 RE2 对象时锁争用) —— 【本库同病且更重�
          Go 1.26 的 unicode.Version 还是 15.0.0, stdlib 这三对【不折叠】, 现状与 stdlib 一致;
          摘了反而偏离 stdlib。本库以 stdlib 口径为准 ⇒ 不摘。
 a57a1d6  PrefilterTree 用 absl::flat_hash_set 替掉 std::map —— 要 absl, 且只影响 FilteredRE2 (未导出)。
-652b816  RE2::Set::Size —— Go 侧 RegexpSet.Size() 早就有了 (自己记的条数), 重复。
+652b816  RE2::Set::Size —— Go 侧 RegexpSet.GetPatternLen() 早就有了 (自己记的条数), 重复。
 其余 (4f5fd7a/630d011/71f37d0/2a029e2/137ea7f/08d338f/09de536/2d39b70/f31c2c6/928a015/
 6bb550b/67570de/85dd7ad/2c25a64/c986ecd/6598a8e/1c1ffbe/b673de3/826ad10/0f3bf78/315514c/
 6dbafa4/49d776b/7df5539/61c4644/972a15c/f0402c0) 全是 abseil 迁移 / 注释 / 格式 / 测试脚手架。

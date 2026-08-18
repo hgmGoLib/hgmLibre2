@@ -21,8 +21,13 @@
 namespace re2 {
 
 RE2::Set::Set(const RE2::Options& options, RE2::Anchor anchor)
+    : Set(options, anchor, false) {}
+
+// ── hgmLibre2 追加 ── 见 set.h 的三参构造说明。
+RE2::Set::Set(const RE2::Options& options, RE2::Anchor anchor, bool reversed)
     : options_(options),
       anchor_(anchor),
+      reversed_(reversed),
       compiled_(false),
       size_(0) {
   options_.set_never_capture(true);  // might unblock some optimisations
@@ -36,6 +41,7 @@ RE2::Set::~Set() {
 RE2::Set::Set(Set&& other)
     : options_(other.options_),
       anchor_(other.anchor_),
+      reversed_(other.reversed_),
       elem_(std::move(other.elem_)),
       compiled_(other.compiled_),
       size_(other.size_),
@@ -72,20 +78,31 @@ int RE2::Set::Add(const StringPiece& pattern, std::string* error) {
   }
 
   // Concatenate with match index and push on vector.
+  //
+  // ── hgmLibre2 追加 ── reversed_ 时 HaveMatch 要【前置】。
+  // 原因: 编译器反向编译时把所有 concat 反序 (Compiler::Cat 里的 reversed_ 分支), 于是
+  // Concat(P, Match) 会编成"先 Match 后 P" —— DFA 一进门就报命中。写成 Concat(Match, P)
+  // 反序之后正好是"先 P(反着读) 后 Match", 与正向语义对齐。
   int n = static_cast<int>(elem_.size());
   re2::Regexp* m = re2::Regexp::HaveMatch(n, pf);
   if (re->op() == kRegexpConcat) {
     int nsub = re->nsub();
     PODArray<re2::Regexp*> sub(nsub + 1);
-    for (int i = 0; i < nsub; i++)
-      sub[i] = re->sub()[i]->Incref();
-    sub[nsub] = m;
+    if (reversed_) {
+      sub[0] = m;
+      for (int i = 0; i < nsub; i++)
+        sub[i + 1] = re->sub()[i]->Incref();
+    } else {
+      for (int i = 0; i < nsub; i++)
+        sub[i] = re->sub()[i]->Incref();
+      sub[nsub] = m;
+    }
     re->Decref();
     re = re2::Regexp::Concat(sub.data(), nsub + 1, pf);
   } else {
     re2::Regexp* sub[2];
-    sub[0] = re;
-    sub[1] = m;
+    sub[0] = reversed_ ? m : re;
+    sub[1] = reversed_ ? re : m;
     re = re2::Regexp::Concat(sub, 2, pf);
   }
   elem_.emplace_back(std::string(pattern), re);
@@ -117,7 +134,7 @@ bool RE2::Set::Compile() {
     options_.ParseFlags());
   re2::Regexp* re = re2::Regexp::Alternate(sub.data(), size_, pf);
 
-  prog_.reset(Prog::CompileSet(re, anchor_, options_.max_mem()));
+  prog_.reset(Prog::CompileSet(re, anchor_, options_.max_mem(), reversed_));
   re->Decref();
   return prog_ != nullptr;
 }
