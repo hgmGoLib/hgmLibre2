@@ -30,6 +30,12 @@
 * 非 stdlib 的额外方法:
     - FindReplaceWithin(strip, src, repl): 等价 find.ReplaceAllStringFunc(src, m=>strip.ReplaceAllString(m,repl)),
       但整循环 + 段内替换下沉到一次 cgo; 无改动路径零分配直接复用原串。详见 README.md#findreplacewithin。
+    - AppendFindReplaceWithin(dst, strip, src, repl): 上面那个的【追加进调用方缓冲】孪生 ——
+      同一个 C 内核、同一份 changed 判据, 差别只在结果落在哪: FindReplaceWithin 每趟现开一个
+      Go string (整份 C.GoStringN 拷一次), 这个 memcpy 进你传的 dst ⇒ 复用同一块底就是稳态零
+      Go 堆分配。产物"当场扫一遍就丢"的解码腿 (asc 的 heal/combo 变体) 用这个。
+      changed=false 时 dst 一个字节都没动, 该用原 src; 返回的是 dst 上的视图, 一律用返回值。
+      本条没有 ctx —— 外层循环与段内替换都在 C++ 里, Go 侧唯一按正文线性的分配就是结果本身。
     - AppendAllStringIndexFlat(dst, s, n): 同 FindAllStringIndex, 但把 [start,end) 直接追加进
       调用方的 []int (形如 [s0,e0,s1,e1,…]), 不产 [][]int 外壳也不产一次性 flat 表。
       传 buf[:0] 复用缓冲 ⇒ 稳态零分配。匹配集合/顺序/空匹配语义与 FindAllStringIndex 逐处相同

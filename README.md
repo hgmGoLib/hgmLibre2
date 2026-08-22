@@ -634,6 +634,35 @@ matches the plain DFA scan throughput; on input full of split keywords it is
 ~2× faster than the nested-`ReplaceAllStringFunc` form, with allocations
 collapsed from O(matches) to one.
 
+#### AppendFindReplaceWithin
+
+`find.AppendFindReplaceWithin(dst, strip, src, repl) ([]byte, bool)` is the
+**append-into-your-own-buffer** twin, for callers that consume the result once
+and throw it away (build a decoded view → scan it with a `RegexpSet` → drop it).
+Same C kernel, same `changed` predicate; the only difference is where the result
+lands: `FindReplaceWithin` mints a fresh Go `string` on every changed call
+(one `C.GoStringN` copy of the whole result), while this one memcpy's it into
+the `dst` you pass — so a reused buffer makes the steady state zero Go-heap
+allocation.
+
+```go
+out, changed := find.AppendFindReplaceWithin(buf[:0], strip, src, "")
+// changed ⟺ find.FindReplaceWithin(strip, src, "") != src
+// changed ⟹ string(out) == find.FindReplaceWithin(strip, src, "")
+if changed {
+    buf = out          // always keep the returned slice: it may have re-based
+    scanSet.Match(bytesStrView(out), hits)
+}
+```
+
+`changed=false` leaves `dst` untouched down to its length — the caller should
+use the original `src`. The returned bytes are a view into the caller's buffer:
+appending to that buffer again (or reslicing it to `[:0]`) invalidates them.
+
+There is no `_ctx_t` for this one: the outer match loop and the inner
+replacement both live in C++, so the result itself is the only Go-side
+allocation that scales with the input — and that one is now the caller's.
+
 The test suite (`hgmLibre2_test.go`) cross-checks every method against the
 standard library `regexp` on a shared corpus of patterns and inputs; results
 are identical on that corpus (the corpus uses only literal `ReplaceAllString`
