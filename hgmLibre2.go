@@ -379,26 +379,23 @@ func (re *Regexp) replaceAllLiteralRaw(src, repl string) (out string, changed bo
 }
 
 // ReplaceAllStringFunc 用 f(匹配文本) 的返回值替换所有匹配。f 是 Go 回调无法下沉 C++ (下沉需每处
-// 匹配回调 Go, 反而增加跨界), 故拼接循环留在 Go; 但匹配位置由 matchAllFlat 一次取齐, cgo 调用数已
-// 从 O(匹配数) 压到 1。matchAllFlat 已按 stdlib allMatches 语义做了空匹配去重 + UTF-8 rune 推进,
-// 故每处投递的匹配都满足 stdlib replaceAll 的写入条件 (m1>lastMatchEnd || m0==0), 这里无条件写即
-// 与 stdlib 逐字一致。无匹配返回原 src (零分配)。
+// 匹配回调 Go, 反而增加跨界), 故拼接循环留在 Go; 但匹配位置一次取齐, cgo 调用数已从 O(匹配数) 压到 1。
+// 取位置的那段 C 循环已按 stdlib allMatches 语义做了空匹配去重 + UTF-8 rune 推进, 故每处投递的匹配都
+// 满足 stdlib replaceAll 的写入条件 (m1>lastMatchEnd || m0==0), 这里无条件写即与 stdlib 逐字一致。
+// 惰性物化 (同 ReplaceAllString): 全程无字节改动 —— 无匹配, 或有匹配但每处 f 都把原文照样写回 ——
+// 直接复用原 src 返回, 零分配。
+//
+// 结果底按 len(src) 【一次开够】(同 stdlib replaceAll 的 make([]byte,0,len(src)), 也同本库 []byte 门面
+// ReplaceAllFunc): 从 0 开始长的话累计分配收敛到 5×len(src) (Go 大切片 1.25 倍增长 ⇒ 1/(1-1/1.25)),
+// 拷贝还白付 4 份 —— 实测 64MB 正文上是 329MB。要连这一块底都复用 (逐段反复调的热路径),
+// 用 ReplaceAllStringFunc_ctx_t.AppendReplaceAllStringFunc 追加进自己的缓冲。
 func (re *Regexp) ReplaceAllStringFunc(src string, f func(string) string) string {
-	flat, count := re.matchAllFlat(src, len(src)+1) // len+1 = 最大可能匹配数 (含逐字节空匹配), 即全部
-	if count == 0 {
+	var ctx ReplaceAllStringFunc_ctx_t // 一次性用完就扔; 复用请直接持有 ctx 走 Append 版
+	out, changed := ctx.AppendReplaceAllStringFunc(nil, re, src, f)
+	if !changed {
 		return src
 	}
-	per := 2 * (re.numSubexp + 1)
-	var b strings.Builder
-	lastMatchEnd := 0
-	for k := 0; k < count; k++ {
-		m0, m1 := flat[k*per], flat[k*per+1] // 只需 group0 (整体匹配文本)
-		b.WriteString(src[lastMatchEnd:m0])
-		b.WriteString(f(src[m0:m1]))
-		lastMatchEnd = m1
-	}
-	b.WriteString(src[lastMatchEnd:])
-	return b.String()
+	return bytesStr(out) // out 是刚现开的底, 出了这里没有第二个引用 ⇒ 零拷贝转 string 安全
 }
 
 // FindReplaceWithin 等价于

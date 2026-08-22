@@ -224,6 +224,27 @@ cre2_dfa_stats cre2_dfa_stats_get(void);
 /* 四个计数归零 (分段测量用)。 */
 void cre2_dfa_stats_zero(void);
 
+/* ── prefilter (FilteredRE2 的 C ABI · 实现在 cre2_prefilter.cpp) ──────────────
+ * 回答「这条 pattern 想命中, 正文里必须先出现哪些字面量」, 以及最要紧的那个反问:
+ * 「哪几条根本没有必需字面量, 因而任何前置粗筛都筛不掉」。用途与判据见 cre2_prefilter.cpp 头注。*/
+typedef struct cre2_prefilter cre2_prefilter;
+
+/* 新建. min_atom_len<=0 用 FilteredRE2 默认最小原子长度; max_mem<=0 用 RE2 默认 8MB. */
+cre2_prefilter *cre2_prefilter_new(int min_atom_len, int64_t max_mem);
+/* 加一条 pattern (必须在 compile 之前). 返回 id (0 起, 与加入顺序一致) 或 -1 (解析失败/已 compile). */
+int cre2_prefilter_add(cre2_prefilter *h, const char *pat, int patlen);
+/* 编译, 返回原子个数 (>=0); 重复调返回 -1. */
+int cre2_prefilter_compile(cre2_prefilter *h);
+/* 取第 i 个原子 (已小写化、去重). 返回字节长度, 指针写进 *p (有效期到 cre2_prefilter_free). */
+int cre2_prefilter_atom(const cre2_prefilter *h, int i, const char **p);
+/* 加进去的 pattern 条数. */
+int cre2_prefilter_num_regexps(const cre2_prefilter *h);
+/* 给定"正文里找到的原子下标集合", 回填"还可能命中的 pattern 下标"(升序).
+ * natoms==0 ⟹ 返回【不可过滤集】= 无论正文长什么样都得跑的那批.
+ * 返回值是真实条数, 可能 > outcap (此时只填了前 outcap 个). */
+int cre2_prefilter_potentials(const cre2_prefilter *h, const int *atoms, int natoms, int *out, int outcap);
+void cre2_prefilter_free(cre2_prefilter *h);
+
 #ifdef __cplusplus
 }
 #endif

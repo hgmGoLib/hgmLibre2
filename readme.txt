@@ -1,5 +1,6 @@
 本包文档见同目录 README.md (Markdown 正文)。
-调 RegexpSet 的性能 (几百条正则一遍扫) 看 doc/set性能优化经验.txt —— README 里那几节的长版。
+调性能 (单条 Regexp 与 RegexpSet 都算) 看 doc/set性能优化经验.txt —— README 里那几节的长版:
+三个旋钮按收益排是 方向 (反着扫) > 表的形状 > 内存预算, 以及量什么、怎么标定、哪些路已经排除。
 
 要点速记 (详见 README.md):
 * 自带 cgo 的原生 RE2 正则库, 不用 go-re2 / 不用 abseil / 不用 cmake, 编译期不下载远程源
@@ -34,6 +35,20 @@
       传 buf[:0] 复用缓冲 ⇒ 稳态零分配。匹配集合/顺序/空匹配语义与 FindAllStringIndex 逐处相同
       (同一段 C 循环), 只回填 group0; 要子组用 FindAllStringSubmatchIndex。
       详见 README.md#appendallstringindexflat。
+    - ReplaceAllStringFunc_ctx_t (NewReplaceAllStringFunc_ctx / AppendReplaceAllStringFunc):
+      ReplaceAllStringFunc 的【复用已有分配】变体 —— 结果追加进调用方自己的 []byte 底,
+      匹配位置表挂 ctx 上, 两块都跨调用复用 ⇒ 稳态零分配 (逐段反复替换的热路径用这个)。
+      返回 (dst, changed) —— 🔴 是 changed 不是 matched: 定义就是
+      `re.ReplaceAllStringFunc(src,f) != src`。两种情况都报 false 且【dst 一个字节都不多】:
+      ①压根没匹配; ②有匹配但每处 f 都把原文原样写回 (HTML 实体码点越界 / hex 奇数长或解出不可打印
+      这类 f 自带合法性判断的情形) ⇒ 收尾把 dst 截回调用前的长度。拿 matched 当 changed 用会凭空多出
+      一份与原文相同的产物 (多存一块底·多扫一遍·多一次去重)。回滚只退 len 不退 cap, 一律用返回值。
+      ctx 非线程安全, 并发各持一个; 零值即可用。
+      🔴 顺带修了 ReplaceAllStringFunc 本身: 原来是裸 strings.Builder 从 0 开始长,
+      Go 大切片 1.25 倍增长 ⇒ 累计分配收敛到 5×len(src) (还白拷 4 份)。实测 64MB 正文的
+      hex 解码腿上 Builder 累计 329MB = 每输入字节 4.9 字节。现在按 len(src) 一次开够
+      (stdlib replaceAll 和本库 []byte 门面 ReplaceAllFunc 本来就是这么开的), 实测 1.02×。
+      详见 README.md#appendreplaceallstringfunc。
     - MatchStats() / MemInfo(): 【按次调用】与【按 Set】的 DFA 计数 (清空次数/新建状态数/
       正文字节数/额度水位), 没有全局状态, 并发下各算各的。调预算就看 MemInfo().FlushesTotal
       是不是 0; 判"这张表贵不贵"看 StatesBuiltTotal 和 ScanStats 的 Bytes/StatesBuilt。
@@ -55,7 +70,12 @@
       【建状态】—— 同一档 0 flush 下, 全新正文 23.7ms/份 vs 重扫同一批 0.36ms/份 (66 倍)。
       所以把预算调到 0 flush 是"别掉下悬崖"(必做, 且几乎不花物理内存), 不是"快 100 倍";
       每个请求都是新正文的场景, 那 23.7ms 就是上限, 要再快只能让【表】少造状态或者少扫正文。
-    - MatchReverse / MatchReverseBytes / MatchReverseStats, NewRegexpSetReverse(MaxMem):
+    - RegexpSet.MatchAny / MatchAnyBytes: 只问"有没有命中"的快路径 —— 不回填 index (不传 buf),
+      底下 RE2 打开 want_earliest_match, 扫到第一个命中位置立刻收工, 不把正文扫完 (不命中仍全扫)。
+      实测 8MB 正文 + 命中落在第 0 字节: MatchAny 2.12µs vs len(Match(...))>0 11.18ms。
+      与 Match 共用同一份 DFA 缓存, 不多占内存。要"哪几条"仍然用 Match —— 早退与完整命中集不可兼得。
+    - CompileReverse / CompileReverseMaxMem / MustCompileReverse (类型 RegexpReverse, 方法
+      MatchString / Match / MatchStats), 整表 NewRegexpSetReverseMaxMem + set.Reverse():
       【反着扫】—— 答案与 MatchString / 正向 Set 逐位相同, 但 DFA 从正文末尾往前走【原始 buffer】
       (不反转正文、不复制正文, 多字节 UTF-8 也不会被拆散: 反向程序是 RE2 编译器自己编的)。
       为的是 `S B{m,n} L` 这个形状 —— 起始类窄于重复类的计数重复, 正向 DFA 状态数对界指数,
@@ -74,6 +94,19 @@
       口径与 NewRegexpSetMaxMem 完全一致。实测同上那条 pattern × 60 份 16KB 语料:
       默认 8MB 下 flush 6 次, 256MB 下 0 次; 而反着扫在默认预算下就 0 次 (状态峰值 9)。
       —— 调预算是拿内存换, 换方向不花钱, 形状允许就先换方向。
+    - Prefilter (NewPrefilter / Atoms / Potentials / Unfiltered): RE2 自己的「必需字面量」推导
+      (FilteredRE2 + PrefilterTree, 本来就 vendored 在这, 现在接出来了)。回答三件事:
+      这批 pattern 想命中【必须】先出现哪些字面量 (Atoms, 已小写去重) · 正文里找到了这几个原子
+      之后还有哪几条【可能】命中 (Potentials, 没进名单的保证不命中) · 以及最要紧的反问:
+      哪几条【没有】必需字面量因而任何粗筛都筛不掉 (Unfiltered)。
+      本身不做匹配 —— 原子表交给调用方自己的字符串匹配器 (AC / memmem) 去找。
+      🔴 Unfiltered 才是接它出来的动机: 「先用便宜的字面量门挡掉大多数正文」是唯一能抬吞吐上限的
+      方向 (见 doc §4 G), 但天花板就是这批筛不掉的条数 —— 做之前先量, 别做完才发现天花板在 3%。
+      🔴 这个数只有 RE2 的 prefilter 算得准: 手写抽取器在 `(?:foo|[A-Z]{5})` 上会答错 (含字面量 foo,
+      但另一支不需要它 ⇒ 整条不可过滤)。minAtomLen 是真旋钮不是细节: 调大 ⇒ 原子更少更长 (匹配器更快)
+      但更多 pattern 掉进不可过滤集。实测 112 条生产表: RE2 默认 1654 原子 / 4 条不可过滤, 但原子短到
+      几乎每份正文都能找到 ⇒ 一条都筛不掉; minAtomLen=6 是 216 原子 / 38 条不可过滤, 筛得动但底线 34%。
+      对拍见 prefilter_test.go (健全性: 真命中的必须一条不落地出现在 Potentials 里)。
     - FreeC: 显式释放 native 句柄 (否则靠 finalizer)。
     - RegexpSet: N 条正则编进一个 DFA, 一遍扫回答"哪几条命中"。详见 README.md#regexpset。
       条数多到 NewRegexpSet 报 "set compile failed (out of memory)" 时,【不要拆成两个 set】

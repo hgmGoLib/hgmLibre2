@@ -98,6 +98,10 @@ as `regexp.Compile` (RE2's default Perl mode), *not* leftmost-longest — e.g.
   a scratch-reusing `FindStringIndex` that is steady-state allocation-free
 - `AppendAllStringIndexFlat` — *not* in stdlib; `FindAllStringIndex` without the intermediate
   `[][]int`; see [AppendAllStringIndexFlat](#appendallstringindexflat) below
+- `ReplaceAllStringFunc_ctx_t` (`NewReplaceAllStringFunc_ctx`, `AppendReplaceAllStringFunc`) —
+  *not* in stdlib; `ReplaceAllStringFunc` appending into a caller-owned `[]byte`, steady-state
+  allocation-free, reporting *changed* rather than *matched*;
+  see [AppendReplaceAllStringFunc](#appendreplaceallstringfunc) below
 - `RegexpReverse` (`CompileReverse`, `CompileReverseMaxMem`, `MustCompileReverse`, `MatchString`,
   `Match`, `MatchStats`) — *not* in stdlib; a **separate object** that gives the same yes/no
   answer as a forward `Regexp`, with the DFA walking the **original buffer back to front**;
@@ -524,6 +528,72 @@ The match set, its order, and the empty-match handling are identical to
 it and against stdlib in `find_all_flat_test.go`. Use
 `FindAllStringSubmatchIndex` when you need capture groups.
 
+### AppendReplaceAllStringFunc
+
+`ctx.AppendReplaceAllStringFunc(dst, re, src, f)` produces exactly what
+`re.ReplaceAllStringFunc(src, f)` produces, but appends it to a caller-owned
+`[]byte` and keeps the match-position table on the `ctx`, so both buffers are
+reused across calls.
+
+It returns `(dst, changed)`. **`changed` means "the result differs from `src`",
+not "the regexp matched"** — it is defined to be exactly
+`re.ReplaceAllStringFunc(src, f) != src`. Two cases report `false`, and both
+leave `dst` byte-for-byte as you passed it in:
+
+1. nothing matched — fast return, no bytes written;
+2. something matched but every `f` handed the original text straight back, so
+   the result is byte-identical to `src` — the appended bytes are rolled back.
+
+Case 2 is not a nicety. Replacements written against this API are usually
+decoders or de-obfuscators whose `f` carries its own validity check and returns
+`m` unchanged when it fails: an HTML numeric entity `&#…;` whose code point is
+out of range, a hex run of odd length or one that decodes to non-printable
+bytes. Those match but change nothing, and a caller that treats `matched` as
+`changed` ends up with a spurious extra copy of the original — one more buffer
+to hold, one more pass to scan, one more duplicate to reconcile. The check costs
+essentially nothing: a length mismatch decides it outright, and only an
+exactly-equal length pays for a `memcmp`.
+
+The rollback restores the length and the contents, but not the capacity: `dst`
+may come back pointing at a larger backing array (the `len(src)` bytes just
+reserved). That is a win for the next call — just always use the returned slice
+rather than the one you passed in.
+
+```go
+var ctx hgmLibre2.ReplaceAllStringFunc_ctx_t   // zero value is usable; not goroutine-safe
+var buf []byte                                 // reuse across calls
+for _, text := range corpus {
+    out, changed := ctx.AppendReplaceAllStringFunc(buf[:0], re, text, decode)
+    buf = out         // keep the (possibly grown) buffer either way
+    if !changed {
+        use(text)     // decoding changed nothing, nothing allocated
+        continue
+    }
+    use(string(buf))  // or keep working on the bytes
+}
+```
+
+Why it exists: `ReplaceAllStringFunc` pays two throwaway allocations per call
+that both scale with the body — the match table (`2*(numSubexp+1)` ints per
+match, of which the concatenation loop reads only group 0), and the result
+buffer. The result buffer used to be a bare `strings.Builder` growing from
+nothing: for a large byte slice Go grows by 1.25×, so the cumulative allocation
+converges to `1/(1-1/1.25) = 5×len(src)`, with 4× of that also paid in memcpy.
+Measured on a 64 MB body in a hex-decoding leg: 329 MB of `Builder` growth, 4.9
+bytes allocated per input byte. `ReplaceAllStringFunc` now sizes that buffer to
+`len(src)` in one shot (the same thing stdlib's `replaceAll` and this library's
+own `ReplaceAllFunc` byte facade already did), which is a 1× buffer and no
+regrow copies. This variant goes one step further and reuses the buffer you
+already own, which is what a hot loop calling it per segment actually wants.
+
+`ReplaceAllStringFunc` itself is now a thin shell over this method, so the two
+share the match set, the order, the call sites of `f` and the concatenation
+(both read group 0 out of the same C loop) — and the same lazy materialization
+as `ReplaceAllString`: a call that changes no bytes hands the original `src`
+back with zero allocation. That, the append contract, the rollback contract, the
+no-bleed-on-reuse contract and the steady-state-zero-allocation claim are pinned
+in `replace_func_ctx_test.go`.
+
 ### FindReplaceWithin
 
 `find.FindReplaceWithin(strip, src, repl)` is exactly equivalent to the two-regex
@@ -582,13 +652,57 @@ allocates less than `MatchString(string(b))`.
 go test ./...
 ```
 
-## Tuning a large RegexpSet
+## Prefilter: which literals must appear, and which patterns can never be filtered
+
+`Prefilter` exposes RE2's own prefilter machinery (`FilteredRE2` / `PrefilterTree`,
+both already vendored here). It answers three questions:
+
+```go
+p, err := hgmLibre2.NewPrefilter(patterns, 0 /*minAtomLen: 0 = RE2 default*/, 0 /*maxMem*/)
+atoms := p.Atoms()              // lowercased, distinct literals that must appear
+live  := p.Potentials(found)    // given the atom indices found in the text: which patterns can still match
+hard  := p.Unfiltered()         // which patterns need NO literal at all -> they always have to run
+```
+
+`Prefilter` does no matching of its own. It hands you the atom list; you find
+those atoms with whatever string matcher you like (an Aho-Corasick automaton, or
+`memmem`), then ask which patterns survive. A pattern that does not survive is
+**guaranteed** not to match. Matching must be case-insensitive, or done on a
+lowercased copy of the text, because the atoms are lowercased.
+
+**`Unfiltered()` is the reason this is exposed.** "Screen the text with a cheap
+literal gate first, and only run the big table on what gets through" is the one
+direction that raises the throughput ceiling (see
+`doc/set性能优化经验.txt` §4 G) — but it has a hard cap: patterns with no required
+literal (`[A-Za-z0-9+/=_-]{20,}`, `(?-i:\([A-Z]{2,5}\))`) have to run no matter
+what the text looks like. Measure that set **before** building a prefilter stage,
+not after.
+
+🔴 Only RE2's own prefilter gets this right. A hand-rolled "pull the literals out
+of the pattern source" extractor answers wrongly on `(?:foo|[A-Z]{5})`: it
+contains the literal `foo`, yet the pattern as a whole is unfilterable, because
+the other alternative does not need `foo`. That reasoning lives in an AND-OR tree
+and is not something you can eyeball. `prefilter_test.go` pins this case, along
+with the soundness property the whole idea rests on: every pattern that really
+matches a text must appear in `Potentials()` for the atoms found in that text.
+
+`minAtomLen` is a real trade-off knob, not a tuning detail. Raising it yields
+fewer, longer atoms — a faster matcher, but more patterns fall into
+`Unfiltered()`. Measured on a 112-pattern production table: RE2's default gives
+1654 atoms and only 4 unfilterable patterns, but the atoms are so short that they
+occur in nearly every text, so nothing gets filtered out; `minAtomLen=6` gives 216
+atoms and 38 unfilterable patterns, which filters much harder but starts from a
+34% floor. Measure both ends on your own table.
+
+## Tuning for the DFA state cache
 
 [`doc/set性能优化经验.txt`](doc/set%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96%E7%BB%8F%E9%AA%8C.txt) is the long-form version of the
-`RegexpSet` performance material above: the mental model, what to measure and in
-what order, what actually drives state explosion, what to change, how to split a
-table, and a list of approaches that were measured and rejected. Read it before
-tuning a table of hundreds of patterns; the sections above are the summary.
+performance material above, for a single `Regexp` as well as for a `RegexpSet`:
+the mental model, what to measure and in what order, what actually drives state
+explosion, the three knobs in benefit order (direction > pattern shape > memory
+budget), how to split a table, and a list of approaches that were measured and
+rejected. Read it before tuning a table of hundreds of patterns, or before
+reaching for `CompileMaxMem`/`CompileReverse`; the sections above are the summary.
 
 ## Differences from stdlib `regexp`
 
