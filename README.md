@@ -70,6 +70,15 @@ does not scale linearly here (every search takes a read lock on the DFA state ca
 so on **tiny inputs under heavy concurrency** the two engines come out even. On
 body-sized input the lock is irrelevant and this library is still ~100× ahead at 1000
 goroutines. See [Concurrency](#concurrency-sharing-one-regexp-is-fine-it-just-doesnt-scale-linearly).
+- **the pattern can match the empty string and you `FindAll` over a whole document** — e.g.
+  `(?m)^[ \t]*$` or `(?m)^\s*(?://.*)?$`. An empty-matchable pattern succeeds on every line,
+  so `FindAll` is forced to emit one match per line and pay the advance-and-restart path for
+  each; on 115 KiB of line-shaped text that is **0.23x** (10.4 ms vs 2.4 ms). This is a *pattern
+  shape* problem, not an engine problem: making the same intent non-empty-matchable (`*` → `+`)
+  flips it to **8.45x** in this library's favour, and is faster under the standard library too.
+  Try rewriting the pattern before you settle for the standard library here.
+  Numbers: `go test -run TestEmptyWidthMultiline -v .`
+
 
 Beyond speed, this library also avoids the costs of the usual ways to get native RE2
 into Go:
