@@ -19,6 +19,7 @@ import "C"
 
 import (
 	"errors"
+	"sync"
 	"runtime"
 	"sort"
 	"strconv"
@@ -29,6 +30,48 @@ import (
 type RegexpSet struct {
 	h    *C.cre2_set
 	size int // Add 成功的 pattern 数 (= Match 输出 index 的上界)
+	// lens 是每条 pattern 的匹配字节长度区间 (见 patlen.go), 建集期算一次。
+	// NewMatchScanner 靠它决定"这条的 start 怎么找": 定长 = 减法, 别的 = 回推。
+	lens []patLen_t
+	// pats / maxMem 留着给"单条反向"用 (rev1)。存的是切片头和调用方那份字符串,
+	// 不复制内容。
+	pats   []string
+	maxMem int64
+	// rev1[i] = 第 i 条 pattern 【自己一条】的反向 set, 惰性建 —— MatchScanner 补左端时
+	// 用它的 ResolveSpanWithin(锚定, 从右端往左推)。
+	//
+	// 🔴 为什么是"一条一个 set"而不是"整表一个反向 set": set 里的状态数是【相乘】的
+	//    (doc/状态数为什么会相乘.txt), 155 条的反向 set 会把每条各自反向的最坏情况乘到一起 ——
+	//    实测 6.4MB 正文上要 65 秒、arena 顶满 254MB 还在 flush, 而正向同一张表 18ms 零 flush。
+	//    拆成一条一个就没有这个乘法; 而且这些 set 只用来【锚定解析】、从不用来扫正文,
+	//    那条 .*? 前缀引起的状态爆炸机制从根上就不存在。
+	//    再加上惰性: 只有真命中过的那几条才会被建出来。
+	rev1   []*RegexpSet
+	rev1Mu sync.Mutex
+}
+
+// reverseOne 返回第 i 条 pattern 自己一条的反向 set (惰性建, 建不出来返回 nil)。
+// 只读用途 (ResolveSpan*), 并发安全。
+func (s *RegexpSet) reverseOne(i int) *RegexpSet {
+	if i < 0 || i >= len(s.pats) {
+		return nil
+	}
+	s.rev1Mu.Lock()
+	defer s.rev1Mu.Unlock()
+	if s.rev1 == nil {
+		s.rev1 = make([]*RegexpSet, len(s.pats))
+	}
+	if r := s.rev1[i]; r != nil {
+		return r
+	}
+	r, err := NewRegexpSetReverseMaxMem([]string{s.pats[i]}, s.maxMem)
+	if err != nil {
+		// 建不出来不是错: 调用方会把这一条列进 Unresolved(), 照老路跑 FindAll。
+		// 存一个"建过了"的空壳避免每次重试 —— 用 size==0 的哨兵。
+		return nil
+	}
+	s.rev1[i] = r
+	return r
 }
 
 // DefaultSetMaxMem 是 RE2 的默认内存预算 (RE2::Options::kDefaultMaxMem = 8MB)。
@@ -94,6 +137,9 @@ func newRegexpSet(patterns []string, maxMem int64, reversed bool) (*RegexpSet, e
 			strconv.Itoa(s.size) + " maxMem=" + strconv.FormatInt(maxMem, 10) +
 			" bytes; 用 NewRegexpSetMaxMem 把 maxMem 调大 (翻倍试) 即可, 不必拆成多个 set")
 	}
+	s.lens = buildPatLens(patterns)
+	s.pats = patterns
+	s.maxMem = maxMem
 	runtime.SetFinalizer(s, func(x *RegexpSet) { C.cre2_set_free(x.h) })
 	return s, nil
 }

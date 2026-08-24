@@ -189,11 +189,48 @@
       判定用的上下文恒是【整篇正文】, 所以 \b / ^ / $ 看到的永远是真实邻居字节, 而不是
       bound 切出来的假边界 —— 掐 bound 只会让答案变短, 不会让它变错。
       无状态、只读 (自己拿 DFA 的缓存读锁), 可以和别的 goroutine 的扫描并发调。
+    - RegexpSet.NewMatchScanner + (*MatchScanner).Scan / HitIDs / Hit / AppendMatches
+      + RegexpSet.PatternLenRange / PatternLenRange(pattern):
+      【一遍扫, 之后按条要位置】—— 把上面两件 (游程扫 + 锚定解析) 拼成调用方真正要的形状,
+      顺带把"同一处命中报出一串右端"那种重复在库里就解决掉。替的是这套两段式:
+      先 Set.Match 扫一遍拿"哪几条命中", 再为了知道【在哪】把命中的每条各对整篇正文跑一遍
+      FindAllStringIndex —— 命中 k 条就是 1+k 遍全文。
+        ms, _ := set.NewMatchScanner()      // 热路径上建一次留着
+        ms.Scan(body)                       // ← 唯一一遍全文。之后 Hit(i)/HitIDs() 就是门那张 bool 表
+        spans, ok, _ := ms.AppendMatches(buf[:0], id)   // ← 只有问到的这条才补左端; 扁平 (lo,hi) 对
+        // ok==false: 这一条补不出来 (能匹配空串 / 反向编不出来), 照老路 re.FindAllStringIndex
+      🔴 分成两步是有意的: 门上很多位【只当 bool 用】, 从来没人问它在哪。一遍扫的时候把全表的
+         左端都补出来是白付。所以补左端挂在"谁问谁付"上。
+      左端怎么补, 看 PatternLenRange 的两档 (patlen.go, 建集期用 Go 的 regexp/syntax 解析一次):
+        min == max  定长 (NRIC 9 字节 · 身份证 18 字节): Lo = Hi - min, 一句减法, 不进正则引擎。
+        其余        用【这一条 pattern 自己一条】的反向 set 做一次锚定回推, 一次调用给最靠左的起点。
+      🔴 反向必须是【一条一个 set】, 整表建一个反向 set 是死路 —— set 里状态数是相乘的
+         (doc/状态数为什么会相乘.txt): 155 条的真实门表, 正向 6.4MB 上 18ms / 零 flush,
+         整表反向 65 秒 / arena 顶满 254MB 还在 flush。拆成一条一个就没有这个乘法; 而且这些
+         反向 set 【从不用来扫正文】, 只做锚定解析, 起点只有一个, 爆炸机制从根上不存在。
+         再加上惰性: 只有真被问到的那几条才建得出来。
+      保证只有三条: ① 吐的 text[Lo:Hi] 一定是那条 pattern 的【真匹配】; ② 正文里有匹配的地方
+      一定被覆盖到 (不丢召回); ③ 同一条 pattern 吐的区间互不相交、按 Lo 升序。
+      🔴 【不是】FindAllStringIndex 的逐字节等价: 交替式上 FindAll 是 leftmost-first, 这里恒取
+         最长 (ab|abcd 撞 "abcd" 给 [0,4) 而不是 [0,2))。要逐字节等价的别用这个。
+      🔴 【只在同一条 pattern 内部去重, 跨 pattern 一概不合并】: 两条 pattern 撞在同一片正文上
+         不是重复, 是两个问题各要一个答案 (带空格的和不带空格的两条, 下游正是靠"这段里有没有
+         空格"分流; 合了就是漏检)。
+      实测 (真实 155 条门表 × 6.4MB 真前端产物 · 命中 47 条 · 稳态 · 生产预算 64MB):
+        ① 门 Match (今天就在付的那一遍)          19.4ms
+        ② 同一遍改成收游程                       19.1ms   ← 位置是白送的
+        ③ Scan (收游程 + 命中表)                 18.8ms   ← 与 ① 同价
+        ④ ③ + 把命中的 47 条【全部】补出来        33.6ms
+        旧的 1+k 遍全文 (k=47)                  446ms
+        新腿 (③ + 按条补 + 兜底)                 35ms  = 12.6×; 74249 处逐段验过, 0 假匹配 0 漏
+      小串上不吃亏 (门在小 body 上被调很多次): 32B 无命中 119ns→115ns · 4KB base64 5.70us→5.61us ·
+      最贵的一档 256B 命中密集 434ns→574ns。
     - 性能 (spanscan_bench_test.go · 64KiB 正文 · 10 条通用 pattern · Ryzen 5900X · 稳态复用):
       对照的"旧实现"就是今天调用方那一套 —— set.Match 当门 + 逐条命中 pattern 在整篇正文上
       FindAllStringIndex (命中 k 条 = 1+k 遍全文扫描, 而且后面那 k 遍是最贵的非锚定扫描)。
-      🔴 推荐用法只有一行: 反向 set 扫 + 一次左到右的推进 (rev-cov, 判据抄在 SetSpan 注释里)。
-         它与 FindAllStringIndex 【逐处全等】(TestSpanPerf_Shape 直接对账), 三档都不劣于旧实现:
+      🔴 这一档的"推荐用法"只适用于【要与 FindAllStringIndex 逐字节等价】的调用方 ——
+         反向 set 扫 + 一次左到右的推进 (rev-cov, 判据抄在 SetSpan 注释里), 与 FindAll 逐处全等
+         (TestSpanPerf_Shape 直接对账), 三档都不劣于旧实现:
                               0 命中     稀疏(39 处)   最坏输入(见下)
         旧实现                 93.1us      400.8us      596.0us  给 4 处
         反向扫 + 左到右推进    89.7us       94.7us      611.7us  给 4 处   ← 推荐
@@ -222,6 +259,11 @@
         旧实现 528KB = 1 份 set DFA 缓存 + 10 份各自独立的 Regexp DFA 缓存
         正向路 400KB · 反向路 596KB = 各 2 份 set DFA 缓存 (解析那份只建 160~170 个状态, 很便宜)
       预算口径上差得更远: 旧实现是 1+N 份各自 8MB 额度的缓存, 新实现恒 2 份。
+      🔴 但【不要把这一档当成通用推荐】。它的证据是 10 条 pattern / 64KiB 的合成微基准, 那个
+         规模【结构上】显不出 set 里状态数相乘这件事。同一条路换成真实的 155 条门表 × 6.4MB:
+         整表反向 set 一遍扫要 65 秒 (arena 顶满 254MB 仍在 flush), 正向同表 18ms 零 flush ——
+         整整差四个数量级, 结论直接翻过来。不要求逐字节等价的调用方一律走上面的 MatchScanner
+         (正向扫 + 单条反向锚定回推), 别建整表反向 set。
       ⚠ 量这类差别时【两条路必须共用同一批 set 对象】: 同一批 pattern 建两次, 两个 DFA 的
         状态区落在不同地址上, cache set 冲突不一样 —— 实测同一段代码只因为换了个 set 对象
         就能差 5~8%, 比要量的差别本身还大。
