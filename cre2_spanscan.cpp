@@ -78,3 +78,18 @@ int cre2_set_resolve_span(const cre2_set *h, const char *text, int textlen,
 	const char *base = text ? text : "";
 	return h->set->ResolveSpan(base, textlen, from, bound, id, out);
 }
+
+cre2_span_resolve_result cre2_set_resolve_span_r(const cre2_set *h, const char *text,
+                                                 int textlen, int from, int bound, int id) {
+	cre2_span_resolve_result r;
+	r.rc = -1;
+	r.pos = 0;
+	if (h == nullptr || h->set == nullptr) {
+		return r;
+	}
+	const char *base = text ? text : "";
+	int32_t pos = 0;
+	r.rc = (int32_t)h->set->ResolveSpan(base, textlen, from, bound, id, &pos);
+	r.pos = pos;
+	return r;
+}

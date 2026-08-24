@@ -283,9 +283,14 @@ bool DFASpanScan::Resume() {
 // RunLoop 是新的热循环。返回 0 = 本批攒满了要挂起, 1 = 正文走完了 (进入 etx), -1 = 出错。
 template <bool run_forward>
 int DFASpanScan::RunLoop(const uint8_t* bp, int32_t* /*unused*/) {
-  const uint8_t* bytemap = dfa_->prog_->bytemap();
+  // 当前状态和 dfa_ 都走【本地变量】, 与上游 InlinedSearchLoop 写法一致 (它的 s 也是局部的)。
+  // ⚠ 实测这一条在这份循环上【量不出差别】(零命中 1MiB 上 ±1%, 落在噪声里) —— 留着只是
+  //    为了和上游那份对得上, 不要拿它当优化项。
+  DFA* dfa = dfa_;
+  const uint8_t* bytemap = dfa->prog_->bytemap();
   const uint8_t* p = bp + off_;
   const uint8_t* ep = run_forward ? (bp + textlen_) : bp;
+  DFA::State* s = s_;
 
   while (p != ep) {
     int c;
@@ -294,17 +299,19 @@ int DFASpanScan::RunLoop(const uint8_t* bp, int32_t* /*unused*/) {
     else
       c = *--p;
 
-    DFA::State* ns = dfa_->NextOf(s_, bytemap[c]);
+    DFA::State* ns = dfa->NextOf(s, bytemap[c]);
     if (ns == NULL) {
       off_ = static_cast<int>(p - bp);
+      s_ = s;                      // AdvanceState 是拿 s_ 进出的 (要存/查状态内容)
       if (!AdvanceState(c)) {
         return -1;
       }
+      s = s_;
     } else {
-      s_ = ns;
+      s = ns;
     }
 
-    if (s_ <= SpanSpecialMax()) {
+    if (s <= SpanSpecialMax()) {
       // kManyMatch 不会出 FullMatchState (见文件头), 所以这里只可能是 DeadState:
       // 从这里往后不可能再有任何命中 ⇒ 正文部分到此为止, 直接去收口。
       off_ = static_cast<int>(p - bp);
@@ -313,11 +320,12 @@ int DFASpanScan::RunLoop(const uint8_t* bp, int32_t* /*unused*/) {
       return 1;
     }
 
-    if (s_->IsMatch()) {
+    if (s->IsMatch()) {
       // 匹配晚一个字节才被看见 (见 InlinedSearchLoop 头上的说明), 所以位置要退一格:
       // 正向 p-1 = 匹配右端 (不含); 反向 p+1 = 匹配左端 (含)。
       const uint8_t* m = run_forward ? p - 1 : p + 1;
-      NoteState<run_forward>(s_, static_cast<int32_t>(m - bp));
+      s_ = s;                      // 挂起要把它按内容存下来, 所以先写回
+      NoteState<run_forward>(s, static_cast<int32_t>(m - bp));
       if (n_ > limit_) {
         off_ = static_cast<int>(p - bp);
         Suspend();
@@ -326,6 +334,7 @@ int DFASpanScan::RunLoop(const uint8_t* bp, int32_t* /*unused*/) {
     }
   }
   off_ = static_cast<int>(p - bp);
+  s_ = s;
   phase_ = kPhaseEtx;
   return 1;
 }

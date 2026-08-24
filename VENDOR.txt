@@ -15,7 +15,11 @@ cre2.h / cre2.cpp      : 我们自己写的极小 C 包装 (不算改 RE2)
 cre2_internal.h        : cre2 各 .cpp 之间共用的句柄定义 (struct cre2_set), 不对外
 cre2_dfastats.cpp      : 进程级 DFA 计数的 hook 安装 (挂 re2::hooks)
 cre2_spanscan.cpp      : "命中在哪"的 C 门面 —— 流式游程扫描 (sqlite3_step 式轮询)
-                         + 锚定解析 (cre2_set_resolve_span)
+                         + 锚定解析 (cre2_set_resolve_span 及其按值返回孪生 _r)。
+                         🔴 Go 侧一律调 _r 那个: 出参版要把 &out 这个 Go 指针交给 C, 逃逸分析
+                         据此每次调用把它搬上堆 —— 一次解析一笔 4 字节, 在"每个端点解析一次"
+                         的用法上按端点数放大 (实测 6.5 万个端点 = 6.5 万笔)。同一招见
+                         cre2_match_all_r; 有 TestSpanPerf_NoAlloc 钉着不许退回去。
 internal_include/re2/dfa_stats.h : 本库追加的观测结构体 (ScanStats / MemInfo / AttribInfo)
 internal_include/re2/span_scan.h : 流式游程扫描 + 锚定解析的对内声明 + 全部语义说明
 re2_dfa_spanscan.inc   : 流式游程扫描与锚定解析的实现。【不是独立编译单元】—— 由 re2_dfa.cc 末尾

@@ -76,6 +76,10 @@ type SpanScanner struct {
 	h   *C.cre2_spanscan
 	set *RegexpSet
 	buf []SetSpan
+	// more 是 step 的"还有没有下一批"出参。放在这儿而不是每次 step 开个局部变量:
+	// &局部变量 交给 C 会被逃逸分析判成逃逸, 每次 step 一笔 4 字节堆分配 —— 而 Scan
+	// 本该是零分配的 (工作区本身就是长期复用的, 这个字段跟着它一起活)。
+	more C.int
 }
 
 // NewSpanScanner 开一个流式扫描工作区。batch = 一批最多吐几条游程 (一次 Scan 里回调被调几次
@@ -138,8 +142,8 @@ func (sc *SpanScanner) Scan(text string, fn func(spans []SetSpan) bool) error {
 	outp := (*C.int32_t)(unsafe.Pointer(&sc.buf[0]))
 	outcap := C.int(len(sc.buf) * 3)
 	for {
-		var more C.int
-		n := int(C.cre2_spanscan_step(sc.h, tp, tn, outp, outcap, &more))
+		sc.more = 0
+		n := int(C.cre2_spanscan_step(sc.h, tp, tn, outp, outcap, &sc.more))
 		runtime.KeepAlive(text)
 		runtime.KeepAlive(sc)
 		if n < 0 {
@@ -152,7 +156,7 @@ func (sc *SpanScanner) Scan(text string, fn func(spans []SetSpan) bool) error {
 		if n > 0 && !fn(sc.buf[:n]) {
 			return nil
 		}
-		if more == 0 {
+		if sc.more == 0 {
 			return nil
 		}
 	}
@@ -210,14 +214,17 @@ func (s *RegexpSet) ResolveSpanWithin(text string, from, bound, id int32) (pos i
 	if from < 0 || int(from) > len(text) {
 		return 0, false, errors.New("re2native: resolve span bad offset " + strconv.Itoa(int(from)))
 	}
-	var out C.int32_t
-	r := C.cre2_set_resolve_span(s.h, strBytePtr(text), C.int(len(text)),
-		C.int(from), C.int(bound), C.int(id), &out)
+	// 🔴 走【按值返回】的 _r 孪生, 不走出参版: 出参版要把 &out 这个 Go 指针交给 C, 逃逸分析
+	// 据此每次调用把它搬上堆 —— 一次解析一笔 4 字节分配。调用方按端点解析时这笔按端点数
+	// 放大 (实测 6.5 万个端点 = 6.5 万笔 262KB), 而这个方法本该是零分配的。同一招见
+	// find_all_flat.go 里 cre2_match_all_r 那段。
+	r := C.cre2_set_resolve_span_r(s.h, strBytePtr(text), C.int(len(text)),
+		C.int(from), C.int(bound), C.int(id))
 	runtime.KeepAlive(text)
 	runtime.KeepAlive(s)
-	switch r {
+	switch r.rc {
 	case 1:
-		return int32(out), true, nil
+		return int32(r.pos), true, nil
 	case 0:
 		return 0, false, nil
 	}

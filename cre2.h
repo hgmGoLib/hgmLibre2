@@ -246,6 +246,21 @@ int cre2_spanscan_step(cre2_spanscan *ss, const char *text, int textlen,
 int cre2_set_resolve_span(const cre2_set *h, const char *text, int textlen,
                           int from, int bound, int id, int32_t *out);
 
+/* cre2_span_resolve_result: cre2_set_resolve_span_r 的返回值。
+ *   rc  同 cre2_set_resolve_span 的返回值 (1 找到 / 0 不匹配 / -1 参数错或 DFA 放弃);
+ *   pos 就是那个出参 (rc!=1 时无意义)。 */
+typedef struct {
+	int32_t rc;
+	int32_t pos;
+} cre2_span_resolve_result;
+
+/* cre2_set_resolve_span_r: 上面那个的【按值返回】孪生 (同一份实现, 语义逐字相同)。
+ * 🔴 Go 侧一律走这个: 出参版要把 &out 这个 Go 指针交给 C, 逃逸分析据此每次调用把那个
+ * 局部变量搬上堆 —— 一次解析一笔 4 字节堆分配, 在"每个端点解析一次"的用法上直接按端点数
+ * 放大 (实测 6.5 万个端点 = 6.5 万笔)。同一招见 cre2_match_all_r。 */
+cre2_span_resolve_result cre2_set_resolve_span_r(const cre2_set *h, const char *text,
+                                                 int textlen, int from, int bound, int id);
+
 /* 建一个空 set, reversed!=0 时整个 set 反向编译 (Match 从末尾往前扫原始 buffer)。
  * cre2_set_new(mm) == cre2_set_new_ex(mm, 0)。其余 API (add/compile/match/stats/mem_info/attrib)
  * 对反向 set 一律照常可用, 命中集与正向逐位相同。 */
