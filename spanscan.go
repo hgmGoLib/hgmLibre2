@@ -71,6 +71,19 @@ import (
 // 游程长度 (Hi-Lo) 本身就是信号: 它大, 说明这条 pattern 正在这段文本上贪心吞一大片。
 // 拿不准就按上界判 —— 上界是写 pattern 的人自己知道的事。
 //
+// 🔴 想要 FindAllStringIndex 那个口径 (leftmost-longest · 不重叠) 的调用方, 别自己拼 ——
+//    照抄这套推进, 它逐处全等, 而且总回走量是 O(正文长) 而不是 O(游程数 × 正文长):
+//
+//	用【反向 set】扫 (吐左端)。反向 set 是从右往左扫正文的, 输出总体【降序】, 所以倒着遍历。
+//	对每条 pattern 各留一个游标 cur (初值 -1):
+//	  拿游程的 Lo (= 游标右边最靠左的起点); Lo < cur 就跳过 —— 它落在上一处命中里面,
+//	  FindAll 不会从那里再起一处; 否则用正向 set ResolveSpan(Lo) 求最长右端 end,
+//	  吐出 [Lo, end), 并把 cur 置成 end。
+//
+//    方向【不能反】。拿正向 set (吐右端) 从右往左推是 rightmost-longest, 是另一种口径:
+//    abc?|bcd 撞 "abcd" 时 FindAll 给 [0,3)="abc", 从右往左推给 [1,4)="bcd" —— 两个都自洽,
+//    但要拿这一段做定长校验的下游会判成另一回事。回归钉在 TestSpanPerf_CovDirection。
+//
 // ⚠ 字段布局必须是紧挨着的三个 int32 —— native 侧直接往这块内存写三元组, 不做逐条转换。
 // 下面的 spanSizeAssert 把这条约束钉在编译期。
 type SetSpan struct {

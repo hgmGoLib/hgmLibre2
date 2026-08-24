@@ -213,6 +213,7 @@ type benchNew struct {
 	sc      *SpanScanner
 	spans   []SetSpan
 	out     []int32
+	cov     []int32 // runCov 用: 每条 pattern 上一处已解析命中的【内侧边界】
 }
 
 // newBenchNewFresh 同上, 现建自己的两个 set。只给峰值测量用。
@@ -311,6 +312,85 @@ func (n *benchNew) run(tb testing.TB, text string, perEndpoint bool) []int32 {
 	return n.out
 }
 
+// runCov 在 run(perEndpoint=false) 之上再省一层, 【只走反向路】。
+//
+// 一条 pattern 在同一段正文上常常吐出好几条游程, 但按旧口径它们属于【同一处命中】: 变长尾巴
+// 每走到一个可收的位置就成一条游程, [a-z]{5,}ing 撞上一大段小写就是每个 "ing" 各一条。逐条
+// 游程各解析一次, 每次都从自己那个端点一路回走到同一个起点 —— 回走量 O(游程数 × 正文长)。
+//
+// 改成【一次左到右的推进】: 取当前游标右边最小的那个左端, 解析出它的最长右端, 记下来当新
+// 游标; 后面凡是落在游标以内的左端全部跳过 (它们只可能落在刚吐出的那一处里面)。总回走量压回
+// O(正文长)。这正是 FindAllStringIndex 自己那套 leftmost-longest 扫法, 所以口径逐字节相同 ——
+// TestSpanPerf_Shape 里直接和旧实现【全等】对账, 不是"盖住"那种弱断言。
+//
+// 🔴 方向不能反 —— 拿正向 set (右端) 从右往左推是【错的】, 给的是 rightmost-longest, 和旧口径
+//    不是一个东西。反例 abc?|bcd 在 "abcd" 上: 旧口径 [0,3)="abc", 从右往左推给 [1,4)="bcd"。
+//    两个都自洽, 但下游要拿这一段做定长校验, 差一个字节就是另一回事。见 TestSpanPerf_CovDirection。
+func (n *benchNew) runCov(tb testing.TB, text string) []int32 {
+	if n.forward {
+		tb.Fatalf("runCov 只能走反向路 (扫左端), 见上面那条红字")
+	}
+	n.scanOnly(tb, text)
+	n.out = n.out[:0]
+	if len(n.cov) != len(benchPats) {
+		n.cov = make([]int32, len(benchPats))
+	}
+	for i := range n.cov {
+		n.cov[i] = -1 // 游标: 这条 pattern 上一处命中的右端 (还没有 = -1, 任何左端都跳不过)
+	}
+	// 🔴 反向 set 是【从右往左】扫正文的, 吐出来的游程按位置【降序】排。这一趟推进要的是升序,
+	//    所以倒着遍历。(run() 那几档不看次序, 所以从前没暴露过这件事。)
+	for k := len(n.spans) - 1; k >= 0; k-- {
+		sp := n.spans[k]
+		id := sp.Index
+		p := sp.Lo // 这条游程最左的那个左端 = 游标右边最靠左的起点
+		if p < n.cov[id] {
+			continue // 落在上一处命中里面 ⟹ 旧口径不会从这里再起一处
+		}
+		end, ok, err := n.resSet.ResolveSpanWithin(text, p, -1, id)
+		if err != nil {
+			tb.Fatalf("ResolveSpan: %v", err)
+		}
+		if !ok {
+			tb.Fatalf("规则 #%d 在端点 %d 上解析不出另一端", id, p)
+		}
+		n.cov[id] = end
+		n.out = append(n.out, id, p, end)
+	}
+	return n.out
+}
+
+// TestSpanPerf_CovDirection 钉死上面那条红字: 同一个"跳过被盖住的游程"的省法, 反向路给的是
+// 旧口径, 正向路给的【不是】。这不是实现 bug, 是 leftmost-longest 和 rightmost-longest 本来
+// 就不是一个东西 —— 需求要的是前者 (下游拿这一段做定长校验)。
+func TestSpanPerf_CovDirection(t *testing.T) {
+	const pat, text = `abc?|bcd`, "abcd"
+	re, err := Compile(pat)
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	want := re.FindAllStringIndex(text, -1) // [[0 3]] —— 旧口径
+	if len(want) != 1 || want[0][0] != 0 || want[0][1] != 3 {
+		t.Fatalf("旧口径变了: %v", want)
+	}
+	fwd, err := NewRegexpSet([]string{pat})
+	if err != nil {
+		t.Fatalf("建正向 set: %v", err)
+	}
+	rev, err := NewRegexpSetReverseMaxMem([]string{pat}, 0)
+	if err != nil {
+		t.Fatalf("建反向 set: %v", err)
+	}
+	// 反向路: 最靠左的左端 0 → 最长右端 3 → [0,3) = 旧口径。
+	if end, ok, err := fwd.ResolveSpanWithin(text, 0, -1, 0); err != nil || !ok || end != 3 {
+		t.Fatalf("反向路解析: end=%d ok=%v err=%v, 要 3", end, ok, err)
+	}
+	// 正向路: 最靠右的右端 4 → 最长回走到 1 → [1,4), 与旧口径【不同】。
+	if start, ok, err := rev.ResolveSpanWithin(text, 4, -1, 0); err != nil || !ok || start != 1 {
+		t.Fatalf("正向路解析: start=%d ok=%v err=%v, 要 1", start, ok, err)
+	}
+}
+
 // ── benchmark ───────────────────────────────────────────────────────────────
 
 func BenchmarkSpanPerf(b *testing.B) {
@@ -352,6 +432,18 @@ func BenchmarkSpanPerf(b *testing.B) {
 					n.run(b, text, false)
 				}
 			})
+			if !dir.fwd { // cov 只对反向路成立, 见 runCov 上面那条红字
+				b.Run(dir.tag+"-cov/"+kind, func(b *testing.B) {
+					n := newBenchNew(b, dir.fwd)
+					n.runCov(b, text)
+					b.ReportAllocs()
+					b.SetBytes(int64(len(text)))
+					b.ResetTimer()
+					for i := 0; i < b.N; i++ {
+						n.runCov(b, text)
+					}
+				})
+			}
 			b.Run(dir.tag+"-all/"+kind, func(b *testing.B) {
 				n := newBenchNew(b, dir.fwd)
 				n.run(b, text, true)
@@ -430,6 +522,25 @@ func TestSpanPerf_Shape(t *testing.T) {
 					t.Fatalf("%s %s: 旧实现的匹配 (规则 #%d, [%d,%d)) 没被盖住",
 						kind, r.tag, k[0], k[1], k[2])
 				}
+			}
+		}
+		// 反向路的"跳过被盖住的游程"那一档 (runCov) 走的就是 FindAllStringIndex 自己那套
+		// leftmost-longest 扫法, 所以这里要的是【全等】, 不是上面那种"盖住"的弱断言。
+		covOut := rev.runCov(t, text)
+		want := map[[3]int32]int{}
+		for i := 0; i+2 < len(oldOut); i += 3 {
+			want[[3]int32{oldOut[i], oldOut[i+1], oldOut[i+2]}]++
+		}
+		for i := 0; i+2 < len(covOut); i += 3 {
+			k := [3]int32{covOut[i], covOut[i+1], covOut[i+2]}
+			if want[k] == 0 {
+				t.Fatalf("%s cov: 多给了一处 (规则 #%d, [%d,%d))", kind, k[0], k[1], k[2])
+			}
+			want[k]--
+		}
+		for k, n := range want {
+			if n != 0 {
+				t.Fatalf("%s cov: 少给了 %d 处 (规则 #%d, [%d,%d))", kind, n, k[0], k[1], k[2])
 			}
 		}
 	}
