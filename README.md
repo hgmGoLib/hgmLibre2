@@ -14,12 +14,65 @@ for `*regexp.Regexp`, and not meant to be: the `io.Reader` variants,
 provided, and some semantics differ from stdlib on purpose — most notably
 **`ReplaceAllString` substitutes a *literal* `repl` (no `$1` / `${name}` / `$$`
 expansion)** — plus a few edge cases; see [Differences from stdlib](#differences-from-stdlib-regexp).
+Which of the two engines to use for a given call site is answered — with numbers — in
+[`doc/与标准库regexp怎么选.md`](doc/%E4%B8%8E%E6%A0%87%E5%87%86%E5%BA%93regexp%E6%80%8E%E4%B9%88%E9%80%89.md);
+the short version is in [Why](#why).
 
 ## Why
 
-`regexp` in the standard library is already RE2-based and is the right choice
-almost everywhere. hgmLibre2 exists for the narrow cases where you need the
-real native RE2 engine but cannot pay the cost of the usual options:
+**Use this library by default. Reach for the standard library `regexp` only in the
+three cases listed below** — they are all recognizable by inspection, so no
+experiment is needed to tell them apart.
+
+Go's `regexp` is RE2-*derived* in syntax and in its linear-time guarantee, but its
+matcher is a from-scratch NFA simulation (onepass / bitstate backtracking / one-pass
+NFA). It gets a fast path only when a **literal prefix** can be extracted; when it
+cannot, it restarts at every position. This library runs the real native RE2 lazy
+DFA: one linear pass, essentially independent of input shape. That single difference
+is where the numbers come from — it is not "C beats Go".
+
+On identical patterns and identical corpora the native engine did not lose a single
+*throughput* measurement (compile cost and the per-call floor are separate, and are
+the exceptions below): **1.1× at worst, and 11–85× wherever the standard library
+cannot extract a literal prefix** — a leading `(?i)`, `\b`, character class or alternation is enough
+to lose it. Matching also happens entirely on the C side, so the steady state is
+**0 B/op** on the Go heap, which keeps the GC heap goal (and therefore the process
+peak) from moving at all.
+
+Full numbers, method, corpora and every exception:
+[`doc/与标准库regexp怎么选.md`](doc/%E4%B8%8E%E6%A0%87%E5%87%86%E5%BA%93regexp%E6%80%8E%E4%B9%88%E9%80%89.md)
+("choosing between this library and stdlib `regexp`", Chinese). Every number in it is
+reproduced by `go test -run TestStdlibCompare -v .` (`stdlib_compare_test.go`), so
+re-run it after changing the library or moving to another machine.
+
+**Prefer the standard library `regexp` when:**
+
+- **The pattern is compiled at run time and not cached.** Compiling costs 1.2–4.6×
+  more here (native RE2 does more work up front), and a freshly compiled pattern used
+  once cannot earn that back: measured 9.2 µs (stdlib) vs 21.6 µs here for
+  "compile `(?i)\b<word>\b`, then match one 90-byte sentence". Hoist the pattern to a
+  package-level variable if you can — or, if it is a whole keyword table, compile it
+  into one [`RegexpSet`](#regexpset) instead, which puts you back on this library.
+- **The call sits at the cgo bridge-cost floor.** One crossing costs ~67 ns here
+  versus ~2 ns for a stdlib call (Ryzen 5900X · linux/amd64 · go1.26.5). That only
+  decides the outcome when the *match itself* is cheaper than the crossing — i.e. a
+  few bytes of input and a pattern simple enough for onepass. Note that "short input"
+  alone is **not** the criterion: on a 161-byte string with six backtracking-shaped
+  patterns this library is 24× faster and allocation-free.
+- **You are compiling somebody else's pattern** — user- or config-supplied — and the
+  accepted syntax must match stdlib byte for byte. The two engines disagree at the
+  edges (`\C`, nesting-depth limit, a few escapes; see
+  [Differences](#differences-from-stdlib-regexp)). That is a semantic contract, not a
+  performance question.
+
+One more thing that is not about speed: sharing a single `*Regexp` across goroutines
+does not scale linearly here (every search takes a read lock on the DFA state cache),
+so on **tiny inputs under heavy concurrency** the two engines come out even. On
+body-sized input the lock is irrelevant and this library is still ~100× ahead at 1000
+goroutines. See [Concurrency](#concurrency-sharing-one-regexp-is-fine-it-just-doesnt-scale-linearly).
+
+Beyond speed, this library also avoids the costs of the usual ways to get native RE2
+into Go:
 
 - **No wazero / WASM runtime.** Wrappers like `go-re2` run RE2 inside a wazero
   WebAssembly runtime, which probes stdio handles at startup. In environments
@@ -31,7 +84,9 @@ real native RE2 engine but cannot pay the cost of the usual options:
 - **Single static binary, cross-compilable.** Because it is just C++11 + cgo,
   it cross-compiles with [zig](https://ziglang.org) as the C/C++ toolchain.
 
-If none of the above applies to you, prefer the standard library `regexp`.
+The one hard requirement is cgo: it must stay enabled, and a C++11 compiler (clang,
+gcc or `zig c++`) must be available. A pure-Go / `CGO_ENABLED=0` build cannot use
+this library at all.
 
 ## Install
 
@@ -740,6 +795,11 @@ library `regexp`. The first two are **API-design choices** (this library
 deliberately is not a drop-in); the rest follow from running the **native RE2
 engine** instead of Go's from-scratch reimplementation. All are intentional and
 covered by tests.
+
+For a migration checklist that pairs each gap (here and in
+[Supported API](#supported-api)) with what to use instead — together with the
+performance side of the same decision — see
+[`doc/与标准库regexp怎么选.md`](doc/%E4%B8%8E%E6%A0%87%E5%87%86%E5%BA%93regexp%E6%80%8E%E4%B9%88%E9%80%89.md) §4.
 
 1. **`ReplaceAllString` repl is literal — no `$` expansion.** stdlib expands
    `$1` / `${name}` / `$$` in the replacement string; here `repl` is inserted
