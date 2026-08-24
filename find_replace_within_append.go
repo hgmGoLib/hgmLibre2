@@ -1,6 +1,6 @@
 // find_replace_within_append.go — FindReplaceWithin 的【追加进调用方缓冲】变体。
 //
-// 动机 (2026-08-22 · 200MB 语料 memprofilerate=1 实测): asc 的 healInjectionSeparators 走
+// 动机 (2026-08-22 · 200MB 语料 memprofilerate=1 实测): 调用方的"去分隔符再匹配"那条腿走
 // FindReplaceWithin, 而后者在【有改动】那条路上把 C 侧结果整份 C.GoStringN 拷成一个新的 Go string
 // —— 200MB 正文上就是每次调用一份 200MB 的 Go 堆分配, 一次注入检测走两趟 (#5 heal / #7 combo),
 // 单这一条在那份 profile 里排第五 (400MB, 全场 7.5%)。而那两份产物都是【当场喂进 Set 扫一遍就丢】,

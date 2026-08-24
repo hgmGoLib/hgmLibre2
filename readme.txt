@@ -1,8 +1,21 @@
 本包文档见同目录 README.md (Markdown 正文)。
 调性能 (单条 Regexp 与 RegexpSet 都算) 看 doc/set性能优化经验.txt —— README 里那几节的长版:
 三个旋钮按收益排是 方向 (反着扫) > 表的形状 > 内存预算, 以及量什么、怎么标定、哪些路已经排除。
+本库 vs Go 标准库 regexp 怎么选 看 doc/与标准库regexp怎么选.md —— 哪种形状谁更快 (含实测表)、
+本库缺哪些 stdlib API、一页判据。数据出自 stdlib_compare_test.go, 换机器重跑一遍就知道还成不成立。
 
 要点速记 (详见 README.md):
+* 【默认用本库】。标准库 regexp 的匹配是从零重写的 NFA 模拟, 只有提得出【字面量前缀】时才走
+  memchr 快路; 提不出来 (pattern 以 (?i) / \b / 字符类 / 交替开头) 就逐位置起头 —— 同一条正则
+  同一份正文实测差 11~85 倍, 最差的一格本库也没输 (1.1 倍)。而且匹配全在 C 侧, 稳态 0 B/op,
+  不抬高 GC 堆目标。只有三种情况该留标准库, 都是一眼能认出来的:
+    ① 运行期【现编】且不缓存的正则 (编译价进热路径: 实测 9.2us vs 21.6us 本库输) ——
+       能提到包级变量就提, 是整张关键词表就编成一个 RegexpSet, 那又回到本库。
+    ② 调用停在【过桥地板价】上 (一次 cgo 过桥 ~67ns, stdlib ~2ns): 输入只有几字节且正则简单到
+       onepass 一遍就完。🔴 "输入短" 本身【不是】判据 —— 161B 的串上 6 条要回溯的正则,
+       本库快 24 倍且零分配。决定胜负的是形状不是长度。
+    ③ 编译的是【别人写的】正则 (用户/配置提供) 且语法面必须和 stdlib 逐字一致 —— 语义契约,
+       与性能无关 (\C / 嵌套深度上限 / 个别 escape 两边不通)。
 * 自带 cgo 的原生 RE2 正则库, 不用 go-re2 / 不用 abseil / 不用 cmake, 编译期不下载远程源
   (RE2 2023-03-01 已 vendored, 纯 C++11, zig 可交叉编译)。cgo 必须开启。
   另摘了上游 2023-03-01 之后的几条真修复 (交替因式分解丢大小写的静默漏报 / (?<name>) / 空宽计数重复
@@ -33,7 +46,7 @@
     - AppendFindReplaceWithin(dst, strip, src, repl): 上面那个的【追加进调用方缓冲】孪生 ——
       同一个 C 内核、同一份 changed 判据, 差别只在结果落在哪: FindReplaceWithin 每趟现开一个
       Go string (整份 C.GoStringN 拷一次), 这个 memcpy 进你传的 dst ⇒ 复用同一块底就是稳态零
-      Go 堆分配。产物"当场扫一遍就丢"的解码腿 (asc 的 heal/combo 变体) 用这个。
+      Go 堆分配。产物"当场扫一遍就丢"的解码腿 (先归一化再匹配的那类变体) 用这个。
       changed=false 时 dst 一个字节都没动, 该用原 src; 返回的是 dst 上的视图, 一律用返回值。
       本条没有 ctx —— 外层循环与段内替换都在 C++ 里, Go 侧唯一按正文线性的分配就是结果本身。
     - AppendAllStringIndexFlat(dst, s, n): 同 FindAllStringIndex, 但把 [start,end) 直接追加进
