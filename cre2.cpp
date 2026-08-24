@@ -1,5 +1,6 @@
 // cre2.cpp — cre2.h 的实现, 直接调 vendored RE2 (2023-03-01, 无 abseil).
 #include "cre2.h"
+#include "cre2_internal.h"
 #include "re2/re2.h"
 #include "re2/set.h"
 // 反着扫要直接用 re2 的内部件: Regexp::Parse + Regexp::CompileToReverseProg + Prog::SearchDFA。
@@ -420,9 +421,7 @@ cre2_rev_match_result cre2_partial_match_reverse(const cre2_re *h, const char *t
 }
 
 // ── RE2::Set 包装 ────────────────────────────────────────────────────────────
-struct cre2_set {
-	RE2::Set *set;
-};
+// struct cre2_set 的定义在 cre2_internal.h (cre2_spanscan.cpp 也要用)。
 
 cre2_set *cre2_set_new_ex(int64_t max_mem, int reversed) {
 	RE2::Options opt;

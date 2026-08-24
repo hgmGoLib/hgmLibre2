@@ -16,6 +16,7 @@
 #include "re2/prog.h"
 #include "re2/re2.h"
 #include "re2/regexp.h"
+#include "re2/span_scan.h"
 #include "re2/stringpiece.h"
 
 namespace re2 {
@@ -146,6 +147,14 @@ bool RE2::Set::Match(const StringPiece& text, std::vector<int>* v) const {
 bool RE2::Set::Match(const StringPiece& text, std::vector<int>* v,
                      ErrorInfo* error_info) const {
   return Match(text, v, error_info, NULL);
+}
+
+// ── hgmLibre2 追加 ── 见 set.h / re2/span_scan.h。
+// nid 传 size_ (Add 成功的条数) —— 吐出去的 id 与 Match 返回的下标是同一套。
+DFASpanScan* RE2::Set::NewSpanScan() const {
+  if (!compiled_ || prog_ == NULL)
+    return NULL;
+  return prog_->NewSpanScan(size_);
 }
 
 // 没扫过就没有 DFA —— 这时候【不建】, 直接报 built=false。

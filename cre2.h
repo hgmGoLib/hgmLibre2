@@ -202,6 +202,40 @@ typedef struct {
  * 反向程序在首次调用时惰性编出来 (线程安全), 预算用 handle 的 max_mem。 */
 cre2_rev_match_result cre2_partial_match_reverse(const cre2_re *h, const char *text, int textlen, int want_stats);
 
+/* ── 流式游程扫描: 一遍扫正文, 边扫边说"哪条 pattern 命中在【哪】" ──────────────
+ * cre2_set_match 只回答"哪几条命中"; 要位置的调用方只能拿到 id 之后, 再用那几条各自
+ * 跑一遍【整篇正文】。位置本来就在 DFA 热循环里算出来了 (只是被丢掉), 这套 API 把它收下来。
+ *
+ * 吐出来的是【游程】(id, lo, hi), 不是逐个位置 —— kManyMatch 的 DFA 在每一个能结束匹配的
+ * 位置都会报一次, 可变长匹配上会连出一串 (`[a-z]{3,}` 撞 "abcdef" 会在 3/4/5/6 各报一次)。
+ * 按 pattern 把连号的收敛成一段再吐, 且【两端都给】所以无信息损失 (展开 [lo,hi] 即可还原)。
+ *   正向 set : 位置 = 匹配【右端】偏移 (不含)
+ *   反向 set : 位置 = 匹配【左端】偏移 (含)
+ * 恒 lo <= hi (原文坐标)。顺序【不保证】全局按位置升序 —— 游程要等"这条再次命中且不连号"
+ * 或"整篇扫完"才收口, 所以不同 pattern 的游程会交错。要有序自己排 (条数是游程数, 很少)。
+ *
+ * 语义细节和"为什么是轮询不是回调/不是一次吐完"见 internal_include/re2/span_scan.h。 */
+typedef struct cre2_spanscan cre2_spanscan;
+
+/* 开一个流式扫描工作区 (set 必须已 cre2_set_compile)。OOM / 没编译返回 NULL。
+ * 工作区可以反复用于多次扫描 (游程表不重新分配), 但【不是并发安全的】: 一个线程一个。 */
+cre2_spanscan *cre2_set_spanscan_new(const cre2_set *h);
+void cre2_spanscan_free(cre2_spanscan *ss);
+
+/* 开始一次新扫描 (清游程表, 绑定正文长度)。1=成功 0=失败(textlen<0)。 */
+int cre2_spanscan_begin(cre2_spanscan *ss, int textlen);
+
+/* 推进一步, 最多吐 outcap/3 条游程进 out (每条 3 个 int32: index, lo, hi)。
+ * 返回本批的【游程条数】(>=0); <0 = 出错 (DFA 放弃 / 状态恢复失败, 整次扫描作废)。
+ * *more: 1 = 还没扫完, 取走这批后再 step 一次; 0 = 扫完了。
+ * outcap 必须 >= 3*pattern条数 (保证"再来一个命中字节也一定塞得下"), 否则返回 -1。
+ *
+ * 🔴 text/textlen 每次 step 都要重新传, 且必须是同一份正文、同一个长度:
+ *    native 侧【只存偏移不存指针】—— 挂起期间不持有调用方的任何指针 (cgo 的硬要求),
+ *    也不持有 DFA 的任何锁 (持锁跨回调会把想 flush 的线程全堵住)。 */
+int cre2_spanscan_step(cre2_spanscan *ss, const char *text, int textlen,
+                       int32_t *out, int outcap, int *more);
+
 /* 建一个空 set, reversed!=0 时整个 set 反向编译 (Match 从末尾往前扫原始 buffer)。
  * cre2_set_new(mm) == cre2_set_new_ex(mm, 0)。其余 API (add/compile/match/stats/mem_info/attrib)
  * 对反向 set 一律照常可用, 命中集与正向逐位相同。 */

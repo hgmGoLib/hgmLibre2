@@ -43,6 +43,7 @@
 #include "util/strutil.h"
 #include "re2/pod_array.h"
 #include "re2/prog.h"
+#include "re2/span_scan.h"   // ── hgmLibre2 追加 ── 流式游程扫描 (实现见文件末尾的 .inc)
 #include "re2/re2.h"
 #include "re2/sparse_set.h"
 #include "re2/stringpiece.h"
@@ -201,6 +202,10 @@ static const bool ExtraDebug = false;
 
 class DFA {
  public:
+  // ── hgmLibre2 追加 ── 流式游程扫描的工作区 (re2_dfa_spanscan.inc)。它要用 State /
+  // RWLocker / StateSaver / RunStateOnByteUnlocked 这些只在本编译单元里可见的东西。
+  friend class DFASpanScan;
+
   DFA(Prog* prog, Prog::MatchKind kind, int64_t max_mem);
   ~DFA();
   bool ok() const { return !init_failed_; }
@@ -3311,3 +3316,7 @@ bool Prog::PossibleMatchRange(std::string* min, std::string* max, int maxlen) {
 }
 
 }  // namespace re2
+
+// ── hgmLibre2 追加 ── 流式游程扫描 (自带 namespace re2)。放文件末尾是因为它要用到
+// 上面所有 DFA 内部件, 而 class DFA 整个定义就在本文件里, 外面的编译单元看不见。
+#include "re2_dfa_spanscan.inc"

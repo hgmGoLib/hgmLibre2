@@ -87,8 +87,9 @@
       为的是 `S B{m,n} L` 这个形状 —— 起始类窄于重复类的计数重复, 正向 DFA 状态数对界指数,
       反向线性。实测 [A-Za-z][A-Za-z0-9]{2,19}key × 120 份 8KB 语料: 正向 35149 状态 / 5.35MB,
       反向 45 状态 / 0.01MB, 命中集一致。
-      ⚠ 只回答"命中没有 / 哪几条命中", 不回答"在哪" (反向只知道匹配左端)。要位置就用它当便宜的门,
-      少数命中的再正向 FindStringIndex 一次。
+      ⚠ Match 只回答"命中没有 / 哪几条命中", 不回答"在哪"。要位置别再走"命中之后正向
+      FindStringIndex 重扫整篇"那条老路 —— 用 NewSpanScanner (见下), 反向 set 直接给匹配左端,
+      再用锚定的 \A(?:pat) 在 text[start:] 上取右端, 第二遍只碰命中那一段。
       ⚠ 方向是【每条 pattern 各自】的决定: (?s).{20}key 正向 21 状态 / 反向 1,
       key(?s).{20} 正好反过来。拿真语料各建一个单条 set 比 MemInfo().States 就知道该往哪边放。
       ⚠ 这跟"自己把 pattern 倒着写 + 把正文倒过来"不是一回事, 而且库这条更省: RE2 的 Simplify
@@ -123,13 +124,47 @@
       Match/MatchAny/MatchBytes/MatchAnyBytes 不返回 error: Compile 过了之后运行期 DFA 不会爆
       (RE2 对 set 的 DFA 只 flush 缓存不 bail; 且 CompileSet 编译期就跑过 DFA 冒烟测试) —— 依据与
       实测见 README.md 的 "Why Match has no error return"。
+    - RegexpSet.NewSpanScanner + (*SpanScanner).Scan / ScanBytes / AppendSpans:
+      【流式游程扫描】—— Match 只回答"哪几条命中", 这个回答"命中在哪"。位置本来就在 DFA
+      热循环里算出来了 (lastmatch), 上游只是把它丢掉; 这套 API 把它收下来吐给调用方。
+      为什么值得: 原来要位置只能"拿到 index 之后, 对那几条各跑一次 FindStringIndex", 每跑一次
+      就是【又扫一遍整篇正文】, 而且用的是非锚定正则 —— .*? 前缀让"哪个位置能当匹配起点"
+      变成"每个位置都能", 那正是状态数指数增长的引信 (见 doc/状态数为什么会相乘.txt:
+      同一条 pattern 加个 \b 就是 967 倍)。有了位置, 第二遍只跑【命中那一段】, 而且可以写成
+      锚定的 \A(?:pat) —— 起点只剩一个, 走不通当场 DeadState 收工, 那套爆炸机制从根上不存在。
+      🔴 第二遍【必须锚定】才有这一半收益。继续拿原来那条非锚定正则去扫 text[start:],
+      .*? 前缀会让它一路扫到正文末尾, 省下来的只有 start 之前那一截, 状态照建不误。
+      吐的是【游程】(Index, Lo, Hi) 不是逐个位置: kManyMatch 的 DFA 在每一个能结束匹配的位置
+      都报一次, 一条可变长 pattern 会连出一串 (`[a-z]{3,}` 撞 "abcdef" 在 3/4/5/6 各报一次),
+      按 pattern 把连号的收敛成一段再吐。正向 set 给的是匹配【右端】(不含), 反向 set 给的是
+      【左端】(含); 恒 Lo <= Hi (原文坐标)。
+      🔴 两端都给是【必须】的, 不能只留一端: `ab|c` 撞 "abc" 的两个 end 是 2 和 3 —— 连号,
+      只留 3 就把 [0,2) 那个匹配悄悄弄丢了, 而且不报错。展开 [Lo,Hi] 就能无损还原逐个位置。
+      🔴 顺序【不保证】全局按位置升序 (游程要等"这条再次命中且不连号"或"整篇扫完"才收口,
+      不同 pattern 会交错)。要有序自己排 —— 排的是游程条数, 不是位置数。
+      🔴 语义【不是】FindAllStringIndex: 那个只给 leftmost-first 的不重叠序列, 这里给的是
+      所有 pattern 的所有匹配端点, 重叠的也在里面 (`abcd|bc` 撞 "abcd" 两条都报)。要取舍
+      (优先级贪心 / 相交即丢 / …) 是调用方的业务规则, 库这层不替它决定。
+      形态是"取一批再要一批"(sqlite3_step 式) 而不是一次吐完: 游程条数没有上界, 一次吐完
+      要么无界攒内存, 要么"缓冲不够就扩容重跑"—— 重跑付的正是最贵的那一遍 (新正文现造状态,
+      同档 0-flush 下 23.7ms/份 vs 重扫 0.36ms/份 = 66 倍)。攒满一批就挂起 (按内容存下 DFA
+      状态、放掉缓存读锁), 取走再进去接着扫; 挂起期间一把锁都不持有, 也不持有调用方指针。
+      SpanScanner 是可复用工作区, 热路径上建一次长期留着; 【不是并发安全的】—— 一个 goroutine
+      一个 (同一个 Set 上开多个 scanner 并发扫没问题, Set 本身只读)。
+      ⚠ Set 是 never_capture(true) 编的, 永远不给子组位置 —— 需要 FindAllStringSubmatchIndex
+      (要 group1 的偏移) 的调用方, 这条路服务不了, 只能照旧单独跑那条正则。
 * vendored 的 re2 里改过的上游文件只有这几个 (完整清单与升级时怎么重打见 VENDOR.txt):
   re2_dfa.cc 是大头 —— 转移表槽位从 8 字节指针改成 4 字节 arena 下标 + arena 按需增长。
   同预算多装 1.74 倍状态 (0-flush 门槛降一档), 健康档吞吐不降, 峰值 RSS 约 -30%。
   命中集与原版逐位一致 (跨 pattern 表/语料/预算矩阵对拍钉死)。
   要编原版对照: CGO_CXXFLAGS="-O2 -DRE2_DFA_NEXT_BITS=64 -DRE2_DFA_ARENA=0"。详见 README.md。
   其余几处是【纯追加】: prog.h / set.h / re2_set.cc 上的观测出参与访问器, 外加
-  re2_compile.cc / re2_set.cc 上给 Prog::CompileSet 和 RE2::Set 加的 reversed (反着扫, 见上)。
+  re2_compile.cc / re2_set.cc 上给 Prog::CompileSet 和 RE2::Set 加的 reversed (反着扫, 见上),
+  以及流式游程扫描 (re2/span_scan.h + re2_dfa_spanscan.inc, 由 re2_dfa.cc 末尾 #include 进去 ——
+  class DFA 整个定义就在 re2_dfa.cc 里, 别的编译单元看不见 State/RWLocker/StateSaver)。
+  🔴 那份是【另写的一份热循环】, 没往 InlinedSearchLoop 里塞 if: 老循环是全库最热的那个,
+  它只管把 id 塞进 SparseSet (塞一次就够, 还能 early-out); 游程扫描每个命中字节都要维护
+  "这条 pattern 的游程长到哪了"且永不早退。混在一起是白给老循环加分支。
 * 与 stdlib 的边角差异 (非法 UTF-8 上 . 的匹配、\C 等) 见 README.md 的 Caveats。
 * 测试: go test ./... (每个方法对拍 stdlib regexp; FindReplaceWithin 对拍 stdlib 等价嵌套写法;
   []byte 系见 bytes_test.go: 同语料下双向对拍 stdlib 与自家 string 孪生 + 每方法手算的命中/不命中
@@ -137,4 +172,13 @@
   反着扫见 reverse_test.go: 正反答案逐位对拍 (含 ^ $ \A \z (?m)^ \b (?i) (?s) 与多字节 UTF-8)
   + 状态数确实塌下来 + 方向是每条 pattern 各自的决定 + 库的反向比手写反转便宜 100 倍以上
   + 反向 DFA 放弃时退回正向且答案不变; 单条内存预算见 maxmem_test.go: 读回/编译失败/语义不变
-  + "默认预算 flush、给够就 0 flush" 这条曲线)。
+  + "默认预算 flush、给够就 0 flush" 这条曲线;
+  流式游程扫描见 spanscan_test.go (与一个 O(n²) 暴力参考逐位对拍 —— 参考实现把前后缀按字面量
+  钉死再拿【整篇正文】去匹配, 这样 ^ $ \b 看到的是真实位置, 拿 text[s:e] 单独匹配会判出一堆
+  假命中; 外加"batch 只影响怎么吐不影响吐什么"、`ab|c` 连号游程可还原、半途 return false 之后
+  工作区能重用) · spanscan_need_test.go (按真实调用形态走完整流水线: 反向 set 拿左端 → 锚定
+  正则只跑命中那一段拿右端 → 优先级贪心相交即丢 → 一次升序替换, 并钉死边界精确到字节、
+  条数不多不少、以及"锚定的在错位置当场死 / 非锚定的会一路扫过来"这个机制本身) ·
+  spanscan_stress_test.go (把 maxMem 压到反复 flush + batch 压到 1 反复挂起, 结果必须与
+  预算充足+大批一致 —— 挂起是"按内容存状态", 走错了不会崩, 会悄悄少吐几段; 外加同一个 Set
+  上 8 个 goroutine 各拿一个 scanner 并发扫, -race 干净))。

@@ -14,6 +14,7 @@
 #include "re2/re2.h"
 
 namespace re2 {
+class DFASpanScan;   // ── hgmLibre2 追加 ── 见 re2/span_scan.h
 class Prog;
 class Regexp;
 }  // namespace re2
@@ -84,6 +85,12 @@ class RE2::Set {
   // stats 由调用方在栈上开一个即可, 不必清零; 传 NULL 等价于上面那个重载。
   bool Match(const StringPiece& text, std::vector<int>* v,
              ErrorInfo* error_info, DFAScanStats* stats) const;
+
+  // ── hgmLibre2 追加 (非上游 re2) ──
+  // 开一个【流式游程扫描】工作区: Match 只回答"哪几条命中", 这个回答"命中在哪"。
+  // 语义 (吐什么 / 为什么是游程 / 为什么是轮询) 全在 re2/span_scan.h, 用完 DFASpanScanFree。
+  // 没编译 / OOM 返回 NULL。工作区可以反复用于多次扫描, 但不是并发安全的。
+  DFASpanScan* NewSpanScan() const;
 
   // 查这个 Set 的 DFA 缓存水位 + 生涯累计 (没扫过则 out->built=false)。
   // 只读, 短暂拿 DFA 的读锁, 可以和扫描并发调。

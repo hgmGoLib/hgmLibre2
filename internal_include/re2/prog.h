@@ -52,6 +52,7 @@ enum EmptyOp {
 };
 
 class DFA;
+class DFASpanScan;   // ── hgmLibre2 追加 ── 见 re2/span_scan.h
 class Regexp;
 
 // Compiled form of regexp program.
@@ -298,6 +299,10 @@ class Prog {
                  Anchor anchor, MatchKind kind, StringPiece* match0,
                  bool* failed, SparseSet* matches,
                  DFAScanStats* stats = NULL);
+
+  // ── hgmLibre2 追加 ── 在这个 Prog 的 kManyMatch DFA 上开一个【流式游程扫描】工作区
+  // (语义/用法见 re2/span_scan.h; 用完 DFASpanScanFree)。nid = Set 里的 pattern 条数。
+  DFASpanScan* NewSpanScan(int nid);
 
   // 查这个 Prog 上某一 kind 的 DFA 缓存水位 (没建出来则 out->built=false)。
   // 只读, 会短暂拿 DFA 的读锁; 可以在扫描并发进行时调。
