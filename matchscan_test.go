@@ -205,3 +205,34 @@ func TestMatchScanEmptyCapableFallback(t *testing.T) {
 		t.Fatalf("要 [0] (a* 走老路), 得到 %v", unres)
 	}
 }
+
+// TestMatchScanWanted —— 没进 SetWanted 的那几条: 位照样亮 (Hit/HitIDs), 但一个游程不攒、
+// 一次左端不补, AppendMatches 返回 ok=false 让调用方走老路。
+func TestMatchScanWanted(t *testing.T) {
+	set, err := NewRegexpSet([]string{`[A-Z]\d{3}`, `[a-f]{2,6}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ms, err := set.NewMatchScanner()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ms.Close()
+	ms.SetWanted([]bool{false, true})
+	if err := ms.Scan("A123 beef"); err != nil {
+		t.Fatal(err)
+	}
+	if !ms.Hit(0) || !ms.Hit(1) {
+		t.Fatalf("两条都该命中: %v", ms.HitIDs())
+	}
+	if _, ok, _ := ms.AppendMatches(nil, 0); ok {
+		t.Errorf("第 0 条没在 wanted 里, 该返回 ok=false")
+	}
+	got, ok, err := ms.AppendMatches(nil, 1)
+	if err != nil || !ok {
+		t.Fatalf("第 1 条: ok=%v err=%v", ok, err)
+	}
+	if fmt.Sprint(got) != fmt.Sprint([]int32{5, 9}) {
+		t.Fatalf("得到 %v, 要 [5 9] (%q)", got, "beef")
+	}
+}

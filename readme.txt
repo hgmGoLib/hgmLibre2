@@ -189,18 +189,18 @@
       判定用的上下文恒是【整篇正文】, 所以 \b / ^ / $ 看到的永远是真实邻居字节, 而不是
       bound 切出来的假边界 —— 掐 bound 只会让答案变短, 不会让它变错。
       无状态、只读 (自己拿 DFA 的缓存读锁), 可以和别的 goroutine 的扫描并发调。
-    - RegexpSet.NewMatchScanner + (*MatchScanner).Scan / HitIDs / Hit / AppendMatches
-      + RegexpSet.PatternLenRange / PatternLenRange(pattern):
-      【一遍扫, 之后按条要位置】—— 把上面两件 (游程扫 + 锚定解析) 拼成调用方真正要的形状,
-      顺带把"同一处命中报出一串右端"那种重复在库里就解决掉。替的是这套两段式:
+    - RegexpSet.NewMatchScanner + (*MatchScanner).SetWanted / Scan / HitIDs / Hit / AppendMatches
+      + RegexpSet.PatternLenRange / PatternLenRange(pattern) / ReverseOneStats:
+      【一遍扫, 直接给不重复的命中区间】—— 把上面两件 (游程扫 + 锚定解析) 拼成调用方真正要的
+      形状, 顺带把"同一处命中报出一串右端"那种重复在库里就解决掉。替的是这套两段式:
       先 Set.Match 扫一遍拿"哪几条命中", 再为了知道【在哪】把命中的每条各对整篇正文跑一遍
       FindAllStringIndex —— 命中 k 条就是 1+k 遍全文。
-        ms, _ := set.NewMatchScanner()      // 热路径上建一次留着
+        ms, _ := set.NewMatchScanner()      // 热路径上建一次留着; 不是并发安全的
+        ms.SetWanted(mask)                  // 哪几条要位置 (只当 bool 用的那几条别攒), 默认全要
         ms.Scan(body)                       // ← 唯一一遍全文。之后 Hit(i)/HitIDs() 就是门那张 bool 表
-        spans, ok, _ := ms.AppendMatches(buf[:0], id)   // ← 只有问到的这条才补左端; 扁平 (lo,hi) 对
-        // ok==false: 这一条补不出来 (能匹配空串 / 反向编不出来), 照老路 re.FindAllStringIndex
-      🔴 分成两步是有意的: 门上很多位【只当 bool 用】, 从来没人问它在哪。一遍扫的时候把全表的
-         左端都补出来是白付。所以补左端挂在"谁问谁付"上。
+        spans, ok, _ := ms.AppendMatches(buf[:0], id)   // 扁平 (lo,hi) 对; 结果扫那一遍就算好了
+        // ok==false: 这一条拿不到 (不在 wanted / 能匹配空串 / 反向编不出来 / 游程乱序)
+        //            → 照老路 re.FindAllStringIndex
       左端怎么补, 看 PatternLenRange 的两档 (patlen.go, 建集期用 Go 的 regexp/syntax 解析一次):
         min == max  定长 (NRIC 9 字节 · 身份证 18 字节): Lo = Hi - min, 一句减法, 不进正则引擎。
         其余        用【这一条 pattern 自己一条】的反向 set 做一次锚定回推, 一次调用给最靠左的起点。
@@ -208,7 +208,17 @@
          (doc/状态数为什么会相乘.txt): 155 条的真实门表, 正向 6.4MB 上 18ms / 零 flush,
          整表反向 65 秒 / arena 顶满 254MB 还在 flush。拆成一条一个就没有这个乘法; 而且这些
          反向 set 【从不用来扫正文】, 只做锚定解析, 起点只有一个, 爆炸机制从根上不存在。
-         再加上惰性: 只有真被问到的那几条才建得出来。
+         惰性建 + 便宜得出奇: 真表上被问到的 32 条一共才 973 个状态 / 2.0MB (ReverseOneStats)。
+      🔴 游标推进在【回调里当场跑完】, Go 这侧一条游程都不攒。native 那层本来就是 sqlite3_step
+         式的 (一批 4096 条 = 48KB, 装满就挂起回调, 缓冲循环复用, 不随正文长度涨); 要是 Go
+         这侧把每批 append 起来等扫完再算, 那个固定缓冲就白设计了 —— 真表上游程约 30741 条/MB
+         (0.23MB/MB), 200MB 的 body 就是每个并发扫描 47MB。收口之后 Go 这侧留下的只有【输出】,
+         实测 0.037MB/MB (6.2 倍差), 而输出是调用方本来就要拿走的东西, 还比老路的 [][]int 省
+         (扁平 int32 对 8 字节/处 vs 每处一个切片头 40 字节)。
+         能这么做是因为同一条 pattern 的游程【跨批次也是升序】(正向扫本来就从左往右走; 真表
+         196744 条游程 / 50 批, 乱序 0 处)。万一乱序, 那一条当场标成"补不出来"退回老路。
+      🔴 SetWanted 不是可选优化: 门上很多位只当外层短路的 bool 用 (bgAPACCombined 那种),
+         从来没人问它在哪。真表上光两条这样的 pattern 就占了 57% 的游程 —— 挡掉就是白赚。
       保证只有三条: ① 吐的 text[Lo:Hi] 一定是那条 pattern 的【真匹配】; ② 正文里有匹配的地方
       一定被覆盖到 (不丢召回); ③ 同一条 pattern 吐的区间互不相交、按 Lo 升序。
       🔴 【不是】FindAllStringIndex 的逐字节等价: 交替式上 FindAll 是 leftmost-first, 这里恒取
@@ -217,14 +227,12 @@
          不是重复, 是两个问题各要一个答案 (带空格的和不带空格的两条, 下游正是靠"这段里有没有
          空格"分流; 合了就是漏检)。
       实测 (真实 155 条门表 × 6.4MB 真前端产物 · 命中 47 条 · 稳态 · 生产预算 64MB):
-        ① 门 Match (今天就在付的那一遍)          19.4ms
-        ② 同一遍改成收游程                       19.1ms   ← 位置是白送的
-        ③ Scan (收游程 + 命中表)                 18.8ms   ← 与 ① 同价
-        ④ ③ + 把命中的 47 条【全部】补出来        33.6ms
-        旧的 1+k 遍全文 (k=47)                  446ms
-        新腿 (③ + 按条补 + 兜底)                 35ms  = 12.6×; 74249 处逐段验过, 0 假匹配 0 漏
-      小串上不吃亏 (门在小 body 上被调很多次): 32B 无命中 119ns→115ns · 4KB base64 5.70us→5.61us ·
-      最贵的一档 256B 命中密集 434ns→574ns。
+        整条腿 (Match+逐条 FindAll) → (Scan+按条取):  366.8ms → 26.1ms = 14×
+        分段:  门 Match 18.6ms · 同一遍收游程 18.7ms (位置白送) · Scan 全套 33.8ms
+        内存:  进程 VmHWM 107.2MB → 108.1MB (+0.9MB) · Go 分配 4.0MB/2252 obj → ~0/146 obj
+        按正文长度: 真语料 8KB 以下打平 (1.0×) · 32KB 3.1× · 512KB 6.1× · 2MB 14×
+        最坏 (每 38 字节一处命中的合成串): 0.94×, 即 6% 慢 —— 每处命中要两次 cgo 往返,
+        正文短到几乎全是命中时这笔固定开销赢不了。真 base64 碎片不长这样 (打平)。
     - 性能 (spanscan_bench_test.go · 64KiB 正文 · 10 条通用 pattern · Ryzen 5900X · 稳态复用):
       对照的"旧实现"就是今天调用方那一套 —— set.Match 当门 + 逐条命中 pattern 在整篇正文上
       FindAllStringIndex (命中 k 条 = 1+k 遍全文扫描, 而且后面那 k 遍是最贵的非锚定扫描)。
