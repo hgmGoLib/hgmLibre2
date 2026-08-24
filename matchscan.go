@@ -81,15 +81,14 @@
 //
 // 🔴 这两个口子上给出来的段【是真匹配但比 FindAll 那一处长/短/偏】。对于拿这一段去过校验位的
 //    下游 (身份证 · IBAN mod-97 · Luhn), 边界差一个字节就是校验失败 = 无声漏报 —— 比"没检测到"
-//    更难查。所以要"和老路逐字节一致"的调用方 (检测器/checker 就是这种) 必须开 SetExactOnly,
-//    把变长档整个交回老路。
+//    更难查。要"和老路逐字节一致"的调用方只能挑定长档用: 变长条的位置别拿去切片再判。
 //
 // PatternLeftmostLongestSafe (patlen.go) 只挡掉最凶的那一类 (惰性量词 · 不等长交替 ——
 // 后者会让短分支结在长分支【内部】, 整个长匹配被游标吞掉), 它是【必要不充分】条件:
 // 挡住之后变长档仍然不等于 FindAll, 见上面两个反例。
 //
-// ok=false 的那几条 (没在 SetWanted 里 / 开了 SetExactOnly 的变长条 / 能匹配空串 /
-// 口径不安全 / 反向编不出来 / 游程乱序 / DFA 预算不够) 请调用方照老路对它跑 FindAll ——
+// ok=false 的那几条 (没在 SetWanted 里 / 能匹配空串 / 口径不安全 / 反向编不出来 /
+// 游程乱序 / DFA 预算不够) 请调用方照老路对它跑 FindAll ——
 // 库这边宁可退回去也不给一个"像是对的"答案。
 //
 // 生命周期同 SpanScanner: 可复用工作区, 热路径上建一次留着, 【不是并发安全的】。
@@ -112,9 +111,6 @@ type MatchScanner struct {
 	text string
 	per  []msPat_t
 	want []bool // nil = 全要
-	// exactOnly: 只交【与 FindAll 逐字节相同】的那一档 (定长), 变长条一律 ok=false。
-	// 检测器那种"拿这一段过校验位"的调用方必须开, 见文件头。
-	exactOnly bool
 	hit  []bool
 	hits []int32 // 上一遍命中过的下标 (= Set.Match 那张表), 去重且只含真命中
 	err  error   // 回调里出的错 (回调没法返 error)
@@ -154,17 +150,6 @@ func (s *RegexpSet) NewMatchScanner() (*MatchScanner, error) {
 // 真表上光这一挡就去掉 57% 的游程。调用方那边这是【静态】信息: 哪几个门分支的消费点会问
 // 位置, 哪几个只是外层短路的 bool, 建集的时候就知道。
 func (m *MatchScanner) SetWanted(mask []bool) { m.want = mask }
-
-// SetExactOnly 打开"只要逐字节等于 FindAllStringIndex 的那一档"。开了之后变长 pattern 一律
-// 返回 ok=false 交回老路, 只有定长档 (min==max) 走这条快路。
-//
-// 什么时候必须开: 消费点拿区间去【切一段出来再判】(校验位 · 去空格后重新匹配 · 判断段里
-// 有没有空格 · 把 Start/End 写进告警给人看)。这些地方边界差一个字节就是另一个答案。
-// 什么时候不用开: 只拿区间做"这附近有没有东西"的粗定位 (上下文窗口 · 邻域共现)。
-//
-// 代价是真的: 真表 6.4MB 上全开是 13.9×, 只留定长档是 1.19× —— 收益的大头在变长档,
-// 而变长档正是给不出逐字节保证的那一档。别只看倍数就选。
-func (m *MatchScanner) SetExactOnly(v bool) { m.exactOnly = v }
 
 func (m *MatchScanner) wants(i int) bool {
 	if m.want == nil {
@@ -239,10 +224,6 @@ func (m *MatchScanner) feed(i int, lo, hi int32) {
 		p.minL = int32(minL)
 		p.fixed = minL == maxL && maxL >= 0
 		if !p.fixed {
-			if m.exactOnly {
-				p.bad = true // 只要逐字节那一档 —— 变长条交回老路
-				return
-			}
 			// 变长: 右端要靠 ResolveSpan 取【最长】。只有"最长 == FindAll 那一处"的
 			// pattern 才敢这么给 —— 惰性量词 / 不等长交替上最长会比 FindAll 长一截,
 			// 下游拿这一段过校验位就是无声漏报 (patlen.go PatternLeftmostLongestSafe)。
