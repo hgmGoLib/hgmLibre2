@@ -50,6 +50,24 @@ type RegexpSet struct {
 	rev1Mu sync.Mutex
 }
 
+// ReverseOneStats 报【已经被建出来】的那些单条反向 set 的账: 几条 · 状态数合计 ·
+// 状态区实际字节合计。惰性建 ⟹ 没被问过位置的 pattern 一条都不占。
+// 与 MemInfo 同一个用途 (量内存去哪了), 不制造状态。
+func (s *RegexpSet) ReverseOneStats() (n int, states, arenaCap int64) {
+	s.rev1Mu.Lock()
+	defer s.rev1Mu.Unlock()
+	for _, r := range s.rev1 {
+		if r == nil {
+			continue
+		}
+		mi := r.MemInfo()
+		n++
+		states += mi.States
+		arenaCap += mi.ArenaCap
+	}
+	return n, states, arenaCap
+}
+
 // reverseOne 返回第 i 条 pattern 自己一条的反向 set (惰性建, 建不出来返回 nil)。
 // 只读用途 (ResolveSpan*), 并发安全。
 func (s *RegexpSet) reverseOne(i int) *RegexpSet {
