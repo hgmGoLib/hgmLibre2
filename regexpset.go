@@ -47,6 +47,7 @@ type RegexpSet struct {
 	//    那条 .*? 前缀引起的状态爆炸机制从根上就不存在。
 	//    再加上惰性: 只有真命中过的那几条才会被建出来。
 	rev1   []*RegexpSet
+	rev1No []bool // 第 i 条试过且【建不出来】—— 记下来免得每遍扫描重编一次
 	rev1Mu sync.Mutex
 }
 
@@ -78,14 +79,19 @@ func (s *RegexpSet) reverseOne(i int) *RegexpSet {
 	defer s.rev1Mu.Unlock()
 	if s.rev1 == nil {
 		s.rev1 = make([]*RegexpSet, len(s.pats))
+		s.rev1No = make([]bool, len(s.pats))
 	}
 	if r := s.rev1[i]; r != nil {
 		return r
 	}
+	if s.rev1No[i] {
+		return nil // 上次就没建出来, 别再重编一遍
+	}
 	r, err := NewRegexpSetReverseMaxMem([]string{s.pats[i]}, s.maxMem)
 	if err != nil {
-		// 建不出来不是错: 调用方会把这一条列进 Unresolved(), 照老路跑 FindAll。
-		// 存一个"建过了"的空壳避免每次重试 —— 用 size==0 的哨兵。
+		// 建不出来不是错: 调用方把这一条照老路跑 FindAll。记下来避免每遍扫描重试 ——
+		// 反向编译是要钱的, 而失败是【确定性】的, 重试一万次也还是失败。
+		s.rev1No[i] = true
 		return nil
 	}
 	s.rev1[i] = r

@@ -122,40 +122,77 @@ func TestMatchScanUnboundedTail(t *testing.T) {
 	}
 }
 
-// TestMatchScanVsFindAllRandom —— 随机语料上对三条保证做批量对账 (合成 pattern + 合成正文)。
-// 口径不是"与 FindAll 逐字节相同" (交替式上本来就不同), 而是:
-// 真匹配 · 不丢召回 (FindAll 的每一处都被覆盖) · 同条不自相重叠。
-func TestMatchScanVsFindAllRandom(t *testing.T) {
+// TestMatchScanStrictVsFindAll —— 随机语料上的差分对账, 口径是【逐字节等于 FindAll】。
+//
+// 为什么口径要这么硬: 消费点拿到区间是要 text[Lo:Hi] 去过校验位的 (身份证 / IBAN mod-97 /
+// 银行卡 Luhn)。相交但边界不同 = 那一段过不了校验 = 无声漏报, 比"没检测到"更难查。
+// 所以凡是 ok=true 的条必须逐处相同; 给不出这个保证的条必须【自己承认】(ok=false),
+// 交回调用方走老路 —— 那正是 PatternLeftmostLongestSafe 在挡的两类:
+//   ab|abcd  分支不等长的交替: FindAll 是 leftmost-first 取 "ab", 取最长会给 "abcd";
+//            更糟的是 abc|b 那种短分支结在长分支【内部】的, 游标会把长的整个漏掉。
+//   a.*?b    惰性量词: 语义就是能短就短, 与最长正相反。
+func TestMatchScanStrictVsFindAll(t *testing.T) {
 	pats := []string{
 		`[A-Z]\d{3}`,
 		`[a-f]{2,6}`,
 		`q[0-9a-z]{3,}q`,
 		`[\x{4e00}-\x{9fff}]{2,4}`,
 		`w+x`,
-		`ab|abcd`,
+		`ab|abcd`, // 🔴 故意放一条不安全的: 它必须落进 unresolved, 不许硬给答案
 		`\b[A-F0-9]{8}\b`,
+		`x[a-f]{1,4}y`,
+		`[a-f]{2}-[a-f]{2,4}`,
 	}
+	// 没有长度上限的那两条 (q…q · w+x) 本来就只保证"真匹配 + 不相交", 不进逐字节那一档。
+	unbounded := map[int32]bool{2: true, 4: true}
+	wantUnres := map[int32]bool{5: true}
+
 	set, err := NewRegexpSet(pats)
 	if err != nil {
 		t.Fatal(err)
 	}
-	anch := make([]*regexp.Regexp, len(pats))
 	std := make([]*regexp.Regexp, len(pats))
+	anch := make([]*regexp.Regexp, len(pats))
 	for i, p := range pats {
-		anch[i] = regexp.MustCompile(`\A(?:` + p + `)\z`)
 		std[i] = regexp.MustCompile(p)
+		anch[i] = regexp.MustCompile(`\A(?:` + p + `)\z`)
 	}
-	alphabet := []string{"a", "b", "c", "d", "e", "f", "q", "w", "x", "z",
+	ms, err := set.NewMatchScanner()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ms.Close()
+
+	alphabet := []string{"a", "b", "c", "d", "e", "f", "q", "w", "x", "y", "z",
 		"0", "1", "9", "A", "B", "F", "Z", " ", "-", "张", "三", "李"}
 	rng := rand.New(rand.NewSource(20260824))
-	for round := 0; round < 40; round++ {
+	nStrict, nLoose := 0, 0
+	for round := 0; round < 400; round++ {
 		var sb strings.Builder
-		for i := 0; i < 400; i++ {
+		n := 40 + rng.Intn(400)
+		for i := 0; i < n; i++ {
 			sb.WriteString(alphabet[rng.Intn(len(alphabet))])
 		}
 		text := sb.String()
-		got := scanAll(t, set, text)
-		for id, f := range got {
+		if err := ms.Scan(text); err != nil {
+			t.Fatal(err)
+		}
+		for id := range pats {
+			f, ok, err := ms.AppendMatches(nil, int32(id))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if wantUnres[int32(id)] {
+				if ok && len(f) > 0 {
+					t.Fatalf("轮 %d: #%d %q 口径不安全, 必须 ok=false 交回老路, 却给了 %v",
+						round, id, pats[id], f)
+				}
+				continue
+			}
+			if !ok {
+				t.Fatalf("轮 %d: #%d %q 意外补不出左端", round, id, pats[id])
+			}
+			// ① 每一段都是真匹配 · ② 互不相交且升序
 			prev := int32(-1)
 			for k := 0; k+1 < len(f); k += 2 {
 				if !anch[id].MatchString(text[f[k]:f[k+1]]) {
@@ -163,28 +200,45 @@ func TestMatchScanVsFindAllRandom(t *testing.T) {
 						round, id, f[k], f[k+1], text[f[k]:f[k+1]], pats[id])
 				}
 				if f[k] < prev {
-					t.Fatalf("轮 %d: #%d 区间自相重叠或乱序 %v", round, id, f)
+					t.Fatalf("轮 %d: #%d 自相重叠或乱序 %v", round, id, f)
 				}
 				prev = f[k+1]
 			}
-		}
-		for id := range pats {
-			f := got[int32(id)]
-			for _, loc := range std[id].FindAllStringIndex(text, -1) {
-				hit := false
-				for k := 0; k+1 < len(f); k += 2 {
-					if int(f[k]) < loc[1] && loc[0] < int(f[k+1]) {
-						hit = true
-						break
+			old := std[id].FindAllStringIndex(text, -1)
+			if unbounded[int32(id)] {
+				// 没上限那一档: 只要 FindAll 的每一处都被覆盖到 (不丢召回)。
+				for _, loc := range old {
+					hit := false
+					for k := 0; k+1 < len(f); k += 2 {
+						if int(f[k]) < loc[1] && loc[0] < int(f[k+1]) {
+							hit = true
+							break
+						}
+					}
+					if !hit {
+						t.Fatalf("轮 %d: #%d FindAll 的 [%d,%d)=%q 没被覆盖到; 给的是 %v",
+							round, id, loc[0], loc[1], text[loc[0]:loc[1]], f)
 					}
 				}
-				if !hit {
-					t.Fatalf("轮 %d: #%d FindAll 的 [%d,%d)=%q 没被覆盖到; 新腿给的是 %v",
-						round, id, loc[0], loc[1], text[loc[0]:loc[1]], f)
+				nLoose += len(old)
+				continue
+			}
+			// 有上限那一档: 逐字节相同。
+			if len(f) != 2*len(old) {
+				t.Fatalf("轮 %d: #%d %q 处数不同: 新 %d 处 %v · FindAll %d 处 %v\n正文 %q",
+					round, id, pats[id], len(f)/2, f, len(old), old, text)
+			}
+			for k := range old {
+				if int(f[2*k]) != old[k][0] || int(f[2*k+1]) != old[k][1] {
+					t.Fatalf("轮 %d: #%d %q 第 %d 处不同: 新 [%d,%d)=%q · FindAll [%d,%d)=%q\n正文 %q",
+						round, id, pats[id], k, f[2*k], f[2*k+1], text[f[2*k]:f[2*k+1]],
+						old[k][0], old[k][1], text[old[k][0]:old[k][1]], text)
 				}
 			}
+			nStrict += len(old)
 		}
 	}
+	t.Logf("400 轮: 逐字节对齐 %d 处 · 覆盖口径 %d 处", nStrict, nLoose)
 }
 
 // TestMatchScanEmptyCapableFallback —— 能匹配空串的 pattern 必须落进"补不出左端"那一档,

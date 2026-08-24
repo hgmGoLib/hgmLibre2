@@ -46,7 +46,11 @@ func (s *RegexpSet) PatternLenRange(i int) (min, max int) {
 }
 
 // patLen_t 是存在 set 上的那份表。int32 够用 —— 长度上限超过 2GiB 的 pattern 早就是"没上限"。
-type patLen_t struct{ min, max int32 }
+// safe 见 PatternLeftmostLongestSafe。
+type patLen_t struct {
+	min, max int32
+	safe     bool
+}
 
 func buildPatLens(patterns []string) []patLen_t {
 	out := make([]patLen_t, len(patterns))
@@ -55,9 +59,67 @@ func buildPatLens(patterns []string) []patLen_t {
 		if hi > maxCInt || hi < 0 {
 			hi = PatLenUnbounded
 		}
-		out[i] = patLen_t{min: int32(lo), max: int32(hi)}
+		out[i] = patLen_t{min: int32(lo), max: int32(hi), safe: PatternLeftmostLongestSafe(p)}
 	}
 	return out
+}
+
+// PatternLeftmostLongestSafe 报这条 pattern 上"取最长匹配"和 FindAll 的 leftmost-first
+// 口径【是不是同一个答案】。
+//
+// 为什么要问: MatchScanner 补右端用的是 ResolveSpan, 它按设计返回【最长】的那个匹配
+// (定长格式的下游要的就是完整那一段)。而 FindAll 走的是 Perl 的 leftmost-first ——
+// 同一个起点上有好几个长度都成立时, 它给的是【回溯先撞上】的那个, 不一定最长。
+// 两者分道扬镳只有两个口子:
+//
+//	惰性量词 (*? +? ?? {n,m}?)  : 语义就是"能短就短", 与最长正相反。
+//	                             `a.*?b` 撞 "a__b__b": FindAll 给 [0,4), 最长给 [0,7)。
+//	长度不齐的交替 (foo|foobar) : Perl 试第一个能成的分支就收工, 不比长短。
+//	                             `foo|foobar` 撞 "foobar": FindAll 给 [0,3), 最长给 [0,6)。
+//
+// 这两个口子上"最长"给出来的段是【真匹配】但【比 FindAll 长】—— 对于拿这一段去过校验位的
+// 下游 (身份证 / IBAN mod-97 / NRIC 校验位), 长出来一截就是校验失败 = 无声漏报。所以
+// MatchScanner 默认把这种 pattern 直接判成"补不出来", 让调用方照老路 FindAll。
+//
+// 反过来: 全贪心、且交替各分支等长的 pattern 上, 贪心量词本来就取最长, 两个口径逐字节相同。
+// 解析不了 (Go 的 syntax 不认的写法) 一律当【不安全】—— 保守方向只会多走老路。
+func PatternLeftmostLongestSafe(pattern string) bool {
+	re, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return false
+	}
+	return llSafe(re)
+}
+
+// LeftmostLongestSafe 报集合里第 i 条安不安全 (建集期算好, 这里查表)。
+func (s *RegexpSet) LeftmostLongestSafe(i int) bool {
+	return i >= 0 && i < len(s.lens) && s.lens[i].safe
+}
+
+func llSafe(re *syntax.Regexp) bool {
+	if re.Flags&syntax.NonGreedy != 0 {
+		return false // 惰性量词: 语义是"能短就短", 与最长正相反
+	}
+	if re.Op == syntax.OpAlternate {
+		lo0 := -1
+		for _, sub := range re.Sub {
+			lo, hi := lenRangeOf(sub)
+			if lo != hi || hi < 0 {
+				return false // 分支自己就是变长的 ⟹ "先撞上的"未必是最长的
+			}
+			if lo0 < 0 {
+				lo0 = lo
+			} else if lo != lo0 {
+				return false // 分支之间不等长
+			}
+		}
+	}
+	for _, sub := range re.Sub {
+		if !llSafe(sub) {
+			return false
+		}
+	}
+	return true
 }
 
 // lenRangeOf 递归。max < 0 一路向上传染 = 没上限。

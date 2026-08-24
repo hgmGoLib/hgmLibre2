@@ -50,15 +50,47 @@
 // 🔴 ② 的窗口掐在 cur 上是【正确性】不是省钱: 不掐的话上例 Hi=18 会回推到 6, 与刚吐出去的
 //    [0,12) 相交而被丢掉, "王五"就无声无息漏了。掐上之后回推到 12, 吐 [12,18)。
 //
+// 🔴 这套推进【只有在起点随右端单调不减时】才等于 FindAll。反例: abc|b 撞 "abc" 的右端是
+//    2 和 3 —— 右端 2 回推到起点 1 ("b"), 当场吐 [1,2) 把 cur 推到 2, 右端 3 那个真正的
+//    [0,3)="abc" 就因为起点 0 < cur 被永远跳过, 【无声漏掉】。造出这种非单调的只有交替:
+//    一条更短的分支在另一条更长分支的【内部】结束。所以 PatternLeftmostLongestSafe 把
+//    "分支不等长的交替"整个挡在门外 (它同时也挡住了下面那个取最长的口子), 挡不住的都
+//    走老路。TestMatchScanStrictVsFindAll 用随机语料把"逐字节等于 FindAll"钉住。
+//
 // 🔴 【只在同一条 pattern 内部去重, 跨 pattern 一概不合并】。两条 pattern 在同一片正文上各自
 //    命中不是重复, 是两个问题各要一个答案 (带空格的和不带空格的两条 pattern, 下游正是靠
 //    "这一段里有没有空格"分流的; 合了就是漏检)。
 //
-// ── 它不是 FindAllStringIndex ────────────────────────────────────────────────
-// 保证的只有三条: ① 吐出去的 text[Lo:Hi] 一定是这条 pattern 的一个【真匹配】;
-// ② 正文里有匹配的地方一定会吐出至少一处覆盖它 (不丢召回); ③ 同一条 pattern 吐出去的区间
-// 互不相交、按 Lo 升序。至于"和 FindAll 挑的是不是同一处", 交替式 pattern (ab|abcd) 上会
-// 不一样 —— FindAll 是 leftmost-first, 这里恒取最长。要逐字节等价的调用方别用这个。
+// ── 和 FindAllStringIndex 的关系: 分两档, 只有一档敢说"一样" ─────────────────
+//
+//	定长档 (min == max)      与 FindAllStringIndex 【逐字节相同】, 而且是可以论证的:
+//	                         右端 e 的起点只能是 e-min (唯一), 所以"起点随右端单调"必然成立;
+//	                         长度也唯一, 不存在"取最长还是取贪心先撞上的"之分。剩下的就是
+//	                         "从左往右贪心取不相交", 那正是 FindAll 的规则。
+//	                         回归钉在 TestMatchScanStrictVsFindAll + 6 万条随机定长 pattern 对拍。
+//
+//	变长档 (min < max)       【不保证】和 FindAll 挑的是同一处, 只保证 ① text[Lo:Hi] 是真匹配
+//	                         ② 同一条的区间互不相交、按 Lo 升序 ③ 不丢召回。两个口子:
+//
+//	  取最长 ≠ 贪心先撞上   贪心量词是【按优先序回溯】不是【全局最长】。x{1,3}[a-c]?(?:ab|cd)?
+//	                        撞 "xab": FindAll 让 [a-c]? 先吃掉 'a' 给 [0,2)="xa", 而最长是
+//	                        [0,3)="xab" (让 [a-c]? 空手, 交给 (?:ab|cd)?)。两个都是真匹配。
+//	  起点未必随右端单调     (?:ab)?[bc]{1,2} 撞 "axbabbyxx": 右端 5 回推到起点 4 吐 [4,6)="bb",
+//	                        而 FindAll 从 3 起手给 [3,6)="abb" —— 更靠右的右端配了更靠左的起点,
+//	                        游标已经推过去了就回不来。
+//
+// 🔴 这两个口子上给出来的段【是真匹配但比 FindAll 那一处长/短/偏】。对于拿这一段去过校验位的
+//    下游 (身份证 · IBAN mod-97 · Luhn), 边界差一个字节就是校验失败 = 无声漏报 —— 比"没检测到"
+//    更难查。所以要"和老路逐字节一致"的调用方 (检测器/checker 就是这种) 必须开 SetExactOnly,
+//    把变长档整个交回老路。
+//
+// PatternLeftmostLongestSafe (patlen.go) 只挡掉最凶的那一类 (惰性量词 · 不等长交替 ——
+// 后者会让短分支结在长分支【内部】, 整个长匹配被游标吞掉), 它是【必要不充分】条件:
+// 挡住之后变长档仍然不等于 FindAll, 见上面两个反例。
+//
+// ok=false 的那几条 (没在 SetWanted 里 / 开了 SetExactOnly 的变长条 / 能匹配空串 /
+// 口径不安全 / 反向编不出来 / 游程乱序 / DFA 预算不够) 请调用方照老路对它跑 FindAll ——
+// 库这边宁可退回去也不给一个"像是对的"答案。
 //
 // 生命周期同 SpanScanner: 可复用工作区, 热路径上建一次留着, 【不是并发安全的】。
 // Scan 之后 text 一直被 scanner 引用着 (AppendMatches 要用), 直到下一次 Scan 或 Reset。
@@ -79,17 +111,21 @@ type MatchScanner struct {
 	sc   *SpanScanner
 	text string
 	per  []msPat_t
-	want []bool  // nil = 全要
+	want []bool // nil = 全要
+	// exactOnly: 只交【与 FindAll 逐字节相同】的那一档 (定长), 变长条一律 ok=false。
+	// 检测器那种"拿这一段过校验位"的调用方必须开, 见文件头。
+	exactOnly bool
 	hit  []bool
 	hits []int32 // 上一遍命中过的下标 (= Set.Match 那张表), 去重且只含真命中
 	err  error   // 回调里出的错 (回调没法返 error)
 }
 
 // msPat_t 是每条 pattern 的推进状态。cur 就是那把游标, out 是已经收口的输出。
+
 type msPat_t struct {
 	inited bool
 	fixed  bool
-	bad    bool // 补不出左端 (能匹配空串 / 反向编不出来 / 游程乱序) → 调用方走老路
+	bad    bool // 补不出左端 (能匹配空串 / 反向编不出来 / 游程乱序 / 口径不安全) → 调用方走老路
 	minL   int32
 	rev    *RegexpSet
 	cur    int32 // 已吐出去的最右字节
@@ -119,6 +155,17 @@ func (s *RegexpSet) NewMatchScanner() (*MatchScanner, error) {
 // 位置, 哪几个只是外层短路的 bool, 建集的时候就知道。
 func (m *MatchScanner) SetWanted(mask []bool) { m.want = mask }
 
+// SetExactOnly 打开"只要逐字节等于 FindAllStringIndex 的那一档"。开了之后变长 pattern 一律
+// 返回 ok=false 交回老路, 只有定长档 (min==max) 走这条快路。
+//
+// 什么时候必须开: 消费点拿区间去【切一段出来再判】(校验位 · 去空格后重新匹配 · 判断段里
+// 有没有空格 · 把 Start/End 写进告警给人看)。这些地方边界差一个字节就是另一个答案。
+// 什么时候不用开: 只拿区间做"这附近有没有东西"的粗定位 (上下文窗口 · 邻域共现)。
+//
+// 代价是真的: 真表 6.4MB 上全开是 13.9×, 只留定长档是 1.19× —— 收益的大头在变长档,
+// 而变长档正是给不出逐字节保证的那一档。别只看倍数就选。
+func (m *MatchScanner) SetExactOnly(v bool) { m.exactOnly = v }
+
 func (m *MatchScanner) wants(i int) bool {
 	if m.want == nil {
 		return true
@@ -144,7 +191,7 @@ func (m *MatchScanner) Scan(text string) error {
 	for _, id := range m.hits {
 		p := &m.per[id]
 		p.inited, p.fixed, p.bad = false, false, false
-		p.cur, p.lastLo = 0, -1
+		p.cur, p.lastLo = 0, 0
 		p.out = p.out[:0]
 		m.hit[id] = false
 	}
@@ -192,6 +239,17 @@ func (m *MatchScanner) feed(i int, lo, hi int32) {
 		p.minL = int32(minL)
 		p.fixed = minL == maxL && maxL >= 0
 		if !p.fixed {
+			if m.exactOnly {
+				p.bad = true // 只要逐字节那一档 —— 变长条交回老路
+				return
+			}
+			// 变长: 右端要靠 ResolveSpan 取【最长】。只有"最长 == FindAll 那一处"的
+			// pattern 才敢这么给 —— 惰性量词 / 不等长交替上最长会比 FindAll 长一截,
+			// 下游拿这一段过校验位就是无声漏报 (patlen.go PatternLeftmostLongestSafe)。
+			if !m.set.LeftmostLongestSafe(i) {
+				p.bad = true
+				return
+			}
 			if p.rev = m.set.reverseOne(i); p.rev == nil {
 				p.bad = true
 				return
@@ -208,37 +266,38 @@ func (m *MatchScanner) feed(i int, lo, hi int32) {
 		if e <= p.cur {
 			continue // 落在已吐出去那一处里面
 		}
-		var start int32
 		if p.fixed {
-			start = e - p.minL
+			// 定长: 起点唯一 (e-minL), 一句减法, 不进正则引擎。
+			start := e - p.minL
 			if start < p.cur {
 				continue // 与已吐出去那一处相交
 			}
-		} else {
-			// 🔴 bound = cur: 回看【绝不越过游标】。是正确性不是省钱, 见文件头 ②。
-			// 顺带它把回看代价钉成"离游标多远", 与正文长度无关。
-			pos, ok, err := p.rev.ResolveSpanWithin(m.text, e, p.cur, 0)
-			if err != nil {
-				m.err = err
-				return
-			}
-			if !ok {
-				continue
-			}
-			start = pos
+			p.out = append(p.out, start, e)
+			p.cur = e
+			continue
+		}
+		// 🔴 bound = cur: 回看【绝不越过游标】。是正确性不是省钱, 见文件头 ②。
+		// 顺带它把回看代价钉成"离游标多远", 与正文长度无关。
+		start, ok, err := p.rev.ResolveSpanWithin(m.text, e, p.cur, 0)
+		if err != nil {
+			// DFA 放弃 (预算不够) —— 不是"没有匹配", 也不该把整遍扫描带崩。
+			// 这一条当场作废, AppendMatches 返回 ok=false, 调用方照老路 FindAll。
+			p.bad = true
+			return
+		}
+		if !ok {
+			continue
 		}
 		// 从这个起点取【最长】右端 —— 变长 pattern 在同一起点上有一串长度都成立,
 		// 取最短就是把命中截断, 下游拿去做定长校验会把真命中判成假。
 		end := e
-		if !p.fixed {
-			pos, ok, err := m.set.ResolveSpan(m.text, start, int32(i))
-			if err != nil {
-				m.err = err
-				return
-			}
-			if ok && pos > end {
-				end = pos
-			}
+		pos, ok, err := m.set.ResolveSpan(m.text, start, int32(i))
+		if err != nil {
+			p.bad = true
+			return
+		}
+		if ok && pos > end {
+			end = pos
 		}
 		p.out = append(p.out, start, end)
 		p.cur = end
