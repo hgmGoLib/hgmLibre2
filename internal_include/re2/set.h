@@ -5,6 +5,8 @@
 #ifndef RE2_SET_H_
 #define RE2_SET_H_
 
+#include <stdint.h>
+
 #include <memory>
 #include <string>
 #include <utility>
@@ -91,6 +93,14 @@ class RE2::Set {
   // 语义 (吐什么 / 为什么是游程 / 为什么是轮询) 全在 re2/span_scan.h, 用完 DFASpanScanFree。
   // 没编译 / OOM 返回 NULL。工作区可以反复用于多次扫描, 但不是并发安全的。
   DFASpanScan* NewSpanScan() const;
+
+  // ── hgmLibre2 追加 (非上游 re2) ──
+  // 给定 NewSpanScan 吐出来的一个端点, 求同一条 pattern 在这个端点上的【另一端】(最长的那个)。
+  // 语义 / 为什么这一步只能在库里做, 见 re2/span_scan.h 末尾那段。
+  // 无状态、只读, 可以与扫描并发调 (自己拿 DFA 的缓存读锁)。
+  // 返回 1 = 找到并写 *out, 0 = 这条 pattern 在这个端点上根本不匹配, -1 = 参数错 / DFA 放弃。
+  int ResolveSpan(const char* text, int textlen, int from, int bound,
+                  int id, int32_t* out) const;
 
   // 查这个 Set 的 DFA 缓存水位 + 生涯累计 (没扫过则 out->built=false)。
   // 只读, 短暂拿 DFA 的读锁, 可以和扫描并发调。

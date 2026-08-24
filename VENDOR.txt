@@ -14,10 +14,11 @@ internal_include/util/ : util/*.h (logging/mutex/strutil/utf/util/flags/mix/mall
 cre2.h / cre2.cpp      : 我们自己写的极小 C 包装 (不算改 RE2)
 cre2_internal.h        : cre2 各 .cpp 之间共用的句柄定义 (struct cre2_set), 不对外
 cre2_dfastats.cpp      : 进程级 DFA 计数的 hook 安装 (挂 re2::hooks)
-cre2_spanscan.cpp      : 流式游程扫描的 C 门面 (sqlite3_step 式轮询)
+cre2_spanscan.cpp      : "命中在哪"的 C 门面 —— 流式游程扫描 (sqlite3_step 式轮询)
+                         + 锚定解析 (cre2_set_resolve_span)
 internal_include/re2/dfa_stats.h : 本库追加的观测结构体 (ScanStats / MemInfo / AttribInfo)
-internal_include/re2/span_scan.h : 流式游程扫描的对内声明 + 全部语义说明
-re2_dfa_spanscan.inc   : 流式游程扫描的实现。【不是独立编译单元】—— 由 re2_dfa.cc 末尾
+internal_include/re2/span_scan.h : 流式游程扫描 + 锚定解析的对内声明 + 全部语义说明
+re2_dfa_spanscan.inc   : 流式游程扫描与锚定解析的实现。【不是独立编译单元】—— 由 re2_dfa.cc 末尾
                          #include 进去, 因为 class DFA 整个定义就在 re2_dfa.cc 里,
                          别的编译单元看不见 State / RWLocker / StateSaver / RunStateOnByteUnlocked。
                          cgo 不编 .inc, 所以扩展名必须留着 (改成 .cc 会被当成第二份实现编两遍)。
@@ -29,22 +30,36 @@ re2_dfa.cc             : ①转移表槽位 8 字节 State* → 4 字节 arena �
                            arena 按需翻倍 (默认开; -DRE2_DFA_NEXT_BITS=64 -DRE2_DFA_ARENA=0 回到原版)
                          ②per-Set / per-scan 计数 (flush 次数 / 新建状态数 / 额度水位)
                          ③编译期开关后面的排障采集 (RE2_DFA_ATTRIB / TRACE / HOTSTATS, 默认全关)
-                         ④流式游程扫描: class DFA 里加一行 friend class DFASpanScan, 文件末尾
-                           #include "re2_dfa_spanscan.inc"。除这两处外【一个字没动】——
-                           热循环是另写的一份, 不往 InlinedSearchLoop 里塞分支 (它是全库最热的)。
+                         ④流式游程扫描 + 锚定解析: class DFA 里加两行 friend (DFASpanScan /
+                           SpanDFA), 文件末尾 #include "re2_dfa_spanscan.inc"。除这两处外
+                           【一个字没动】—— 热循环是另写的一份, 不往 InlinedSearchLoop 里塞
+                           分支 (它是全库最热的)。
 internal_include/re2/prog.h : 追加 SearchDFA 的可选出参 + GetDFAMemInfo / GetDFAAttribInfo 声明
                          + Prog::CompileSet 追加 reversed 参数 (默认 false, 上游调用点不受影响)
-                         + Prog::NewSpanScan (流式游程扫描, 见 re2/span_scan.h)
+                         + Prog::NewSpanScan / Prog::SpanResolve (见 re2/span_scan.h)
 internal_include/re2/set.h  : 追加 Match 的可选出参 + MemInfo / AttribInfo 声明
                          + RE2::Set 三参构造 (reversed) 与 reversed() 访问器
-                         + RE2::Set::NewSpanScan (流式游程扫描)
+                         + RE2::Set::NewSpanScan / RE2::Set::ResolveSpan
 re2_set.cc             : 上面那两个声明的实现 (转发给 Prog); 反向模式下 Add() 把 HaveMatch
                          节点【前置】而不是后置 (反序编译会把 concat 翻过来, 后置的 Match
-                         会跑到 pattern 前面 → 一进门就命中)
+                         会跑到 pattern 前面 → 一进门就命中);
+                         Match() 里 SearchDFA 改传 kUnanchored (上游是 kAnchored) —— 配套
+                         CompileSet 的入口摆法, 见下面 re2_compile.cc 那条, 走的还是同一个
+                         带 .*? 前缀的入口, 命中集逐位不变
 re2_compile.cc         : Compiler::CompileSet / Prog::CompileSet 追加 reversed —— 走完 pattern 树
                          就把 reversed_ 关掉再拼 DotStar 前缀 (与上游 Compiler::Compile 同一手法),
                          并在 Finish 前 set_reversed。反向 set 只支持 UNANCHORED, 其余 anchor 返回 NULL。
                          用途见 README.md 的 "Scanning backwards"。
+                         🔴 另一处 (锚定解析要的): CompileSet 的两个入口改成与 Compiler::Compile
+                         一模一样的摆法。上游是 set_anchor_start(true) + start_ 和 start_unanchored_
+                         【都】指向带 .*? 前缀的那个入口, 靠 SearchDFA 里 anchor_start() 那一条把
+                         搜索强制成锚定 —— 效果等同"非锚定搜索+前缀", 但那个【不带前缀的入口】
+                         从外面就永远够不着了。现在: start_ = 不带前缀的真锚定入口,
+                         start_unanchored_ = 带前缀的, anchor_start_ = (anchor != UNANCHORED)。
+                         配套 RE2::Set::Match 改传 kUnanchored。两个入口都是 Prog::Flatten 本来
+                         就当 root 认得并 remap 的 (MarkSuccessors 里那两行), 所以 Flatten
+                         一个字没动 —— 反过来说, 再想加【第三个】入口就必须同时改 Flatten,
+                         否则那个 pc 是 Flatten 之前的旧编号, DFA 一进去就 "unhandled opcode"。
 cre2.cpp 直接用了 re2 的内部件 (Regexp::Parse / CompileToReverseProg / Prog::SearchDFA) 做
 单条 pattern 的反向匹配 —— 不是改上游, 但升级 RE2 时这三个内部 API 的签名要一起看。
 不能走 RE2 对象自己的 rprog_: 那是从【剥掉必需前缀之后】的 suffix_regexp_ 编的, 只在

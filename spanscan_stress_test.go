@@ -187,3 +187,88 @@ func TestSpanScan_ConcurrentScanners(t *testing.T) {
 	}
 	t.Logf("共享 set flush 了 %d 次", shared.MemInfo().FlushesTotal)
 }
+
+// TestSpanResolve_FlushDuringResolve: 锚定解析撞上缓存整表清空。
+//
+// 解析和扫描共用【同一个 Prog 的同一份 DFA 缓存】, 所以解析用的那几个起点状态随时会被
+// 扫描那边的 flush 冲掉 —— 冲掉之后必须能按内容重建, 而不是拿着失效指针接着走。
+// 这条路走错同样【不崩, 只给错答案】(边界短几个字节), 所以判据是"紧预算下的答案与
+// 预算充足时逐字相同"。中间故意穿插整篇扫描, 就是为了把 flush 塞进解析之间。
+func TestSpanResolve_FlushDuringResolve(t *testing.T) {
+	text := stressText(256 << 10)
+
+	// 先用一个预算充足的反向 set 扫出真实的匹配左端, 当作解析的输入。
+	rev, err := NewRegexpSetReverseMaxMem(stressPatterns, 64<<20)
+	if err != nil {
+		t.Fatalf("建反向 set: %v", err)
+	}
+	revSc, err := rev.NewSpanScanner(1 << 16)
+	if err != nil {
+		t.Fatalf("反向 scanner: %v", err)
+	}
+	defer revSc.Close()
+	spans, err := revSc.AppendSpans(nil, text)
+	if err != nil {
+		t.Fatalf("反向扫: %v", err)
+	}
+	type pt struct{ id, at int32 }
+	var pts []pt
+	for _, sp := range spans {
+		for p := sp.Lo; p <= sp.Hi; p += 7 { // 隔几个取一个, 够多就行
+			pts = append(pts, pt{id: sp.Index, at: p})
+			if len(pts) >= 4000 {
+				break
+			}
+		}
+		if len(pts) >= 4000 {
+			break
+		}
+	}
+	if len(pts) < 100 {
+		t.Fatalf("只取到 %d 个左端, 压不出什么来", len(pts))
+	}
+
+	ref, err := NewRegexpSetMaxMem(stressPatterns, 64<<20)
+	if err != nil {
+		t.Fatalf("建参照 set: %v", err)
+	}
+	tight, err := NewRegexpSetMaxMem(stressPatterns, 1<<20)
+	if err != nil {
+		t.Fatalf("建紧预算 set: %v", err)
+	}
+	churn, err := tight.NewSpanScanner(1)
+	if err != nil {
+		t.Fatalf("紧 scanner: %v", err)
+	}
+	defer churn.Close()
+
+	for i, p := range pts {
+		// 每隔一段就整篇扫一遍, 把紧预算那份缓存搅乱 (顺带把起点状态冲掉)。
+		if i%1000 == 0 {
+			if _, err := churn.AppendSpans(nil, text); err != nil {
+				t.Fatalf("搅缓存: %v", err)
+			}
+		}
+		wantEnd, wantOK, err := ref.ResolveSpan(text, p.at, p.id)
+		if err != nil {
+			t.Fatalf("参照解析 (id=%d at=%d): %v", p.id, p.at, err)
+		}
+		if !wantOK {
+			t.Fatalf("反向 set 说规则 #%d 的匹配从 %d 开始, 正向解析却说那儿不匹配", p.id, p.at)
+		}
+		gotEnd, gotOK, err := tight.ResolveSpan(text, p.at, p.id)
+		if err != nil {
+			t.Fatalf("紧预算解析 (id=%d at=%d): %v", p.id, p.at, err)
+		}
+		if !gotOK || gotEnd != wantEnd {
+			t.Fatalf("紧预算解析对不上 (id=%d at=%d): got=%d,%v want=%d,%v",
+				p.id, p.at, gotEnd, gotOK, wantEnd, wantOK)
+		}
+	}
+
+	if f := tight.MemInfo().FlushesTotal; f == 0 {
+		t.Fatalf("紧预算 set 一次都没 flush, 没压到解析撞 flush 那条路")
+	} else {
+		t.Logf("紧预算 set flush 了 %d 次", f)
+	}
+}

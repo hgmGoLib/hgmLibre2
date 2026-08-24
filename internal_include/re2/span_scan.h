@@ -62,6 +62,27 @@ bool DFASpanScanBegin(DFASpanScan* ss, int textlen);
 int DFASpanScanStep(DFASpanScan* ss, const char* text, int textlen,
                     int32_t* out, int outcap, int* more);
 
+// ── 另一半: 锚定解析 (Prog::SpanResolve / RE2::Set::ResolveSpan) ─────────────
+//
+// SpanScan 吐的是【一端】: 正向 set 吐右端, 反向 set 吐左端。调用方要知道命中到底覆盖了
+// 哪一段, 就得再跑一次正则求另一端 —— 而这一次【必须是锚定的】: 非锚定的 .*? 前缀让每个
+// 位置都能当起点, 状态数对计数上界指数增长 (doc/状态数为什么会相乘.txt 里同一条 pattern
+// 加个 \b 就是 967 倍), 等于把刚省下来的又赔回去。
+//
+// 🔴 这一步【调用方自己补不出来】(补出来的也是另一样东西): set 程序里那截 .*? 前缀是编进
+//    程序的, 从外面进不去"不带前缀的入口" (Prog::start_setanchored 就是为这个留的)。
+//    调用方能做的只有另编一条 \A(?:pat) —— 每条 pattern 一个 RE2 对象、一份独立 DFA 缓存,
+//    还得手工保证它与 set 里那条语义一致。SpanResolve 用的是 set 自己那份程序和那份缓存。
+//
+// 语义 (方向跟着 set 的编译方向, 与 SpanScan 同一个口径):
+//   正向 set: from = 匹配左端 (含), 返回右端 (不含) —— text[from, *out) 是该 pattern 的匹配;
+//   反向 set: from = 匹配右端 (不含), 返回左端 (含) —— text[*out, from) 是该 pattern 的匹配。
+//
+// 🔴 返回的是【最长】的那个匹配的另一端, 不是碰到的第一个。"碰到第一个 match 状态就收工"
+//    给的是最短匹配, 对变长 pattern 等于把命中截断 —— 不是任何调用方要的东西。
+//    走到死状态的成本 = 这条命中实际能延伸到多远, 与正文长度无关; 真能无限延伸的 pattern
+//    ((?s).*KEY 那种) 用 bound 掐住。
+
 }  // namespace re2
 
 #endif  // RE2_SPAN_SCAN_H_

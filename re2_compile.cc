@@ -1237,16 +1237,26 @@ Prog* Compiler::CompileSet(Regexp* re, RE2::Anchor anchor, int64_t max_mem,
   // Cat (DotStar 前缀) 按【程序执行顺序】拼, 而不是再被反序一次。
   c.reversed_ = false;
 
-  c.prog_->set_anchor_start(true);
+  // ── hgmLibre2 改动 (上游是 set_anchor_start(true) + 两个入口都指向 DotStar 那个) ──
+  // 上游把 set 程序写成"anchor_start_=true, start_ 和 start_unanchored_ 是同一个入口
+  // (都在 .*? 前缀前面)", 靠 SearchDFA 里 anchor_start() 那一条把搜索强制成锚定的,
+  // 效果与"非锚定搜索 + 前缀"完全一样。代价是: 那个【不带前缀的入口】从外面再也够不着。
+  //
+  // 这里改成与 Compiler::Compile 一模一样的摆法 —— start_ = 不带前缀的入口 (真锚定),
+  // start_unanchored_ = 带 .*? 前缀的入口, anchor_start_ 照实写成 false。于是:
+  //   · RE2::Set::Match 改传 kUnanchored, 走 start_unanchored_ —— 与改之前逐位相同;
+  //   · Prog::SpanResolve 传 kAnchored 就能进真锚定入口 (见 re2/span_scan.h)。
+  // 两个入口都是 Flatten 认得的 root (它专门 remap 这两个), 不必再动 Flatten。
+  c.prog_->set_anchor_start(anchor != RE2::UNANCHORED);
   c.prog_->set_anchor_end(true);
   c.prog_->set_reversed(reversed);
 
+  c.prog_->set_start(all.begin);
   if (anchor == RE2::UNANCHORED) {
     // Prepend .* or else the expression will effectively be anchored.
     // Complemented by the ANCHOR_BOTH case in PostVisit().
     all = c.Cat(c.DotStar(), all);
   }
-  c.prog_->set_start(all.begin);
   c.prog_->set_start_unanchored(all.begin);
 
   Prog* prog = c.Finish(re);
@@ -1257,7 +1267,7 @@ Prog* Compiler::CompileSet(Regexp* re, RE2::Anchor anchor, int64_t max_mem,
   // since we're not going to fall back to the NFA.
   bool dfa_failed = false;
   StringPiece sp = "hello, world";
-  prog->SearchDFA(sp, sp, Prog::kAnchored, Prog::kManyMatch,
+  prog->SearchDFA(sp, sp, Prog::kUnanchored, Prog::kManyMatch,
                   NULL, &dfa_failed, NULL);
   if (dfa_failed) {
     delete prog;

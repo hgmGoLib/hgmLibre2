@@ -1,5 +1,8 @@
 // re2_dfa_spanscan.inc — ── hgmLibre2 追加 (非上游 re2) ──
-// RE2::Set 流式游程扫描的实现。语义/为什么这么设计见 re2/span_scan.h。
+// RE2::Set "命中在哪"的实现, 两件事:
+//   · DFASpanScan  : 流式游程扫描 —— 一遍扫正文, 吐每条 pattern 的命中【端点】;
+//   · SpanDFA::Resolve : 锚定解析 —— 给定一个端点, 求同一条 pattern 的【另一端】。
+// 两者的语义/为什么这么设计见 re2/span_scan.h。
 //
 // 这份文件被 re2_dfa.cc 在文件末尾 #include 进来 (不是独立编译单元): class DFA 整个定义
 // 就在 re2_dfa.cc 里, 外面看不见 State / RWLocker / StateSaver / RunStateOnByteUnlocked,
@@ -24,6 +27,61 @@ namespace re2 {
 // DFASpanScan 不是 DFA 的成员, 所以这里各留一份带限定名的。
 static inline DFA::State* SpanDeadState() { return reinterpret_cast<DFA::State*>(1); }
 static inline DFA::State* SpanSpecialMax() { return reinterpret_cast<DFA::State*>(2); }
+
+// SpanDFA 是"游程扫描"和"锚定解析"共用的那几行 DFA 私有细节 (DFA 里给它开了 friend)。
+// 只有两件事: 把状态推过一个字节, 和问一个 match 状态里有没有某条 pattern。
+struct SpanDFA {
+  // Advance 把 *sp 推过一个字节类 c (c 可以是 DFA::kByteEndText)。
+  // 状态没造过就现造; 造不出来是"arena 该扩了"或"缓存满了", 分别处理 —— 两条路都要用
+  // StateSaver 把状态按内容存下再按内容查回来 (搬家/清表之后裸 State* 就废了)。
+  // off/textlen 只给 RE2_DFA_ATTRIB 的归因用, 不影响结果。
+  static bool Advance(DFA* dfa, DFA::RWLocker* lock, DFA::State** sp, int c,
+                      int off, int textlen) {
+    DFA::State* s = *sp;
+    DFA::State* ns = dfa->NextOf(s, dfa->ByteMap(c));
+    if (ns != NULL) {
+      *sp = ns;
+      return true;
+    }
+#if RE2_DFA_ATTRIB
+    dfa->atr_off_ = static_cast<size_t>(off >= 0 ? off : -off);
+    dfa->atr_len_ = static_cast<size_t>(textlen);
+#endif
+    ns = dfa->RunStateOnByteUnlocked(s, c);
+    if (ns != NULL) {
+      *sp = ns;
+      return true;
+    }
+    {
+      DFA::StateSaver save_s(dfa, s);
+      dfa->ResetCache(lock, NULL);   // arena 该扩就只扩不清 (见 ResetCache 里的 GrowPending)
+      if ((s = save_s.Restore()) == NULL)
+        return false;
+    }
+    ns = dfa->RunStateOnByteUnlocked(s, c);
+    if (ns == NULL)
+      return false;
+    *sp = ns;
+    return true;
+  }
+
+  // HasId 问: 这个 match 状态里有没有第 id 条 pattern。
+  // inst_ 的布局是 [inst ids...] MatchSep [match ids...], 从尾巴往回走到 MatchSep 为止
+  // (与 InlinedSearchLoop 里那段逐字一致)。
+  static bool HasId(DFA::State* s, int id) {
+    for (int i = s->ninst_ - 1; i >= 0; i--) {
+      int t = s->inst_[i];
+      if (t == MatchSep)
+        break;
+      if (t == id)
+        return true;
+    }
+    return false;
+  }
+
+  static int Resolve(DFA* dfa, bool run_forward, const char* text, int textlen,
+                     int from, int bound, int id, int32_t* out);
+};
 
 class DFASpanScan {
  public:
@@ -118,9 +176,7 @@ class DFASpanScan {
     runhi_[id] = pos;
   }
 
-  // NoteState 把一个 match 状态里的所有 pattern id 都记一遍。
-  // inst_ 的布局是 [inst ids...] MatchSep [match ids...], 从尾巴往回走到 MatchSep 为止
-  // (与 InlinedSearchLoop 里那段逐字一致)。
+  // NoteState 把一个 match 状态里的所有 pattern id 都记一遍 (布局见 SpanDFA::HasId)。
   template <bool run_forward>
   inline void NoteState(DFA::State* s, int32_t pos) {
     for (int i = s->ninst_ - 1; i >= 0; i--) {
@@ -166,13 +222,13 @@ class DFASpanScan {
   DFASpanScan& operator=(const DFASpanScan&) = delete;
 };
 
-// Analyze 选起点。照 Prog::SearchDFA 对 kManyMatch 那条路走: anchored=true
-// (Set 的 prog 是 CompileSet 编的, 非锚定那截 .*? 已经编在程序里, 搜索本身是锚定的),
+// Analyze 选起点。照 Prog::SearchDFA 对 kManyMatch 那条路走: anchored=false
+// (走 start_unanchored_, 也就是带 .*? 前缀的那个入口 —— 与 RE2::Set::Match 同一个起点),
 // want_earliest_match=false, context == text。
 bool DFASpanScan::Analyze(const char* text, int textlen) {
   StringPiece t(text, static_cast<size_t>(textlen));
   DFA::SearchParams params(t, t, lock_);
-  params.anchored = true;
+  params.anchored = false;
   params.want_earliest_match = false;
   params.run_forward = run_forward_;
   if (!dfa_->AnalyzeSearch(&params) || params.failed)
@@ -187,35 +243,9 @@ bool DFASpanScan::Analyze(const char* text, int textlen) {
   return true;
 }
 
-// AdvanceState 把 s_ 推过一个字节类 c (c 可以是 kByteEndText)。
-// 状态没造过就现造; 造不出来是"arena 该扩了"或"缓存满了", 分别处理 —— 两条路都要用
-// StateSaver 把 s_ 按内容存下再按内容查回来 (搬家/清表之后裸 State* 就废了)。
+// AdvanceState 把 s_ 推过一个字节类 c (c 可以是 kByteEndText)。见 SpanDFA::Advance。
 bool DFASpanScan::AdvanceState(int c) {
-  DFA::State* ns = dfa_->NextOf(s_, dfa_->ByteMap(c));
-  if (ns != NULL) {
-    s_ = ns;
-    return true;
-  }
-#if RE2_DFA_ATTRIB
-  dfa_->atr_off_ = static_cast<size_t>(off_ >= 0 ? off_ : -off_);
-  dfa_->atr_len_ = static_cast<size_t>(textlen_);
-#endif
-  ns = dfa_->RunStateOnByteUnlocked(s_, c);
-  if (ns != NULL) {
-    s_ = ns;
-    return true;
-  }
-  {
-    DFA::StateSaver save_s(dfa_, s_);
-    dfa_->ResetCache(lock_, NULL);   // arena 该扩就只扩不清 (见 ResetCache 里的 GrowPending)
-    if ((s_ = save_s.Restore()) == NULL)
-      return false;
-  }
-  ns = dfa_->RunStateOnByteUnlocked(s_, c);
-  if (ns == NULL)
-    return false;
-  s_ = ns;
-  return true;
+  return SpanDFA::Advance(dfa_, lock_, &s_, c, off_, textlen_);
 }
 
 // Suspend 放掉状态指针 (按内容存起来), 让调用方可以在【不持任何锁】的情况下把这批取走。
@@ -408,6 +438,121 @@ DFASpanScan* Prog::NewSpanScan(int nid) {
   if (dfa == NULL || !dfa->ok())
     return NULL;
   return new DFASpanScan(dfa, nid, !reversed_);
+}
+
+// ── 锚定解析 (SpanDFA::Resolve) ────────────────────────────────────────────
+//
+// 给定匹配的一端, 求同一条 pattern 在这个端点上能达到的【另一端】。方向跟着 set 的编译方向:
+//   正向 set: from = 匹配左端 (含), 返回右端 (不含) —— text[from, *out) 是 id 的一个匹配;
+//   反向 set: from = 匹配右端 (不含), 返回左端 (含) —— text[*out, from) 是 id 的一个匹配。
+//
+// 🔴 从 start_setanchored 进 —— 这是它必须待在库里的唯一原因。set 程序里那截 .*? 前缀是
+//    【编进程序】的, 从外面进不去"不带前缀的入口": 调用方想在 Go 那侧补这一步, 只能自己
+//    另编一条 \A(?:pat) 的锚定正则 —— 那是每条 pattern 一个 RE2 对象、一份独立 DFA 缓存,
+//    而且得跟 set 里那条的语义手工对齐。从这里进去, 用的还是 set 自己那份 DFA。
+//
+// 🔴 返回【最长】的那个, 不是碰到的第一个。DFA 是一路走到死状态才知道还能不能更长;
+//    "碰到第一个 match 状态就收工"给的是【最短】匹配 —— `AAA-[A-Za-z0-9]{8,16}` 会只认
+//    前 8 个字符, 把命中截断。代价并不对称: 走到死状态的成本 = 这条命中实际能延伸到多远,
+//    与正文长度无关。除非 pattern 本身就能无限延伸 ((?s).*KEY 那种), 那用 bound 掐住。
+//
+// bound = 最远看到哪 (正向是上界, 反向是下界); 负数 = 不限。context 恒为【整篇正文】,
+// 所以 \b / ^ / $ 看到的永远是真实邻居, 而不是被 bound 切出来的人为边界。
+int SpanDFA::Resolve(DFA* dfa, bool run_forward, const char* text, int textlen,
+                     int from, int bound, int id, int32_t* out) {
+  if (textlen < 0 || from < 0 || from > textlen || id < 0)
+    return -1;
+  if (text == NULL)
+    return -1;
+  if (run_forward) {
+    if (bound < 0 || bound > textlen)
+      bound = textlen;
+    if (bound < from)
+      bound = from;
+  } else {
+    if (bound < 0)
+      bound = 0;
+    if (bound > from)
+      bound = from;
+  }
+  const char* rlo = run_forward ? text + from : text + bound;   // 搜索区间左端
+  const char* rhi = run_forward ? text + bound : text + from;   // 搜索区间右端
+
+  DFA::RWLocker l(&dfa->cache_mutex_);
+  StringPiece region(rlo, static_cast<size_t>(rhi - rlo));
+  StringPiece context(text, static_cast<size_t>(textlen));
+  DFA::SearchParams params(region, context, &l);
+  params.anchored = true;   // ← 与 DFASpanScan 唯一的实质差别就是这一行: 走真锚定入口
+  params.want_earliest_match = false;
+  params.run_forward = run_forward;
+  if (!dfa->AnalyzeSearch(&params) || params.failed)
+    return -1;
+  DFA::State* s = params.start;
+  if (s == SpanDeadState())
+    return 0;
+
+  const uint8_t* bp = reinterpret_cast<const uint8_t*>(text);
+  const uint8_t* p = reinterpret_cast<const uint8_t*>(run_forward ? rlo : rhi);
+  const uint8_t* ep = reinterpret_cast<const uint8_t*>(run_forward ? rhi : rlo);
+  int32_t best = -1;
+
+  // 起点本身就可能是 match 状态 (这条 pattern 能匹配空串)。
+  if (s > SpanSpecialMax() && s->IsMatch() && HasId(s, id))
+    best = static_cast<int32_t>(p - bp);
+
+  const uint8_t* bytemap = dfa->prog_->bytemap();
+  while (p != ep) {
+    int c = run_forward ? *p++ : *--p;
+    DFA::State* ns = dfa->NextOf(s, bytemap[c]);
+    if (ns == NULL) {
+      if (!Advance(dfa, &l, &s, c, static_cast<int>(p - bp), textlen))
+        return -1;
+    } else {
+      s = ns;
+    }
+    if (s <= SpanSpecialMax()) {
+      // kManyMatch 不会出 FullMatchState (见文件头) ⇒ 只可能是 DeadState:
+      // 再往前走不可能有任何匹配, 更不可能有更长的。收工。
+      s = NULL;
+      break;
+    }
+    if (s->IsMatch()) {
+      // 匹配晚一个字节才被看见 —— 正向 p-1 = 右端 (不含), 反向 p+1 = 左端 (含)。
+      const uint8_t* m = run_forward ? p - 1 : p + 1;
+      if (HasId(s, id))
+        best = static_cast<int32_t>(m - bp);
+    }
+  }
+
+  if (s != NULL) {
+    // 最后再喂一个"边界符号": 区间端点正好是整篇正文的两头才是 kByteEndText, 否则喂
+    // 【真实的邻居字节】(与 InlinedSearchLoop 那段 lastbyte 一个口径) —— 这样 \b / $
+    // 判的是它在整篇正文里的真实处境, 而不是 bound 切出来的假边界。
+    int lastbyte;
+    if (run_forward)
+      lastbyte = (rhi == text + textlen) ? DFA::kByteEndText : (rhi[0] & 0xFF);
+    else
+      lastbyte = (rlo == text) ? DFA::kByteEndText : (rlo[-1] & 0xFF);
+    if (!Advance(dfa, &l, &s, lastbyte, static_cast<int>(p - bp), textlen))
+      return -1;
+    if (s > SpanSpecialMax() && s->IsMatch() && HasId(s, id))
+      best = static_cast<int32_t>(p - bp);
+  }
+
+  if (best < 0)
+    return 0;
+  *out = best;
+  return 1;
+}
+
+int Prog::SpanResolve(int nid, const char* text, int textlen,
+                      int from, int bound, int id, int32_t* out) {
+  if (out == NULL || id < 0 || id >= nid)
+    return -1;
+  DFA* dfa = GetDFA(kManyMatch);
+  if (dfa == NULL || !dfa->ok())
+    return -1;
+  return SpanDFA::Resolve(dfa, !reversed_, text, textlen, from, bound, id, out);
 }
 
 void DFASpanScanFree(DFASpanScan* ss) { delete ss; }

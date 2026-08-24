@@ -304,6 +304,13 @@ class Prog {
   // (语义/用法见 re2/span_scan.h; 用完 DFASpanScanFree)。nid = Set 里的 pattern 条数。
   DFASpanScan* NewSpanScan(int nid);
 
+  // ── hgmLibre2 追加 (非上游 re2) ──
+  // 给定匹配的一端, 求同一条 pattern 在这个端点上能达到的【另一端】(最长的那个)。
+  // 语义 / 为什么这件事只能在库里做, 见 re2/span_scan.h 末尾那段。
+  // 返回 1 = 找到并写 *out, 0 = 这条 pattern 在这个端点上根本不匹配, -1 = 参数错 / DFA 放弃。
+  int SpanResolve(int nid, const char* text, int textlen,
+                  int from, int bound, int id, int32_t* out);
+
   // 查这个 Prog 上某一 kind 的 DFA 缓存水位 (没建出来则 out->built=false)。
   // 只读, 会短暂拿 DFA 的读锁; 可以在扫描并发进行时调。
   void GetDFAMemInfo(MatchKind kind, DFAMemInfo* out);

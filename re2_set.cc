@@ -157,6 +157,14 @@ DFASpanScan* RE2::Set::NewSpanScan() const {
   return prog_->NewSpanScan(size_);
 }
 
+// ── hgmLibre2 追加 ── 见 set.h / re2/span_scan.h。id 与 Match 返回的下标同一套。
+int RE2::Set::ResolveSpan(const char* text, int textlen, int from, int bound,
+                          int id, int32_t* out) const {
+  if (!compiled_ || prog_ == NULL)
+    return -1;
+  return prog_->SpanResolve(size_, text, textlen, from, bound, id, out);
+}
+
 // 没扫过就没有 DFA —— 这时候【不建】, 直接报 built=false。
 void RE2::Set::MemInfo(DFAMemInfo* out) const {
   memset(out, 0, sizeof *out);
@@ -200,7 +208,10 @@ bool RE2::Set::Match(const StringPiece& text, std::vector<int>* v,
     matches.reset(new SparseSet(size_));
     v->clear();
   }
-  bool ret = prog_->SearchDFA(text, text, Prog::kAnchored, Prog::kManyMatch,
+  // ── hgmLibre2 改动 ── 上游这里传的是 kAnchored (靠 CompileSet 设的 anchor_start_ 把
+  // 搜索钉成锚定的, 而那个"锚定入口"其实带着 .*? 前缀)。CompileSet 现在按 Compile 的规矩
+  // 摆两个入口了 (见那里), 所以这里照实传 kUnanchored —— 走的还是同一个带前缀的入口。
+  bool ret = prog_->SearchDFA(text, text, Prog::kUnanchored, Prog::kManyMatch,
                               NULL, &dfa_failed, matches.get(), stats);
   if (dfa_failed) {
     if (options_.log_errors())

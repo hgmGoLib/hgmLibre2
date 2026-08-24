@@ -165,6 +165,73 @@ func (sc *SpanScanner) ScanBytes(text []byte, fn func(spans []SetSpan) bool) err
 	return err
 }
 
+// ResolveSpan 求【另一端】: 给定 Scan 吐出来的一个端点, 返回同一条 pattern 在这个端点上
+// 能达到的另一端。方向跟着 set 走 (与 Scan 吐的端点正好配成一对):
+//
+//	正向 set: from = 匹配左端(含), 返回右端(不含) —— text[from:pos] 就是这条 pattern 的匹配
+//	反向 set: from = 匹配右端(不含), 返回左端(含) —— text[pos:from] 就是这条 pattern 的匹配
+//
+// ok=false 表示这条 pattern 在这个端点上根本不匹配 (调用方给错端点了, 或者给错 id)。
+//
+// 🔴 返回的是【最长】的那个匹配, 不是最短的。变长 pattern 在同一个端点上通常有一串长度
+//    都成立 (`AAA-[A-Za-z0-9]{8,16}` 在同一个右端上有 9 个合法左端), "碰到第一个就收工"
+//    给的是最短那个 = 把命中截断, 下游拿去做定长校验就会把真命中判成假命中。
+//
+// 🔴 这一步不要在 Go 这侧自己补。自己补只能另编一条 \A(?:pat) 的锚定正则 —— 每条 pattern
+//    一个 Regexp 对象、一份独立的 DFA 缓存, 还得手工保证它和 set 里那条语义一致;
+//    而且【非锚定】的那种补法 (拿原正则去扫 text[from:]) 更糟: .*? 前缀让每个位置都能当
+//    起点, 状态数对计数上界指数增长 (doc/状态数为什么会相乘.txt 里同形状差 967 倍),
+//    等于把 Scan 刚省下来的又赔回去。这里走的是 set 自己那份程序、那份 DFA 缓存, 且真锚定。
+//
+// 无状态、只读, 可以和别的 goroutine 的 Scan 并发调 (与 Match 同一个口径)。
+func (s *RegexpSet) ResolveSpan(text string, from, id int32) (pos int32, ok bool, err error) {
+	return s.ResolveSpanWithin(text, from, -1, id)
+}
+
+// ResolveSpanWithin 同 ResolveSpan, 但限定【最远看到哪】: 正向 set 的 bound 是右上界,
+// 反向 set 的 bound 是左下界; 负数 = 不限 (等价于 ResolveSpan)。
+//
+// 什么时候需要它: 走到死状态的成本 = 这条命中实际能延伸到多远, 与正文长度无关 —— 除非
+// pattern 本身就能无限延伸 ((?s).*KEY 那种), 那一条在整篇正文上解析一次就是 O(正文)。
+// 给这类 pattern 配一个"回看上限"就把它钉回常数。
+//
+// 判定用的上下文恒是【整篇正文】, 所以 \b / ^ / $ 看到的永远是真实邻居字节,
+// 而不是 bound 切出来的假边界 —— 掐 bound 只会让答案变短, 不会让它变错。
+func (s *RegexpSet) ResolveSpanWithin(text string, from, bound, id int32) (pos int32, ok bool, err error) {
+	if s.size == 0 {
+		return 0, false, errors.New("re2native: resolve span on empty set")
+	}
+	if len(text) > maxCInt {
+		return 0, false, errors.New("re2native: resolve span text too large (>2GiB)")
+	}
+	if id < 0 || int(id) >= s.size {
+		return 0, false, errors.New("re2native: resolve span bad pattern index " + strconv.Itoa(int(id)))
+	}
+	if from < 0 || int(from) > len(text) {
+		return 0, false, errors.New("re2native: resolve span bad offset " + strconv.Itoa(int(from)))
+	}
+	var out C.int32_t
+	r := C.cre2_set_resolve_span(s.h, strBytePtr(text), C.int(len(text)),
+		C.int(from), C.int(bound), C.int(id), &out)
+	runtime.KeepAlive(text)
+	runtime.KeepAlive(s)
+	switch r {
+	case 1:
+		return int32(out), true, nil
+	case 0:
+		return 0, false, nil
+	}
+	return 0, false, errors.New("re2native: resolve span failed (DFA gave up); patterns=" +
+		strconv.Itoa(s.size) + "; 用 NewRegexpSetMaxMem 把 maxMem 调大")
+}
+
+// ResolveSpanBytes 同 ResolveSpan, 但正文是 []byte (零拷贝)。
+func (s *RegexpSet) ResolveSpanBytes(text []byte, from, id int32) (pos int32, ok bool, err error) {
+	pos, ok, err = s.ResolveSpanWithin(bytesStr(text), from, -1, id)
+	runtime.KeepAlive(text)
+	return pos, ok, err
+}
+
 // AppendSpans 是 Scan 的"我就要全部, 一次拿走"版: 把所有游程 append 进 dst 并返回。
 // 传 dst[:0] 复用切片即可零分配 (稳态下)。顺序同 Scan (不保证全局升序)。
 func (sc *SpanScanner) AppendSpans(dst []SetSpan, text string) ([]SetSpan, error) {

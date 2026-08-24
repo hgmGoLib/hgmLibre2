@@ -89,7 +89,7 @@
       反向 45 状态 / 0.01MB, 命中集一致。
       ⚠ Match 只回答"命中没有 / 哪几条命中", 不回答"在哪"。要位置别再走"命中之后正向
       FindStringIndex 重扫整篇"那条老路 —— 用 NewSpanScanner (见下), 反向 set 直接给匹配左端,
-      再用锚定的 \A(?:pat) 在 text[start:] 上取右端, 第二遍只碰命中那一段。
+      再用正向 set 的 ResolveSpan 取右端, 第二遍只碰命中那一段。
       ⚠ 方向是【每条 pattern 各自】的决定: (?s).{20}key 正向 21 状态 / 反向 1,
       key(?s).{20} 正好反过来。拿真语料各建一个单条 set 比 MemInfo().States 就知道该往哪边放。
       ⚠ 这跟"自己把 pattern 倒着写 + 把正文倒过来"不是一回事, 而且库这条更省: RE2 的 Simplify
@@ -153,6 +153,24 @@
       一个 (同一个 Set 上开多个 scanner 并发扫没问题, Set 本身只读)。
       ⚠ Set 是 never_capture(true) 编的, 永远不给子组位置 —— 需要 FindAllStringSubmatchIndex
       (要 group1 的偏移) 的调用方, 这条路服务不了, 只能照旧单独跑那条正则。
+    - RegexpSet.ResolveSpan / ResolveSpanWithin / ResolveSpanBytes:
+      【锚定解析】—— 把 NewSpanScanner 吐的那【一端】补成一整段。方向跟着 set 走, 正反配成一对:
+      正向 set 的 ResolveSpan(text, 左端, id) 给右端(不含); 反向 set 的给左端(含)。
+      所以完整流水线是【两个方向各一个 set】: 一个负责扫出端点, 另一个负责把端点补全。
+      🔴 这一步不要在 Go 那侧自己补。上面说的"第二遍必须锚定"就是这条: 拿原正则去扫
+      text[start:] 是【非锚定】的, .*? 前缀让它一路扫到正文末尾, 白扫也白建状态; 自己另编
+      一条 \A(?:pat) 倒是锚定了, 但那是每条 pattern 一个 Regexp 对象、一份独立 DFA 缓存,
+      而且它跟 set 里那条是不是同一个语义全靠人工保证。ResolveSpan 走的是 set 自己那份程序
+      里【不带 .*? 前缀的那个入口】—— 从外面根本够不着 (为此把 CompileSet 的两个入口按
+      Compiler::Compile 的规矩摆开了, 见 VENDOR.txt), 用的也是 set 自己那份 DFA 缓存。
+      🔴 给的是【最长】那个匹配的另一端, 不是碰到的第一个。变长 pattern 在同一个端点上通常
+      有一串长度都成立 (AAA-[A-Za-z0-9]{8,16} 在同一个右端上有 9 个合法左端), "碰到第一个
+      就收工"给的是最短那个 = 把命中截断, 下游做定长校验时会把真命中判成假命中。
+      成本 = 这条命中实际能延伸到多远, 与正文长度无关 (走到 DeadState 就收工); 真能无限
+      延伸的 pattern ((?s).*KEY 那种) 用 ResolveSpanWithin 的 bound 掐住回看距离。
+      判定用的上下文恒是【整篇正文】, 所以 \b / ^ / $ 看到的永远是真实邻居字节, 而不是
+      bound 切出来的假边界 —— 掐 bound 只会让答案变短, 不会让它变错。
+      无状态、只读 (自己拿 DFA 的缓存读锁), 可以和别的 goroutine 的扫描并发调。
 * vendored 的 re2 里改过的上游文件只有这几个 (完整清单与升级时怎么重打见 VENDOR.txt):
   re2_dfa.cc 是大头 —— 转移表槽位从 8 字节指针改成 4 字节 arena 下标 + arena 按需增长。
   同预算多装 1.74 倍状态 (0-flush 门槛降一档), 健康档吞吐不降, 峰值 RSS 约 -30%。
@@ -160,8 +178,15 @@
   要编原版对照: CGO_CXXFLAGS="-O2 -DRE2_DFA_NEXT_BITS=64 -DRE2_DFA_ARENA=0"。详见 README.md。
   其余几处是【纯追加】: prog.h / set.h / re2_set.cc 上的观测出参与访问器, 外加
   re2_compile.cc / re2_set.cc 上给 Prog::CompileSet 和 RE2::Set 加的 reversed (反着扫, 见上),
-  以及流式游程扫描 (re2/span_scan.h + re2_dfa_spanscan.inc, 由 re2_dfa.cc 末尾 #include 进去 ——
-  class DFA 整个定义就在 re2_dfa.cc 里, 别的编译单元看不见 State/RWLocker/StateSaver)。
+  以及流式游程扫描 + 锚定解析 (re2/span_scan.h + re2_dfa_spanscan.inc, 由 re2_dfa.cc 末尾
+  #include 进去 —— class DFA 整个定义就在 re2_dfa.cc 里, 别的编译单元看不见 State/RWLocker/
+  StateSaver)。唯一一处【改了上游行为写法】的是 Compiler::CompileSet 的两个入口:
+  上游写成 "anchor_start_=true + start_ 和 start_unanchored_ 都指向带 .*? 前缀的那个入口",
+  靠 SearchDFA 里 anchor_start() 那一条把搜索强制成锚定; 现在改成与 Compiler::Compile 一模
+  一样的摆法 (start_ = 不带前缀的真锚定入口, start_unanchored_ = 带前缀的, anchor_start_
+  照实写 false), RE2::Set::Match 相应改传 kUnanchored —— 走的还是同一个带前缀的入口, 命中集
+  逐位不变 (Set/reverse/prefilter/stats/maxmem 全套回归钉死), 换来的是 ResolveSpan 能进那个
+  真锚定入口。两个入口都是 Prog::Flatten 本来就认得并 remap 的 root, 所以 Flatten 一个字没动。
   🔴 那份是【另写的一份热循环】, 没往 InlinedSearchLoop 里塞 if: 老循环是全库最热的那个,
   它只管把 id 塞进 SparseSet (塞一次就够, 还能 early-out); 游程扫描每个命中字节都要维护
   "这条 pattern 的游程长到哪了"且永不早退。混在一起是白给老循环加分支。
@@ -178,7 +203,11 @@
   假命中; 外加"batch 只影响怎么吐不影响吐什么"、`ab|c` 连号游程可还原、半途 return false 之后
   工作区能重用) · spanscan_need_test.go (按真实调用形态走完整流水线: 反向 set 拿左端 → 锚定
   正则只跑命中那一段拿右端 → 优先级贪心相交即丢 → 一次升序替换, 并钉死边界精确到字节、
-  条数不多不少、以及"锚定的在错位置当场死 / 非锚定的会一路扫过来"这个机制本身) ·
+  条数不多不少、以及"锚定的在错位置当场死 / 非锚定的会一路扫过来"这个机制本身; 同一个需求
+  再用 ResolveSpan 走一遍, 正向路(扫右端→求左端)与反向路(扫左端→求右端)两条互相对账) ·
+  spanresolve_test.go (锚定解析与另一个 O(n²) 暴力参考逐位对拍, 正反向各一遍; 外加"给的是
+  最长不是碰到的第一个"、"同一端点上多条 pattern 各算各的"、bound 掐回看距离且不当词边界) ·
   spanscan_stress_test.go (把 maxMem 压到反复 flush + batch 压到 1 反复挂起, 结果必须与
   预算充足+大批一致 —— 挂起是"按内容存状态", 走错了不会崩, 会悄悄少吐几段; 外加同一个 Set
-  上 8 个 goroutine 各拿一个 scanner 并发扫, -race 干净))。
+  上 8 个 goroutine 各拿一个 scanner 并发扫, -race 干净; 以及解析撞 flush: 解析与扫描共用同一份
+  DFA 缓存, 起点状态被冲掉之后必须按内容重建, 判据是紧预算下的答案与预算充足时逐字相同))。

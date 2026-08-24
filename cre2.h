@@ -236,6 +236,16 @@ int cre2_spanscan_begin(cre2_spanscan *ss, int textlen);
 int cre2_spanscan_step(cre2_spanscan *ss, const char *text, int textlen,
                        int32_t *out, int outcap, int *more);
 
+/* 给定 spanscan 吐出来的一个端点, 求第 id 条 pattern 在这个端点上的【另一端】(最长的那个)。
+ *   正向 set: from = 匹配左端(含), 写回右端(不含) —— text[from, *out) 是一个匹配;
+ *   反向 set: from = 匹配右端(不含), 写回左端(含) —— text[*out, from) 是一个匹配。
+ * bound = 最远看到哪 (正向是上界, 反向是下界), 负数 = 不限; 判定用的上下文恒是整篇正文,
+ * 所以 \b / ^ / $ 看到的永远是真实邻居, 不是 bound 切出来的假边界。
+ * 返回 1 = 找到, 0 = 这条 pattern 在这个端点上不匹配, -1 = 参数错 / DFA 放弃。
+ * 无状态、只读, 可以与扫描并发调。为什么这一步得在库里做见 internal_include/re2/span_scan.h。 */
+int cre2_set_resolve_span(const cre2_set *h, const char *text, int textlen,
+                          int from, int bound, int id, int32_t *out);
+
 /* 建一个空 set, reversed!=0 时整个 set 反向编译 (Match 从末尾往前扫原始 buffer)。
  * cre2_set_new(mm) == cre2_set_new_ex(mm, 0)。其余 API (add/compile/match/stats/mem_info/attrib)
  * 对反向 set 一律照常可用, 命中集与正向逐位相同。 */

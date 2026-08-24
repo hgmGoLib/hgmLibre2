@@ -1,4 +1,5 @@
-// cre2_spanscan.cpp — RE2::Set 流式游程扫描的 C 门面 (sqlite3_step 式轮询)。
+// cre2_spanscan.cpp — RE2::Set "命中在哪"的 C 门面: 流式游程扫描 (sqlite3_step 式轮询)
+// + 锚定解析 (cre2_set_resolve_span)。
 //
 // 语义 (吐什么 / 为什么是游程 / 为什么是轮询) 全在 internal_include/re2/span_scan.h,
 // 这里只做句柄包装和参数守卫。用法:
@@ -67,4 +68,13 @@ int cre2_spanscan_step(cre2_spanscan *ss, const char *text, int textlen,
 	// 空串也喂合法指针 (同 cre2_set_match): native 侧只做指针算术, 不解引用长度 0 的缓冲。
 	const char *base = text ? text : "";
 	return re2::DFASpanScanStep(ss->ss, base, textlen, out, outcap, more);
+}
+
+int cre2_set_resolve_span(const cre2_set *h, const char *text, int textlen,
+                          int from, int bound, int id, int32_t *out) {
+	if (h == nullptr || h->set == nullptr || out == nullptr) {
+		return -1;
+	}
+	const char *base = text ? text : "";
+	return h->set->ResolveSpan(base, textlen, from, bound, id, out);
 }

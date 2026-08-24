@@ -205,6 +205,8 @@ class DFA {
   // ── hgmLibre2 追加 ── 流式游程扫描的工作区 (re2_dfa_spanscan.inc)。它要用 State /
   // RWLocker / StateSaver / RunStateOnByteUnlocked 这些只在本编译单元里可见的东西。
   friend class DFASpanScan;
+  // 上面那个和"锚定解析"共用的几行 (推一个字节 / 查状态里有没有某条 pattern)。
+  friend struct SpanDFA;
 
   DFA(Prog* prog, Prog::MatchKind kind, int64_t max_mem);
   ~DFA();
