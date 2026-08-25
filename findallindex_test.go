@@ -87,33 +87,30 @@ func bruteStarts(t *testing.T, pat, text string) []int32 {
 	return out
 }
 
-// setSpan_t 是自动测试收集游程用的三元组。库里【没有】这个类型 —— FindAllIndex 直接把三个数
-// 交给回调, 不给数组 (为什么: findallindex.go 文件头"为什么给回调而不是给一个数组")。
-// 但对拍代码要把整篇的游程攒起来跟暴力参考比, 所以在测试这侧留一个。
-type setSpan_t struct{ Index, Lo, Hi int32 }
-
-// appendAllIndex / appendAllIndexRev 是"我就要全部, 一次拿走"的测试版。
+// appendAllIndex / appendAllIndexRev 是"我就要全部, 一次拿走"的测试版: 把每一批都 append 起来。
+// 库里【不给】这个 —— 游程条数跟正文长度成正比 (真表 30741 条/MB), 一次性数组等于让内存跟着
+// 正文走 (为什么分批: findallindex.go 文件头)。对拍代码要跟暴力参考逐条比才需要攒。
 // batch <= 0 = 用库的默认批大小。
-func appendAllIndex(s *RegexpSet, dst []setSpan_t, text string, batch int) ([]setSpan_t, error) {
+func appendAllIndex(s *RegexpSet, dst []RegexpSet_FindAllIndex_Run_t, text string, batch int) ([]RegexpSet_FindAllIndex_Run_t, error) {
 	alloc, err := newAllocBatch(s, batch)
 	if err != nil {
 		return dst, err
 	}
 	defer alloc.Close()
-	err = s.FindAllIndex(text, alloc, func(reIndex, endLo, endHi int32) {
-		dst = append(dst, setSpan_t{reIndex, endLo, endHi})
+	err = s.FindAllIndex(text, alloc, func(runs []RegexpSet_FindAllIndex_Run_t) {
+		dst = append(dst, runs...)
 	})
 	return dst, err
 }
 
-func appendAllIndexRev(r *RegexpSetReverse, dst []setSpan_t, text string, batch int) ([]setSpan_t, error) {
+func appendAllIndexRev(r *RegexpSetReverse, dst []RegexpSet_FindAllIndex_Run_t, text string, batch int) ([]RegexpSet_FindAllIndex_Run_t, error) {
 	alloc, err := newAllocBatch(r.s, batch)
 	if err != nil {
 		return dst, err
 	}
 	defer alloc.Close()
-	err = r.FindAllIndex(text, alloc, func(reIndex, startLo, startHi int32) {
-		dst = append(dst, setSpan_t{reIndex, startLo, startHi})
+	err = r.FindAllIndex(text, alloc, func(runs []RegexpSet_FindAllIndex_Run_t) {
+		dst = append(dst, runs...)
 	})
 	return dst, err
 }
@@ -126,10 +123,10 @@ func newAllocBatch(s *RegexpSet, batch int) (*RegexpSet_FindAllIndex_Alloc_t, er
 }
 
 // expandSpans 把游程按 pattern 展开成逐个位置 (去重 + 升序), 用来跟暴力参考比。
-func expandSpans(spans []setSpan_t, idx int32) []int32 {
+func expandSpans(spans []RegexpSet_FindAllIndex_Run_t, idx int32) []int32 {
 	seen := map[int32]bool{}
 	for _, sp := range spans {
-		if sp.Index != idx {
+		if sp.ReIndex != idx {
 			continue
 		}
 		for p := sp.Lo; p <= sp.Hi; p++ {
@@ -161,7 +158,7 @@ func TestSpanScan_ForwardMatchesBrute(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRegexpSet: %v", err)
 	}
-	var buf []setSpan_t
+	var buf []RegexpSet_FindAllIndex_Run_t
 	for _, text := range spanScanInputs {
 		// batch 故意开小 (4), 逼出多次挂起/恢复。
 		buf, err = appendAllIndex(set, buf[:0], text, 4)
@@ -183,7 +180,7 @@ func TestSpanScan_ReverseMatchesBrute(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRegexpSetReverseMaxMem: %v", err)
 	}
-	var buf []setSpan_t
+	var buf []RegexpSet_FindAllIndex_Run_t
 	for _, text := range spanScanInputs {
 		buf, err = appendAllIndexRev(set, buf[:0], text, 4)
 		if err != nil {
@@ -205,13 +202,13 @@ func TestSpanScan_ReverseMatchesBrute(t *testing.T) {
 func TestSpanScan_BatchSizeInvariant(t *testing.T) {
 	for _, rev := range []bool{false, true} {
 		// 正反是两个类型, 所以这里收成一个闭包再往下走。
-		var scan func(text string, batch int) ([]setSpan_t, error)
+		var scan func(text string, batch int) ([]RegexpSet_FindAllIndex_Run_t, error)
 		if rev {
 			r, err := NewRegexpSetReverseMaxMem(spanScanPatterns, 0)
 			if err != nil {
 				t.Fatalf("建反向 set: %v", err)
 			}
-			scan = func(text string, batch int) ([]setSpan_t, error) {
+			scan = func(text string, batch int) ([]RegexpSet_FindAllIndex_Run_t, error) {
 				return appendAllIndexRev(r, nil, text, batch)
 			}
 		} else {
@@ -219,12 +216,12 @@ func TestSpanScan_BatchSizeInvariant(t *testing.T) {
 			if err != nil {
 				t.Fatalf("建正向 set: %v", err)
 			}
-			scan = func(text string, batch int) ([]setSpan_t, error) {
+			scan = func(text string, batch int) ([]RegexpSet_FindAllIndex_Run_t, error) {
 				return appendAllIndex(f, nil, text, batch)
 			}
 		}
 		for _, text := range spanScanInputs {
-			var ref []setSpan_t
+			var ref []RegexpSet_FindAllIndex_Run_t
 			for _, batch := range []int{1, 2, 5, 17, 4096} {
 				got, err := scan(text, batch)
 				if err != nil {
@@ -250,10 +247,10 @@ func TestSpanScan_BatchSizeInvariant(t *testing.T) {
 	}
 }
 
-func sortSpans(s []setSpan_t) {
+func sortSpans(s []RegexpSet_FindAllIndex_Run_t) {
 	sort.Slice(s, func(a, b int) bool {
-		if s[a].Index != s[b].Index {
-			return s[a].Index < s[b].Index
+		if s[a].ReIndex != s[b].ReIndex {
+			return s[a].ReIndex < s[b].ReIndex
 		}
 		if s[a].Lo != s[b].Lo {
 			return s[a].Lo < s[b].Lo
@@ -298,7 +295,7 @@ func TestSpanScan_EmptyAndNoMatch(t *testing.T) {
 
 	for _, text := range []string{"", "abc", "no digits and no z-z-z here"} {
 		calls := 0
-		if err := set.FindAllIndex(text, alloc, func(_, _, _ int32) { calls++ }); err != nil {
+		if err := set.FindAllIndex(text, alloc, func(runs []RegexpSet_FindAllIndex_Run_t) { calls += len(runs) }); err != nil {
 			t.Fatalf("FindAllIndex(%q): %v", text, err)
 		}
 		if calls != 0 {
@@ -307,9 +304,9 @@ func TestSpanScan_EmptyAndNoMatch(t *testing.T) {
 	}
 
 	// 工作区复用: 上一次没命中不该污染下一次。
-	var got []setSpan_t
-	if err := set.FindAllIndex("abc 42 zzz", alloc, func(i, lo, hi int32) {
-		got = append(got, setSpan_t{i, lo, hi})
+	var got []RegexpSet_FindAllIndex_Run_t
+	if err := set.FindAllIndex("abc 42 zzz", alloc, func(runs []RegexpSet_FindAllIndex_Run_t) {
+		got = append(got, runs...)
 	}); err != nil {
 		t.Fatalf("FindAllIndex: %v", err)
 	}
@@ -339,9 +336,9 @@ func TestSpanScan_AllocReuse(t *testing.T) {
 	// 每篇正文各扫两遍 (一遍用复用的 alloc, 一遍用现开的), 逐条比。
 	for round := 0; round < 2; round++ {
 		for _, text := range spanScanInputs {
-			var got []setSpan_t
-			if err := set.FindAllIndex(text, alloc, func(i, lo, hi int32) {
-				got = append(got, setSpan_t{i, lo, hi})
+			var got []RegexpSet_FindAllIndex_Run_t
+			if err := set.FindAllIndex(text, alloc, func(runs []RegexpSet_FindAllIndex_Run_t) {
+				got = append(got, runs...)
 			}); err != nil {
 				t.Fatalf("复用 alloc 扫 %q: %v", text, err)
 			}
@@ -378,7 +375,7 @@ func TestFindAllIndex_AllocIsSetBound(t *testing.T) {
 		t.Fatalf("NewFindAllIndexAlloc: %v", err)
 	}
 	defer alloc.Close()
-	if err := b.FindAllIndex("abc 42", alloc, func(_, _, _ int32) {}); err == nil {
+	if err := b.FindAllIndex("abc 42", alloc, func(_ []RegexpSet_FindAllIndex_Run_t) {}); err == nil {
 		t.Fatal("拿 a 的 alloc 去扫 b 该报错")
 	}
 	// 反向 set 的 alloc 也不能拿到正向来用。
@@ -391,13 +388,13 @@ func TestFindAllIndex_AllocIsSetBound(t *testing.T) {
 		t.Fatalf("NewFindAllIndexAlloc(rev): %v", err)
 	}
 	defer ralloc.Close()
-	if err := a.FindAllIndex("abc 42", ralloc, func(_, _, _ int32) {}); err == nil {
+	if err := a.FindAllIndex("abc 42", ralloc, func(_ []RegexpSet_FindAllIndex_Run_t) {}); err == nil {
 		t.Fatal("拿反向 set 的 alloc 去正向扫该报错")
 	}
 
 	// alloc 传 nil 是合法的 (当场建一个用完就扔)。
 	n := 0
-	if err := a.FindAllIndex("abc 42", nil, func(_, _, _ int32) { n++ }); err != nil {
+	if err := a.FindAllIndex("abc 42", nil, func(runs []RegexpSet_FindAllIndex_Run_t) { n += len(runs) }); err != nil {
 		t.Fatalf("alloc=nil: %v", err)
 	}
 	if n == 0 {
@@ -411,7 +408,7 @@ func TestFindAllIndex_AllocIsSetBound(t *testing.T) {
 	}
 	closed.Close()
 	closed.Close() // 可重复调
-	if err := a.FindAllIndex("abc 42", closed, func(_, _, _ int32) {}); err == nil {
+	if err := a.FindAllIndex("abc 42", closed, func(_ []RegexpSet_FindAllIndex_Run_t) {}); err == nil {
 		t.Fatal("Close 过的 alloc 该报错")
 	}
 }

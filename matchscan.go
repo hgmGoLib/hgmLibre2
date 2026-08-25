@@ -1,4 +1,4 @@
-// matchscan.go —— 一遍扫正文, 之后【按需】给出某条 pattern 的不重复命中区间。
+// matchscan.go —— 一遍扫正文, 边扫边【一批一批】交出各条 pattern 的不重复命中区间。
 //
 // ── 它替掉的是哪段路 ────────────────────────────────────────────────────────
 // 调用方今天的写法是"两段式": 先 Set.Match 扫一遍拿到"哪几条命中"(一张 bool 表), 然后为了知道
@@ -11,30 +11,37 @@
 // 右端补成完整区间 —— 它整个就是【搭在 FindAllIndex 上面的一层】, 自己不碰 native。
 //
 //	SetWanted(mask)            【哪几条要位置】。门上很多位只当 bool 用 (某某类内容在不在),
-//	                           从来没人问它在哪 —— 那几条一个字节都不该攒。默认全要。
-//	Scan(text)                 一遍全文。命中表 (HitIDs / Hit, 与 Set.Match 同解) +
-//	                           要位置的那几条的命中区间, 【边扫边收口】。
-//	AppendMatches(dst, id)     取第 id 条的结果 (照抄一份, 不再算)。
+//	                           从来没人问它在哪 —— 那几条不该为它补左端。默认全要。
+//	Scan(text, batchFn)        一遍全文。命中表 (HitIDs / Hit, 与 Set.Match 同解) 边扫边填,
+//	                           命中区间【边扫边收口、攒够一批就交出去】。
+//	                           返回 unresolved: 这几条补不出来, 请调用方走老路。
 //
-// 🔴 边扫边收口是【内存】上的要求, 不是风格。FindAllIndex 那层本来就是 sqlite3_step 式的:
-//    一批 4096 条游程 (48KB) 装满就挂起、回调给 Go、取走再进去接着扫, 缓冲循环复用, 不随
-//    正文长度涨。要是 Go 这侧把每一批都 append 攒起来等扫完再算, 那个固定缓冲就白设计了 ——
-//    实测真表上游程约 30741 条/MB (0.23MB/MB), 200MB 的 body 就是每个并发扫描 47MB。
-//    所以游标推进在回调里当场跑完, Go 这侧留下的只有【输出】(去重后的命中区间), 而输出是
-//    调用方本来就要拿走的东西 —— 而且比老路的 [][]int 还省 (扁平 int32 对 vs 每处一个切片头)。
+// 🔴 一批一批交出去是【内存】上的要求, 不是风格。底下 FindAllIndex 本来就是 sqlite3_step
+//    式的: 一批 4096 条游程 (48KB) 装满就挂起、交给 Go、取走再进去接着扫, 缓冲循环复用,
+//    不随正文长度涨。要是这一层把结果全 append 攒起来等扫完再还给调用方, 那个固定缓冲就白
+//    设计了 —— 实测真表上游程约 30741 条/MB, 收口后的输出还有 0.037MB/MB, 200MB 的 body
+//    就是每个并发扫描 7.4MB 常驻, 而且 AppendMatches 那种"再照抄一份给调用方"的接口等于
+//    两份缓冲。现在这一层【一个字节都不留】: 游标推进在回调里当场跑完, 收口出来的区间写进
+//    一块固定的 matchScanBatch 缓冲, 满了就交出去、就地复用。
 //    真表实测: 游程 196744 条 → 输出 74249 处, 而且其中 57% 的游程来自两条【只当 bool 用】的
-//    pattern, SetWanted 一挡就没了。
+//    pattern, SetWanted 一挡就没了 —— 挡掉的是那几条的【左端回推】(真花钱的那步), 不只是内存。
 //
-// 能这么做是因为同一条 pattern 的游程【跨批次也是升序】的 (正向扫本来就从左往右走)。
-// 万一不是 (真出现了乱序), 那一条当场标成"补不出来", AppendMatches 返回 ok=false 让调用方
-// 走老路 —— 宁可退回去也不给错答案。
+// 🔴 交给 batchFn 的那段切片是内部缓冲【本身】, 下一批原地覆写。要留就自己 append 走。
+//
+// 🔴 交出来的顺序【不按 pattern 分组】, 各条 pattern 的结果按收口先后交错着来 (同一条 pattern
+//    内部仍按 Lo 升序)。想按条归拢是调用方那边一句 append 的事, 库这边归拢就得攒 = 又是缓冲。
+//
+// 能边扫边收口是因为同一条 pattern 的游程【跨批次也是升序】的 (正向扫本来就从左往右走)。
+// 万一不是 (真出现了乱序), 那一条当场作废进 unresolved 让调用方走老路 —— 宁可退回去也不给
+// 错答案。🔴 作废可能发生在【已经交出去几处之后】(乱序 / DFA 中途放弃都是走到一半才知道),
+// 所以调用方对 unresolved 里的下标要把本遍已收到的结果【全丢掉】再走老路, 不能只补后半截。
 //
 // ── 左端怎么补: 看 PatternLenRange 的两档 (patlen.go) ────────────────────────
 //	min == max   定长 (NRIC 9 字节 · 身份证 18 字节): Lo = Hi - min。【不进正则引擎】, 一句减法。
 //	其余         从 Hi 往左【锚定】推一次, 用【这一条 pattern 自己一条】的反向 set
 //	             (RegexpSet.reverseOne → RegexpSetReverse.ResolveSpanWithin), 一次调用
 //	             给最靠左的那个起点。代价 = 回看多远, 与正文长度无关。
-//	             反向编译不出来的那几条 AppendMatches 返回 ok=false, 请调用方照老路 FindAll。
+//	             反向编译不出来的那几条进 unresolved, 请调用方照老路 FindAll。
 //
 // 🔴 反向必须是【一条一个 set】。整表建一个反向 set 是死路: set 里状态数是相乘的
 //    (doc/状态数为什么会相乘.txt), 155 条的反向表在 6.4MB 正文上实测 65 秒 / arena 顶满 254MB
@@ -117,15 +124,20 @@
 //     把口子堵严的话它就退化成 min == max 本身 —— 也就是变长快路整个清空。既然它兑现不了
 //     "等于 FindAll"这个承诺, 就不该拿 8 倍的钱去买: 真表上闸装着 1.82×, 拆掉 15.01×。)
 //
-// ok=false 的那几条 (没在 SetWanted 里 / 能匹配空串 / 反向编不出来 /
-// 游程乱序 / DFA 预算不够) 请调用方照老路对它跑 FindAll ——
-// 库这边宁可退回去也不给一个"像是对的"答案。
+// unresolved 里的那几条 (能匹配空串 / 反向编不出来 / 游程乱序 / DFA 预算不够) 请调用方
+// 照老路对它跑 FindAll —— 库这边宁可退回去也不给一个"像是对的"答案。
+// 没在 SetWanted 里的【不】进 unresolved: 那是调用方自己关掉的, 不是库补不出来。
 //
 // 生命周期同 FindAllIndex 的 alloc: 可复用工作区, 热路径上建一次留着,【不是并发安全的】。
-// Scan 之后 text 一直被 scanner 引用着 (AppendMatches 要用), 直到下一次 Scan 或 Reset。
+// text 只在 Scan 那一遍里被引用 (补左端要读它), Scan 返回之后这一层不再持有它。
 package hgmLibre2
 
 import "errors"
+
+// matchScanBatch 是一批最多交出去几处命中区间。12 字节一处, 1024 处 = 12KB, 一次性的固定
+// 开销, 不随正文长度涨。跟 findAllIndexBatch 一样【不做成旋钮】—— 底下那批 4096 条游程收口
+// 出来大约 1/3 到 1/2 是输出, 这个数就是照着它配的, 没有值得调用方去调的余地。
+const matchScanBatch = 1024
 
 // SetMatch 是一处命中: text[Lo:Hi] 是第 Index 条 pattern 的一个真匹配。
 type SetMatch struct {
@@ -143,10 +155,15 @@ type MatchScanner struct {
 	want  []bool // nil = 全要
 	hit   []bool
 	hits  []int32 // 上一遍命中过的下标 (= Set.Match 那张表), 去重且只含真命中
+	bad   []int32 // 本遍作废的下标, Scan 收尾时原样还给调用方
+	// out 是那块固定的输出缓冲 (长度恒为 matchScanBatch), outN 是已填几处。
+	// 满了就交给 fn 再从头填 —— 整个 Scan 期间这一层留下的就只有这 12KB。
+	out  []SetMatch
+	outN int
+	fn   func([]SetMatch)
 }
 
-// msPat_t 是每条 pattern 的推进状态。cur 就是那把游标, out 是已经收口的输出。
-
+// msPat_t 是每条 pattern 的推进状态。cur 就是那把游标。
 type msPat_t struct {
 	inited bool
 	fixed  bool
@@ -155,7 +172,6 @@ type msPat_t struct {
 	rev    *RegexpSetReverse
 	cur    int32 // 已吐出去的最右字节
 	lastLo int32 // 上一条游程的左端, 用来确认升序
-	out    []int32
 }
 
 // NewMatchScanner 开一个工作区。热路径上建一次长期留着, 别每次扫描新建。
@@ -169,13 +185,15 @@ func (s *RegexpSet) NewMatchScanner() (*MatchScanner, error) {
 		alloc: alloc,
 		per:   make([]msPat_t, s.size),
 		hit:   make([]bool, s.size),
+		out:   make([]SetMatch, matchScanBatch),
 	}, nil
 }
 
 // SetWanted 声明【哪几条要位置】(下标即 pattern 下标, 长度不足的当 false)。传 nil = 全要。
-// 没要位置的那几条照样进命中表 (Hit/HitIDs), 只是一个游程都不攒、一次左端都不补 ——
-// 真表上光这一挡就去掉 57% 的游程。调用方那边这是【静态】信息: 哪几个门分支的消费点会问
-// 位置, 哪几个只是外层短路的 bool, 建集的时候就知道。
+// 没要位置的那几条照样进命中表 (Hit/HitIDs), 只是一处区间都不收口、一次左端都不补 ——
+// 真表上光这一挡就去掉 57% 的游程, 而变长条的左端回推是这一层最花钱的一步。
+// 调用方那边这是【静态】信息: 哪几个门分支的消费点会问位置, 哪几个只是外层短路的 bool,
+// 建集的时候就知道。
 func (m *MatchScanner) SetWanted(mask []bool) { m.want = mask }
 
 func (m *MatchScanner) wants(i int) bool {
@@ -194,35 +212,78 @@ func (m *MatchScanner) Close() {
 	m.text = ""
 }
 
-// Scan 扫 text 一遍 —— 这是【唯一】一遍全文。之后 HitIDs/Hit 就能用, 想要位置再按条问
-// AppendMatches。text 会被留住直到下一次 Scan。
-func (m *MatchScanner) Scan(text string) error {
+// Scan 扫 text 一遍 —— 这是【唯一】一遍全文。命中区间攒够一批 (matchScanBatch 处) 就调一次
+// batchFn; 扫完把不足一批的余数也交出去。全程没有任何命中就一次都不调。
+// 返回之后 HitIDs/Hit 可用。
+//
+// 🔴 交给 batchFn 的切片是内部缓冲本身, 下一批原地覆写 —— 要留就 append 走。
+// 🔴 各条 pattern 的结果是【交错】着来的 (同一条内部按 Lo 升序), 不按 pattern 分组。
+//
+// unresolved 是这一遍里补不出左端的 pattern 下标 (能匹配空串 / 反向编不出来 / 游程乱序 /
+// DFA 预算不够)。调用方要把本遍已收到的这几条的结果【全丢掉】, 改对它们跑一遍老路 FindAll
+// —— 作废可能发生在已经交出去几处之后。切片下次 Scan 会被覆写。
+//
+// batchFn 传 nil 合法: 只要命中表 (等价于 Set.Match), 一处区间都不收口。
+func (m *MatchScanner) Scan(text string, batchFn func(ms []SetMatch)) (unresolved []int32, err error) {
 	if m.alloc == nil {
-		return errClosedMatchScanner
+		return nil, errClosedMatchScanner
 	}
 	for _, id := range m.hits {
 		p := &m.per[id]
 		p.inited, p.fixed, p.bad = false, false, false
 		p.cur, p.lastLo = 0, 0
-		p.out = p.out[:0]
 		m.hit[id] = false
 	}
 	m.hits = m.hits[:0]
+	m.bad = m.bad[:0]
 	m.text = text
-	return m.set.FindAllIndex(text, m.alloc, func(reIndex, endLo, endHi int32) {
-		i := int(reIndex)
-		if i < 0 || i >= len(m.per) {
-			return
+	m.fn = batchFn
+	m.outN = 0
+	err = m.set.FindAllIndex(text, m.alloc, func(runs []RegexpSet_FindAllIndex_Run_t) {
+		for k := range runs {
+			r := &runs[k]
+			i := int(r.ReIndex)
+			if i < 0 || i >= len(m.per) {
+				continue
+			}
+			if !m.hit[i] {
+				m.hit[i] = true
+				m.hits = append(m.hits, r.ReIndex)
+			}
+			if batchFn == nil || !m.wants(i) {
+				continue // 只当 bool 用的那几条: 到此为止, 一次左端都不补
+			}
+			m.feed(i, r.Lo, r.Hi)
 		}
-		if !m.hit[i] {
-			m.hit[i] = true
-			m.hits = append(m.hits, reIndex)
-		}
-		if !m.wants(i) {
-			return // 只当 bool 用的那几条: 到此为止, 一个字节不攒
-		}
-		m.feed(i, endLo, endHi)
 	})
+	if err != nil {
+		m.text = ""
+		m.fn = nil
+		return nil, err
+	}
+	if m.outN > 0 && batchFn != nil {
+		batchFn(m.out[:m.outN])
+		m.outN = 0
+	}
+	m.text = ""
+	m.fn = nil
+	return m.bad, nil
+}
+
+// emit 把收口出来的一处区间写进那块固定缓冲, 满了就交出去。
+func (m *MatchScanner) emit(i int, lo, hi int32) {
+	m.out[m.outN] = SetMatch{Index: int32(i), Lo: lo, Hi: hi}
+	m.outN++
+	if m.outN == len(m.out) {
+		m.fn(m.out)
+		m.outN = 0
+	}
+}
+
+// markBad 把第 i 条当场作废: 之后它的游程一律不看, 收尾时进 unresolved。
+func (m *MatchScanner) markBad(i int) {
+	m.per[i].bad = true
+	m.bad = append(m.bad, int32(i))
 }
 
 // feed 把一条游程 [lo,hi] (都是右端偏移) 喂给第 i 条的游标, 当场推进并收口。
@@ -237,7 +298,7 @@ func (m *MatchScanner) feed(i int, lo, hi int32) {
 		if minL <= 0 {
 			// 能匹配【空串】的 pattern 不走这条路: 每个位置都是一处零长命中, 游标压不住,
 			// 吐出来的 text[Lo:Lo] 对下游也没有意义。这种交给老路。
-			p.bad = true
+			m.markBad(i)
 			return
 		}
 		p.minL = int32(minL)
@@ -246,13 +307,13 @@ func (m *MatchScanner) feed(i int, lo, hi int32) {
 			// 变长: 起点靠这一条自己的反向 set 锚定回推。给出来的口径不是 FindAll ——
 			// 见文件头"变长档"那一节, 调用方自己判断能不能用。
 			if p.rev = m.set.reverseOne(i); p.rev == nil {
-				p.bad = true
+				m.markBad(i)
 				return
 			}
 		}
 	}
 	if lo < p.lastLo {
-		p.bad = true // 游程乱序 —— 推进的前提没了, 宁可退回老路也不给错答案
+		m.markBad(i) // 游程乱序 —— 推进的前提没了, 宁可退回老路也不给错答案
 		return
 	}
 	p.lastLo = lo
@@ -267,7 +328,7 @@ func (m *MatchScanner) feed(i int, lo, hi int32) {
 			if start < p.cur {
 				continue // 与已吐出去那一处相交
 			}
-			p.out = append(p.out, start, e)
+			m.emit(i, start, e)
 			p.cur = e
 			continue
 		}
@@ -276,8 +337,8 @@ func (m *MatchScanner) feed(i int, lo, hi int32) {
 		start, ok, err := p.rev.ResolveSpanWithin(m.text, e, p.cur, 0)
 		if err != nil {
 			// DFA 放弃 (预算不够) —— 不是"没有匹配", 也不该把整遍扫描带崩。
-			// 这一条当场作废, AppendMatches 返回 ok=false, 调用方照老路 FindAll。
-			p.bad = true
+			// 这一条当场作废进 unresolved, 调用方照老路 FindAll。
+			m.markBad(i)
 			return
 		}
 		if !ok {
@@ -288,13 +349,13 @@ func (m *MatchScanner) feed(i int, lo, hi int32) {
 		end := e
 		pos, ok, err := m.set.ResolveSpan(m.text, start, int32(i))
 		if err != nil {
-			p.bad = true
+			m.markBad(i)
 			return
 		}
 		if ok && pos > end {
 			end = pos
 		}
-		p.out = append(p.out, start, end)
+		m.emit(i, start, end)
 		p.cur = end
 	}
 }
@@ -308,48 +369,30 @@ func (m *MatchScanner) Hit(i int) bool {
 	return i >= 0 && i < len(m.hit) && m.hit[i]
 }
 
-// AppendMatches 把第 id 条 pattern 的命中区间以扁平 (lo,hi) 对 append 进 dst 并返回。
-// 结果在 Scan 那一遍里就算好了, 这里只是照抄一份。
-//
-// ok=false 表示这一条这次拿不到 (没在 SetWanted 里 / 能匹配空串 / 反向编不出来 / 游程乱序)
-// —— 调用方照老路对它跑一遍 FindAll。没命中的条返回 dst 原样 + ok=true。
-func (m *MatchScanner) AppendMatches(dst []int32, id int32) (out []int32, ok bool, err error) {
-	if m.alloc == nil {
-		return dst, false, errClosedMatchScanner
-	}
-	i := int(id)
-	if i < 0 || i >= len(m.per) || !m.hit[i] {
-		return dst, true, nil
-	}
-	if !m.wants(i) || m.per[i].bad {
-		return dst, false, nil
-	}
-	return append(dst, m.per[i].out...), true, nil
-}
-
-// AppendAllMatches 是"全表都要"的便利版 (量具 / 对拍用): 扫一遍再把每条命中的都补出来。
-// 生产路径别用这个 —— 它把没人问的那些条也补了, 正是分成两步要躲开的那笔钱。
-// unresolved 里是补不出左端、需要调用方走老路的下标。
+// AppendAllMatches 是"全要, 而且一次性给我个数组"的便利版 (量具 / 对拍用): 扫一遍, 把每一批
+// 都 append 起来, 最后把 unresolved 那几条已经收到的剔掉。
+// 🔴 生产路径别用: 内存跟着正文长度走 (真表 0.037MB/MB), 正是 Scan 的分批接口要躲开的东西。
 func (m *MatchScanner) AppendAllMatches(dst []SetMatch, text string) (out []SetMatch, unresolved []int32, err error) {
-	if err := m.Scan(text); err != nil {
-		return dst, nil, err
+	base := len(dst)
+	unresolved, err = m.Scan(text, func(ms []SetMatch) { dst = append(dst, ms...) })
+	if err != nil {
+		return dst[:base], nil, err
 	}
-	var buf []int32
-	for _, id := range m.hits {
-		buf = buf[:0]
-		buf, ok, err := m.AppendMatches(buf, id)
-		if err != nil {
-			return dst, unresolved, err
-		}
-		if !ok {
-			unresolved = append(unresolved, id)
-			continue
-		}
-		for k := 0; k+1 < len(buf); k += 2 {
-			dst = append(dst, SetMatch{Index: id, Lo: buf[k], Hi: buf[k+1]})
+	if len(unresolved) == 0 {
+		return dst, nil, nil
+	}
+	// 作废那几条可能已经交出去过几处, 全剔掉 —— 调用方对它们要走老路, 留着就是重复。
+	drop := make([]bool, len(m.per))
+	for _, id := range unresolved {
+		drop[id] = true
+	}
+	keep := dst[:base]
+	for _, sm := range dst[base:] {
+		if !drop[sm.Index] {
+			keep = append(keep, sm)
 		}
 	}
-	return dst, unresolved, nil
+	return keep, unresolved, nil
 }
 
 // errClosedMatchScanner 单独提出来, 免得每次构造一遍 error。

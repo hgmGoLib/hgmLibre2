@@ -41,6 +41,28 @@ func TestPatternLenRangeTable(t *testing.T) {
 	}
 }
 
+// scanByPat 把一遍 Scan 的【分批】输出按 pattern 归拢成扁平 (lo,hi) 表, 并把 unresolved
+// 那几条已经收到的剔掉 (调用方对它们要走老路)。库这边【不归拢】—— 归拢就得攒, 正是分批接口
+// 要躲开的 (见 matchscan.go 文件头); 归拢是调用方一句 append 的事, 这个函数就是那一句。
+func scanByPat(t *testing.T, ms *MatchScanner, text string) (map[int32][]int32, map[int32]bool) {
+	t.Helper()
+	out := map[int32][]int32{}
+	unres, err := ms.Scan(text, func(mm []SetMatch) {
+		for _, m := range mm {
+			out[m.Index] = append(out[m.Index], m.Lo, m.Hi)
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad := map[int32]bool{}
+	for _, id := range unres {
+		bad[id] = true
+		delete(out, id)
+	}
+	return out, bad
+}
+
 // scanAll 把一遍 MatchScanner 的输出按 pattern 收成扁平 (lo,hi) 表。
 func scanAll(t *testing.T, set *RegexpSet, text string) map[int32][]int32 {
 	t.Helper()
@@ -187,22 +209,17 @@ func TestMatchScanStrictVsFindAll(t *testing.T) {
 			sb.WriteString(alphabet[rng.Intn(len(alphabet))])
 		}
 		text := sb.String()
-		if err := ms.Scan(text); err != nil {
-			t.Fatal(err)
-		}
+		byPat, bad := scanByPat(t, ms, text)
 		for id := range pats {
-			f, ok, err := ms.AppendMatches(nil, int32(id))
-			if err != nil {
-				t.Fatal(err)
-			}
+			f := byPat[int32(id)]
 			if wantUnres[int32(id)] {
-				if ok && len(f) > 0 {
-					t.Fatalf("轮 %d: #%d %q 能匹配空串, 必须 ok=false 交回老路, 却给了 %v",
+				if !bad[int32(id)] && len(f) > 0 {
+					t.Fatalf("轮 %d: #%d %q 能匹配空串, 必须进 unresolved 交回老路, 却给了 %v",
 						round, id, pats[id], f)
 				}
 				continue
 			}
-			if !ok {
+			if bad[int32(id)] {
 				t.Fatalf("轮 %d: #%d %q 意外补不出左端", round, id, pats[id])
 			}
 			// ① 每一段都是真匹配 · ② 互不相交且升序
@@ -273,8 +290,8 @@ func TestMatchScanEmptyCapableFallback(t *testing.T) {
 	}
 }
 
-// TestMatchScanWanted —— 没进 SetWanted 的那几条: 位照样亮 (Hit/HitIDs), 但一个游程不攒、
-// 一次左端不补, AppendMatches 返回 ok=false 让调用方走老路。
+// TestMatchScanWanted —— 没进 SetWanted 的那几条: 位照样亮 (Hit/HitIDs), 但一处区间都不收口、
+// 一次左端都不补, 一处都不交出来 (也【不】进 unresolved —— 那是调用方自己关掉的)。
 func TestMatchScanWanted(t *testing.T) {
 	set, err := NewRegexpSet([]string{`[A-Z]\d{3}`, `[a-f]{2,6}`})
 	if err != nil {
@@ -286,19 +303,17 @@ func TestMatchScanWanted(t *testing.T) {
 	}
 	defer ms.Close()
 	ms.SetWanted([]bool{false, true})
-	if err := ms.Scan("A123 beef"); err != nil {
-		t.Fatal(err)
-	}
+	byPat, bad := scanByPat(t, ms, "A123 beef")
 	if !ms.Hit(0) || !ms.Hit(1) {
 		t.Fatalf("两条都该命中: %v", ms.HitIDs())
 	}
-	if _, ok, _ := ms.AppendMatches(nil, 0); ok {
-		t.Errorf("第 0 条没在 wanted 里, 该返回 ok=false")
+	if len(byPat[0]) != 0 {
+		t.Errorf("第 0 条没在 wanted 里, 不该交出任何区间, 却给了 %v", byPat[0])
 	}
-	got, ok, err := ms.AppendMatches(nil, 1)
-	if err != nil || !ok {
-		t.Fatalf("第 1 条: ok=%v err=%v", ok, err)
+	if bad[0] || bad[1] {
+		t.Errorf("没在 wanted 里不等于补不出来, 不该进 unresolved: %v", bad)
 	}
+	got := byPat[1]
 	if fmt.Sprint(got) != fmt.Sprint([]int32{5, 9}) {
 		t.Fatalf("得到 %v, 要 [5 9] (%q)", got, "beef")
 	}

@@ -74,10 +74,12 @@ func TestSpanScan_RedactPipeline(t *testing.T) {
 		t.Fatalf("建反向 set: %v", err)
 	}
 	var starts []needSpan // 先只填 rule + lo
-	if err := set.FindAllIndex(needText, nil, func(reIndex, startLo, startHi int32) {
-		// 游程要展开: startLo..startHi 里【每一个】值都是一个真实的匹配左端。
-		for p := startLo; p <= startHi; p++ {
-			starts = append(starts, needSpan{rule: int(reIndex), lo: int(p)})
+	if err := set.FindAllIndex(needText, nil, func(runs []RegexpSet_FindAllIndex_Run_t) {
+		// 游程要展开: Lo..Hi 里【每一个】值都是一个真实的匹配左端。
+		for _, r := range runs {
+			for p := r.Lo; p <= r.Hi; p++ {
+				starts = append(starts, needSpan{rule: int(r.ReIndex), lo: int(p)})
+			}
 		}
 	}); err != nil {
 		t.Fatalf("FindAllIndex: %v", err)
@@ -283,11 +285,13 @@ func TestSpanScan_RedactPipelineBothDirections(t *testing.T) {
 
 	// scanEnds 把一遍扫描吐的游程展开成 (规则, 端点) 列表。
 	// 正反是两个类型, 所以这里收的是 FindAllIndex 那个方法本身。
-	scanEnds := func(find func(string, *RegexpSet_FindAllIndex_Alloc_t, func(int32, int32, int32)) error) []needSpan {
+	scanEnds := func(find func(string, *RegexpSet_FindAllIndex_Alloc_t, func([]RegexpSet_FindAllIndex_Run_t)) error) []needSpan {
 		var out []needSpan
-		if err := find(needText, nil, func(reIndex, lo, hi int32) {
-			for p := lo; p <= hi; p++ {
-				out = append(out, needSpan{rule: int(reIndex), lo: int(p)})
+		if err := find(needText, nil, func(runs []RegexpSet_FindAllIndex_Run_t) {
+			for _, r := range runs {
+				for p := r.Lo; p <= r.Hi; p++ {
+					out = append(out, needSpan{rule: int(r.ReIndex), lo: int(p)})
+				}
 			}
 		}); err != nil {
 			t.Fatalf("FindAllIndex: %v", err)

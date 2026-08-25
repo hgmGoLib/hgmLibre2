@@ -51,7 +51,7 @@ func stressText(n int) string {
 	return string(buf)
 }
 
-func spansEqual(t *testing.T, tag string, got, ref []setSpan_t) {
+func spansEqual(t *testing.T, tag string, got, ref []RegexpSet_FindAllIndex_Run_t) {
 	t.Helper()
 	sortSpans(got)
 	sortSpans(ref)
@@ -116,7 +116,7 @@ func TestSpanScan_ConcurrentScanners(t *testing.T) {
 	if err != nil {
 		t.Fatalf("建参照 set: %v", err)
 	}
-	want := make([][]setSpan_t, len(texts))
+	want := make([][]RegexpSet_FindAllIndex_Run_t, len(texts))
 	for i, tx := range texts {
 		want[i], err = appendAllIndex(ref, nil, tx, 1<<16)
 		if err != nil {
@@ -140,19 +140,19 @@ func TestSpanScan_ConcurrentScanners(t *testing.T) {
 				return
 			}
 			defer alloc.Close()
-			var buf []setSpan_t
+			var buf []RegexpSet_FindAllIndex_Run_t
 			for round := 0; round < 6; round++ {
 				i := (g + round) % len(texts)
 				buf = buf[:0]
-				if err := shared.FindAllIndex(texts[i], alloc, func(id, lo, hi int32) {
-					buf = append(buf, setSpan_t{id, lo, hi})
+				if err := shared.FindAllIndex(texts[i], alloc, func(runs []RegexpSet_FindAllIndex_Run_t) {
+					buf = append(buf, runs...)
 				}); err != nil {
 					errCh <- "FindAllIndex: " + err.Error()
 					return
 				}
-				cp := append([]setSpan_t(nil), buf...)
+				cp := append([]RegexpSet_FindAllIndex_Run_t(nil), buf...)
 				sortSpans(cp)
-				w := append([]setSpan_t(nil), want[i]...)
+				w := append([]RegexpSet_FindAllIndex_Run_t(nil), want[i]...)
 				sortSpans(w)
 				if len(cp) != len(w) {
 					errCh <- "并发结果条数不一致"
@@ -197,7 +197,7 @@ func TestSpanResolve_FlushDuringResolve(t *testing.T) {
 	var pts []pt
 	for _, sp := range spans {
 		for p := sp.Lo; p <= sp.Hi; p += 7 { // 隔几个取一个, 够多就行
-			pts = append(pts, pt{id: sp.Index, at: p})
+			pts = append(pts, pt{id: sp.ReIndex, at: p})
 			if len(pts) >= 4000 {
 				break
 			}
@@ -227,7 +227,7 @@ func TestSpanResolve_FlushDuringResolve(t *testing.T) {
 	for i, p := range pts {
 		// 每隔一段就整篇扫一遍, 把紧预算那份缓存搅乱 (顺带把起点状态冲掉)。
 		if i%1000 == 0 {
-			if err := tight.FindAllIndex(text, churn, func(_, _, _ int32) {}); err != nil {
+			if err := tight.FindAllIndex(text, churn, func(_ []RegexpSet_FindAllIndex_Run_t) {}); err != nil {
 				t.Fatalf("搅缓存: %v", err)
 			}
 		}

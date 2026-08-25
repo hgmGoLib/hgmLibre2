@@ -210,12 +210,12 @@ type benchNew struct {
 	bound   int32 // 解析时的回看上限 (0 = 不限)
 	// 正反已经是两个类型了, 所以方向在建工作区的时候就收进这两个闭包 ——
 	// 下面推进那段代码一个字都不用分方向。
-	scan    func(text string, fn func(reIndex, lo, hi int32)) error
+	scan    func(text string, fn func(runs []RegexpSet_FindAllIndex_Run_t)) error
 	resolve func(text string, from, bound, id int32) (int32, bool, error)
 	// 峰值那条测试要分别报"扫描 set"和"解析 set"的水位, 所以也一起收进来。
 	scanMem func() SetMemInfo
 	resMem  func() SetMemInfo
-	spans   []setSpan_t
+	spans   []RegexpSet_FindAllIndex_Run_t
 	out     []int32
 	cov     []int32 // runCov 用: 每条 pattern 上一处已解析命中的【内侧边界】
 }
@@ -245,7 +245,7 @@ func newBenchNewOn(tb testing.TB, forward bool, fwd *RegexpSet, rev *RegexpSetRe
 		if err != nil {
 			tb.Fatalf("NewFindAllIndexAlloc: %v", err)
 		}
-		n.scan = func(text string, fn func(reIndex, lo, hi int32) ) error {
+		n.scan = func(text string, fn func(runs []RegexpSet_FindAllIndex_Run_t)) error {
 			return fwd.FindAllIndex(text, alloc, fn)
 		}
 		n.resolve = rev.ResolveSpanWithin
@@ -255,7 +255,7 @@ func newBenchNewOn(tb testing.TB, forward bool, fwd *RegexpSet, rev *RegexpSetRe
 		if err != nil {
 			tb.Fatalf("NewFindAllIndexAlloc: %v", err)
 		}
-		n.scan = func(text string, fn func(reIndex, lo, hi int32)) error {
+		n.scan = func(text string, fn func(runs []RegexpSet_FindAllIndex_Run_t)) error {
 			return rev.FindAllIndex(text, alloc, fn)
 		}
 		n.resolve = fwd.ResolveSpanWithin
@@ -265,10 +265,10 @@ func newBenchNewOn(tb testing.TB, forward bool, fwd *RegexpSet, rev *RegexpSetRe
 }
 
 // scanOnly 只做定位那一步 (吐游程), 是新实现的成本下界。
-func (n *benchNew) scanOnly(tb testing.TB, text string) []setSpan_t {
+func (n *benchNew) scanOnly(tb testing.TB, text string) []RegexpSet_FindAllIndex_Run_t {
 	n.spans = n.spans[:0]
-	if err := n.scan(text, func(reIndex, lo, hi int32) {
-		n.spans = append(n.spans, setSpan_t{reIndex, lo, hi})
+	if err := n.scan(text, func(runs []RegexpSet_FindAllIndex_Run_t) {
+		n.spans = append(n.spans, runs...)
 	}); err != nil {
 		tb.Fatalf("FindAllIndex: %v", err)
 	}
@@ -304,7 +304,7 @@ func (n *benchNew) run(tb testing.TB, text string, perEndpoint bool) []int32 {
 					bd = p + n.bound // 正向 set 解析: bound 是右上界
 				}
 			}
-			other, ok, err := n.resolve(text, p, bd, sp.Index)
+			other, ok, err := n.resolve(text, p, bd, sp.ReIndex)
 			if err != nil {
 				tb.Fatalf("ResolveSpan: %v", err)
 			}
@@ -312,14 +312,14 @@ func (n *benchNew) run(tb testing.TB, text string, perEndpoint bool) []int32 {
 				// 不限回看时"解析不出来"一定是 bug (端点是这条 pattern 自己吐的);
 				// 限了回看就是合法结果 —— 这条命中比调用方声明的上限还长, 按约定不要了。
 				if n.bound <= 0 {
-					tb.Fatalf("规则 #%d 在端点 %d 上解析不出另一端", sp.Index, p)
+					tb.Fatalf("规则 #%d 在端点 %d 上解析不出另一端", sp.ReIndex, p)
 				}
 				continue
 			}
 			if n.forward {
-				n.out = append(n.out, sp.Index, other, p) // (id, 左端, 右端)
+				n.out = append(n.out, sp.ReIndex, other, p) // (id, 左端, 右端)
 			} else {
-				n.out = append(n.out, sp.Index, p, other)
+				n.out = append(n.out, sp.ReIndex, p, other)
 			}
 		}
 	}
@@ -356,7 +356,7 @@ func (n *benchNew) runCov(tb testing.TB, text string) []int32 {
 	//    所以倒着遍历。(run() 那几档不看次序, 所以从前没暴露过这件事。)
 	for k := len(n.spans) - 1; k >= 0; k-- {
 		sp := n.spans[k]
-		id := sp.Index
+		id := sp.ReIndex
 		p := sp.Lo // 这条游程最左的那个左端 = 游标右边最靠左的起点
 		if p < n.cov[id] {
 			continue // 落在上一处命中里面 ⟹ 旧口径不会从这里再起一处
@@ -575,9 +575,9 @@ func TestSpanPerf_NoAlloc(t *testing.T) {
 	defer alloc.Close()
 	text := benchCorpus("few")
 
-	var spans []setSpan_t
-	if err := fwd.FindAllIndex(text, alloc, func(i, lo, hi int32) {
-		spans = append(spans, setSpan_t{i, lo, hi})
+	var spans []RegexpSet_FindAllIndex_Run_t
+	if err := fwd.FindAllIndex(text, alloc, func(runs []RegexpSet_FindAllIndex_Run_t) {
+		spans = append(spans, runs...)
 	}); err != nil {
 		t.Fatalf("热身 FindAllIndex: %v", err)
 	}
@@ -586,7 +586,7 @@ func TestSpanPerf_NoAlloc(t *testing.T) {
 	}
 
 	// FindAllIndex: 回调什么都不做 (往切片里 append 是【调用方】的分配, 不是库的)。
-	nop := func(_, _, _ int32) {}
+	nop := func(_ []RegexpSet_FindAllIndex_Run_t) {}
 	if n := testing.AllocsPerRun(50, func() {
 		if err := fwd.FindAllIndex(text, alloc, nop); err != nil {
 			t.Fatalf("FindAllIndex: %v", err)
@@ -598,7 +598,7 @@ func TestSpanPerf_NoAlloc(t *testing.T) {
 	// ResolveSpan: 正向 set 扫出来的右端, 拿反向 set 解析。
 	if n := testing.AllocsPerRun(50, func() {
 		for _, sp := range spans {
-			if _, _, err := rev.ResolveSpan(text, sp.Hi, sp.Index); err != nil {
+			if _, _, err := rev.ResolveSpan(text, sp.Hi, sp.ReIndex); err != nil {
 				t.Fatalf("ResolveSpan: %v", err)
 			}
 		}
