@@ -199,7 +199,7 @@
         ms.SetWanted(mask)                  // 哪几条要位置 (只当 bool 用的那几条别攒), 默认全要
         ms.Scan(body)                       // ← 唯一一遍全文。之后 Hit(i)/HitIDs() 就是门那张 bool 表
         spans, ok, _ := ms.AppendMatches(buf[:0], id)   // 扁平 (lo,hi) 对; 结果扫那一遍就算好了
-        // ok==false: 这一条拿不到 (不在 wanted / 能匹配空串 / 口径不安全 /
+        // ok==false: 这一条拿不到 (不在 wanted / 能匹配空串 /
         //            反向编不出来 / 游程乱序 / DFA 预算不够)
         //            → 照老路 re.FindAllStringIndex
       左端怎么补, 看 PatternLenRange 的两档 (patlen.go, 建集期用 Go 的 regexp/syntax 解析一次):
@@ -238,9 +238,18 @@
          它买不到性能: 真表 6.4MB 上全开 1.82×, 只留定长档 1.18×, 等于把三分之二的收益
          交出去换一个"仍然要调用方自己判断哪条能用"的开关。要逐字节等价请走窗口版
          FindAll (给 cre2_match_at 补 endpos), 那条路不需要静态闸, 见 doc/plan12 §9.5。
-      🔴 PatternLeftmostLongestSafe 只挡掉最凶的一类 (惰性量词 · 不等长交替 —— 后者会让短分支
-         结在长分支【内部】, abc|b 撞 "abc" 会把 [0,3) 整个吞掉只给 [1,2))。它是【必要不充分】
-         条件: 挡住之后变长档仍然不等于 FindAll, 见上面两个反例。
+      🔴 变长档给的是【第三种口径】, 既不是 leftmost-first (贪心 / FindAll), 也不是
+         leftmost-longest (POSIX / re.Longest())。随机撒 3000 条变长 pattern × 40 段正文
+         = 12 万处对账: 与 FindAll 相同 119940, 与 Longest 相同 119972, 两个都不是 28。
+         根子在这一遍扫描给的是【右端集合】, 里面没有 (起点,终点) 的配对信息, 也没有优先序
+         —— RE2 的贪心就活在 NFA 指令优先序里 (kFirstMatch 撞到 Match 就 break 截掉低优先级
+         线程), kLongestMatch 把每段 sort 掉, kManyMatch 连 Mark 都没有。要"所有右端"就只能用
+         kManyMatch, 而它正是把优先序扔得最干净的那个。配对只能在 Go 这侧靠游标启发式重建。
+      🔴 2026-08-25 删掉了 PatternLeftmostLongestSafe 那道静态闸。它想挡住"最长 ≠ 贪心"的
+         pattern, 但只查 OpAlternate —— 而 ? * + {m,n}(min≠max) 同样是长度不齐的交替
+         ((?:ab)? 就是 ab|), 上面 (?:ab)?[bc]{1,2} 和 (?:ab)*b{1,3} 两个反例都是它放行的。
+         把口子堵严的话它就退化成 min == max 本身, 也就是变长快路整个清空。既然兑现不了
+         "等于 FindAll"这个承诺, 就不该拿 8 倍的钱去买: 真表上闸装着 1.82×, 拆掉 15.03×。
       🔴 【只在同一条 pattern 内部去重, 跨 pattern 一概不合并】: 两条 pattern 撞在同一片正文上
          不是重复, 是两个问题各要一个答案 (带空格的和不带空格的两条, 下游正是靠"这段里有没有
          空格"分流; 合了就是漏检)。这条在真表上量过 (doc/plan12/20260825_209re2setNoOverlap.txt):
@@ -250,12 +259,13 @@
          下标在前先占, 而它自己又过不了 ValidateTWID ⟹ 这段明文护照号一条都不出 = 无声漏报。
          跨条合并是调用方的事 (engine/sd_multi_hit.go 按 prio 序 · 脱敏那层再按位置收一次)。
       实测 (真实 155 条门表 × 6.4MB 真前端产物 · 命中 47 条 · 稳态 · 生产预算 64MB):
-        整条腿 (Match+逐条 FindAll) → (Scan+按条取):  368.8ms → 202.3ms = 1.82× (兜底 19 条)
+        整条腿 (Match+逐条 FindAll) → (Scan+按条取):  369.3ms → 24.6ms = 15.03× (兜底 0 条)
         只留定长档 (87 条要位置的里只有 28 条是定长):  368.8ms → 312.1ms = 1.18×
-        🔴 收益比原来记的低很多: PatternLeftmostLongestSafe 那道静态闸挡下 12 条, 另有 25 条
-           没有长度上限 (emailRE 那种) 从原理上就接不了 —— 87 条里只有 50 条 (57%) 走快路,
-           退回去的那几条照样对整篇正文跑 FindAll。这一节以前写的 14× 是加闸之前量的, 作废。
-        这张表上两档的结果碰巧【逐处全等】(74249 处逐字节相同, 0 处变长 / 0 处错边界 / 0 处丢)
+        🔴 中间有一版装着 PatternLeftmostLongestSafe 静态闸, 它挡下 12 条, 那 12 条照样对
+           整篇正文跑 FindAll, 于是只有 1.82× —— 177ms 全花在这 12 条的兜底上。闸删掉之后
+           回到 15.03×。剩下唯一接不了的是 25 条【没有长度上限】的 (emailRE 那种), 没有 maxL
+           就框不出回看窗口; 它们不进 SetWanted 的位置档, 不影响这个数。
+        这张表上新旧两腿的结果【逐处全等】(31379 处命中, 假匹配 0 · 没覆盖到 0 · 自重叠 0)
         —— 因为这些是身份证/IBAN 那种刚性格式。但那是这张表这份语料的性质, 不是保证。
         分段:  门 Match 18.6ms · 同一遍收游程 18.7ms (位置白送) · Scan 全套 33.8ms
         内存:  进程 VmHWM 107.2MB → 108.1MB (+0.9MB) · Go 分配 4.0MB/2252 obj → ~0/146 obj

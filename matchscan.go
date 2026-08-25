@@ -52,10 +52,10 @@
 //
 // 🔴 这套推进【只有在起点随右端单调不减时】才等于 FindAll。反例: abc|b 撞 "abc" 的右端是
 //    2 和 3 —— 右端 2 回推到起点 1 ("b"), 当场吐 [1,2) 把 cur 推到 2, 右端 3 那个真正的
-//    [0,3)="abc" 就因为起点 0 < cur 被永远跳过, 【无声漏掉】。造出这种非单调的只有交替:
-//    一条更短的分支在另一条更长分支的【内部】结束。所以 PatternLeftmostLongestSafe 把
-//    "分支不等长的交替"整个挡在门外 (它同时也挡住了下面那个取最长的口子), 挡不住的都
-//    走老路。TestMatchScanStrictVsFindAll 用随机语料把"逐字节等于 FindAll"钉住。
+//    [0,3)="abc" 就因为起点 0 < cur 被永远跳过, 【无声漏掉】。
+//    造出这种非单调的是"一条更短的分支结在另一条更长分支【内部】"—— 交替 (abc|b) 会,
+//    而 ? * + {m,n}(min≠max) 也都是【长度不齐的交替】: (?:ab)? 就是 ab| 。所以这件事
+//    在整个变长档上是常态, 不是某几条 pattern 的毛病。
 //
 // 🔴 【只在同一条 pattern 内部去重, 跨 pattern 一概不合并】。两条 pattern 在同一片正文上各自
 //    命中不是重复, 是两个问题各要一个答案 (带空格的和不带空格的两条 pattern, 下游正是靠
@@ -75,25 +75,42 @@
 //	                         "从左往右贪心取不相交", 那正是 FindAll 的规则。
 //	                         回归钉在 TestMatchScanStrictVsFindAll + 6 万条随机定长 pattern 对拍。
 //
-//	变长档 (min < max)       【不保证】和 FindAll 挑的是同一处, 只保证 ① text[Lo:Hi] 是真匹配
-//	                         ② 同一条的区间互不相交、按 Lo 升序 ③ 不丢召回。两个口子:
+//	变长档 (min < max)       【第三种口径】, 既不是 leftmost-first (贪心 / FindAll), 也不是
+//	                         leftmost-longest (POSIX / re.Longest())。只保证三条:
+//	                         ① text[Lo:Hi] 是这条 pattern 的一个【真匹配】
+//	                         ② 同一条吐的区间互不相交、按 Lo 升序
+//	                         ③ 有匹配的地方一定吐点什么 (不整段静默)
 //
-//	  取最长 ≠ 贪心先撞上   贪心量词是【按优先序回溯】不是【全局最长】。x{1,3}[a-c]?(?:ab|cd)?
-//	                        撞 "xab": FindAll 让 [a-c]? 先吃掉 'a' 给 [0,2)="xa", 而最长是
-//	                        [0,3)="xab" (让 [a-c]? 空手, 交给 (?:ab|cd)?)。两个都是真匹配。
-//	  起点未必随右端单调     (?:ab)?[bc]{1,2} 撞 "axbabbyxx": 右端 5 回推到起点 4 吐 [4,6)="bb",
-//	                        而 FindAll 从 3 起手给 [3,6)="abb" —— 更靠右的右端配了更靠左的起点,
-//	                        游标已经推过去了就回不来。
+// 🔴 为什么必然是第三种, 而不是"选一个模式就行"—— 这一遍扫描给的是【右端集合】
+//    {e | 存在某个 s 使 text[s:e] 匹配}, 里面【没有】(起点,终点) 的配对信息, 也【没有】
+//    优先序: RE2 的贪心就活在 NFA 指令的优先序里 (re2_dfa.cc:1197 kFirstMatch 撞到 Match
+//    就 break, 把后面低优先级的线程整段截掉), 而 kLongestMatch 干脆把每段 std::sort 掉
+//    (:1272), kManyMatch 连 Mark 都没有、整串 sort (:1289) —— 我们要"所有右端"就只能用
+//    kManyMatch, 而它正是把优先序扔得最干净的那个。一遍搜索本来也只吐【一个】右端
+//    (want_earliest_match 第一处就 return :2562, 否则跑完取 lastmatch :2631)。
+//    所以"拿到全部右端"和"贪心/最长"是互斥的, 配对只能在 Go 这侧用游标启发式【重建】,
+//    重建出来的就是上面那第三种。
 //
-// 🔴 这两个口子上给出来的段【是真匹配但比 FindAll 那一处长/短/偏】。对于拿这一段去过校验位的
-//    下游 (身份证 · IBAN mod-97 · Luhn), 边界差一个字节就是校验失败 = 无声漏报 —— 比"没检测到"
-//    更难查。要"和老路逐字节一致"的调用方只能挑定长档用: 变长条的位置别拿去切片再判。
+//    实测 (随机撒 3000 条变长 pattern × 40 段正文 = 12 万处对账):
+//      与 FindAll(贪心) 相同  119940 / 120000
+//      与 Longest(最长) 相同  119972 / 120000
+//      两个都不是                 28 / 120000
+//    差的那些长这样:
+//      x{1,3}[a-c]?(?:ab|cd)?  撞 "xab"        本路 [0,3)="xab"   FindAll [0,2)="xa"
+//      (?:ab)?[bc]{1,2}        撞 "axbabbyxx"  本路 [4,6)="bb"    FindAll [3,6)="abb"
+//      (?:ab)*b{1,3}           撞 "yaxyabbbb"  本路 [5,8)+[8,9)   FindAll [4,9)="abbbb"
 //
-// PatternLeftmostLongestSafe (patlen.go) 只挡掉最凶的那一类 (惰性量词 · 不等长交替 ——
-// 后者会让短分支结在长分支【内部】, 整个长匹配被游标吞掉), 它是【必要不充分】条件:
-// 挡住之后变长档仍然不等于 FindAll, 见上面两个反例。
+// 🔴 差出来的段【是真匹配, 但比 FindAll 那一处长/短/偏】。对于拿这一段去过校验位的下游
+//    (身份证 · IBAN mod-97 · Luhn), 边界差一个字节就是校验失败 = 无声漏报 —— 比"没检测到"
+//    更难查。所以: 要"和老路逐字节一致"的调用方【只准用定长档】; 变长档的位置只能当
+//    "这附近有东西"的定位用, 别切片再判。
 //
-// ok=false 的那几条 (没在 SetWanted 里 / 能匹配空串 / 口径不安全 / 反向编不出来 /
+//    (曾经有过一道 PatternLeftmostLongestSafe 静态闸, 想把"最长 ≠ 贪心"的 pattern 挡在
+//     门外。2026-08-25 删掉了: 它只查 OpAlternate, 而 ? * + {m,n} 同样是长度不齐的交替,
+//     把口子堵严的话它就退化成 min == max 本身 —— 也就是变长快路整个清空。既然它兑现不了
+//     "等于 FindAll"这个承诺, 就不该拿 8 倍的钱去买: 真表上闸装着 1.82×, 拆掉 15.01×。)
+//
+// ok=false 的那几条 (没在 SetWanted 里 / 能匹配空串 / 反向编不出来 /
 // 游程乱序 / DFA 预算不够) 请调用方照老路对它跑 FindAll ——
 // 库这边宁可退回去也不给一个"像是对的"答案。
 //
@@ -127,7 +144,7 @@ type MatchScanner struct {
 type msPat_t struct {
 	inited bool
 	fixed  bool
-	bad    bool // 补不出左端 (能匹配空串 / 反向编不出来 / 游程乱序 / 口径不安全) → 调用方走老路
+	bad    bool // 补不出左端 (能匹配空串 / 反向编不出来 / 游程乱序) → 调用方走老路
 	minL   int32
 	rev    *RegexpSet
 	cur    int32 // 已吐出去的最右字节
@@ -230,13 +247,8 @@ func (m *MatchScanner) feed(i int, lo, hi int32) {
 		p.minL = int32(minL)
 		p.fixed = minL == maxL && maxL >= 0
 		if !p.fixed {
-			// 变长: 右端要靠 ResolveSpan 取【最长】。只有"最长 == FindAll 那一处"的
-			// pattern 才敢这么给 —— 惰性量词 / 不等长交替上最长会比 FindAll 长一截,
-			// 下游拿这一段过校验位就是无声漏报 (patlen.go PatternLeftmostLongestSafe)。
-			if !m.set.LeftmostLongestSafe(i) {
-				p.bad = true
-				return
-			}
+			// 变长: 起点靠这一条自己的反向 set 锚定回推。给出来的口径不是 FindAll ——
+			// 见文件头"变长档"那一节, 调用方自己判断能不能用。
 			if p.rev = m.set.reverseOne(i); p.rev == nil {
 				p.bad = true
 				return

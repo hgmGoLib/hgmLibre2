@@ -122,15 +122,17 @@ func TestMatchScanUnboundedTail(t *testing.T) {
 	}
 }
 
-// TestMatchScanStrictVsFindAll —— 随机语料上的差分对账, 口径是【逐字节等于 FindAll】。
+// TestMatchScanStrictVsFindAll —— 随机语料上的差分对账。两档两个口径, 按 PatternLenRange 分:
 //
-// 为什么口径要这么硬: 消费点拿到区间是要 text[Lo:Hi] 去过校验位的 (身份证 / IBAN mod-97 /
-// 银行卡 Luhn)。相交但边界不同 = 那一段过不了校验 = 无声漏报, 比"没检测到"更难查。
-// 所以凡是 ok=true 的条必须逐处相同; 给不出这个保证的条必须【自己承认】(ok=false),
-// 交回调用方走老路 —— 那正是 PatternLeftmostLongestSafe 在挡的两类:
-//   ab|abcd  分支不等长的交替: FindAll 是 leftmost-first 取 "ab", 取最长会给 "abcd";
-//            更糟的是 abc|b 那种短分支结在长分支【内部】的, 游标会把长的整个漏掉。
-//   a.*?b    惰性量词: 语义就是能短就短, 与最长正相反。
+//	定长 (min == max)  【逐字节等于 FindAll】。这一档是可以论证的 (右端定了起点就唯一),
+//	                   也是唯一能拿去切片过校验位 (身份证 / IBAN mod-97 / Luhn) 的一档。
+//	变长 (min < max)   只钉三条: ① 每段都是真匹配 ② 互不相交且升序 ③ FindAll 命中的每一处
+//	                   都被盖到 (不整段静默)。边界【允许】和 FindAll 不同 —— 这一档给的既不是
+//	                   贪心也不是最长, 见 matchscan.go 文件头"变长档"。
+//
+// 2026-08-25 之前这里是"变长条要么逐字节相同、要么自认 ok=false", 靠 PatternLeftmostLongestSafe
+// 那道静态闸兜。闸删掉了 (它兑现不了这个承诺: ? * + {m,n} 同样是长度不齐的交替, 堵严就退化成
+// min == max), 于是口径改成上面这样 —— 承诺缩到真做得到的范围里。
 func TestMatchScanStrictVsFindAll(t *testing.T) {
 	pats := []string{
 		`[A-Z]\d{3}`,
@@ -138,14 +140,25 @@ func TestMatchScanStrictVsFindAll(t *testing.T) {
 		`q[0-9a-z]{3,}q`,
 		`[\x{4e00}-\x{9fff}]{2,4}`,
 		`w+x`,
-		`ab|abcd`, // 🔴 故意放一条不安全的: 它必须落进 unresolved, 不许硬给答案
+		`ab|abcd`,
 		`\b[A-F0-9]{8}\b`,
 		`x[a-f]{1,4}y`,
 		`[a-f]{2}-[a-f]{2,4}`,
+		`[a-f]{4}`,
+		`\d{3}-\d{4}`,
+		`[A-Z]{2}\d{2}[a-f]{2}`,
+		`[a-f]*`, // 🔴 能匹配空串: 必须自认 ok=false 交回老路, 不许硬给答案
 	}
-	// 没有长度上限的那两条 (q…q · w+x) 本来就只保证"真匹配 + 不相交", 不进逐字节那一档。
-	unbounded := map[int32]bool{2: true, 4: true}
-	wantUnres := map[int32]bool{5: true}
+	// 分档就按长度区间算, 别再手写下标 —— 加一条 pattern 不用回来改这里。
+	fixed := make([]bool, len(pats))
+	wantUnres := map[int32]bool{}
+	for i, p := range pats {
+		lo, hi := PatternLenRange(p)
+		fixed[i] = lo == hi && hi >= 0
+		if lo <= 0 {
+			wantUnres[int32(i)] = true
+		}
+	}
 
 	set, err := NewRegexpSet(pats)
 	if err != nil {
@@ -184,7 +197,7 @@ func TestMatchScanStrictVsFindAll(t *testing.T) {
 			}
 			if wantUnres[int32(id)] {
 				if ok && len(f) > 0 {
-					t.Fatalf("轮 %d: #%d %q 口径不安全, 必须 ok=false 交回老路, 却给了 %v",
+					t.Fatalf("轮 %d: #%d %q 能匹配空串, 必须 ok=false 交回老路, 却给了 %v",
 						round, id, pats[id], f)
 				}
 				continue
@@ -205,8 +218,8 @@ func TestMatchScanStrictVsFindAll(t *testing.T) {
 				prev = f[k+1]
 			}
 			old := std[id].FindAllStringIndex(text, -1)
-			if unbounded[int32(id)] {
-				// 没上限那一档: 只要 FindAll 的每一处都被覆盖到 (不丢召回)。
+			if !fixed[id] {
+				// 变长档: 只要 FindAll 的每一处都被覆盖到 (不整段静默), 边界允许不同。
 				for _, loc := range old {
 					hit := false
 					for k := 0; k+1 < len(f); k += 2 {
@@ -223,7 +236,7 @@ func TestMatchScanStrictVsFindAll(t *testing.T) {
 				nLoose += len(old)
 				continue
 			}
-			// 有上限那一档: 逐字节相同。
+			// 定长档: 逐字节相同。
 			if len(f) != 2*len(old) {
 				t.Fatalf("轮 %d: #%d %q 处数不同: 新 %d 处 %v · FindAll %d 处 %v\n正文 %q",
 					round, id, pats[id], len(f)/2, f, len(old), old, text)
