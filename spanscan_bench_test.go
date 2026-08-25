@@ -127,12 +127,12 @@ var benchCorpusKinds = []string{"zero", "few", "most"}
 var (
 	benchObjOnce sync.Once
 	benchFwdSet  *RegexpSet
-	benchRevSet  *RegexpSet
+	benchRevSet  *RegexpSetReverse
 	benchRes     []*Regexp
 	benchObjErr  error
 )
 
-func benchObjects(tb testing.TB) (fwd, rev *RegexpSet, res []*Regexp) {
+func benchObjects(tb testing.TB) (fwd *RegexpSet, rev *RegexpSetReverse, res []*Regexp) {
 	benchObjOnce.Do(func() {
 		benchFwdSet, benchObjErr = NewRegexpSet(benchPats)
 		if benchObjErr != nil {
@@ -206,12 +206,16 @@ func (o *benchOld) run(text string) []int32 {
 
 // benchNew 是新那一套的可复用工作区: 扫一个方向, 解析另一个方向。
 type benchNew struct {
-	scanSet *RegexpSet // 扫描用
-	resSet  *RegexpSet // 解析用 (另一个方向)
-	forward bool       // 扫的是不是正向 set (正向 set 吐右端)
-	bound   int32      // 解析时的回看上限 (0 = 不限)
-	sc      *SpanScanner
-	spans   []SetSpan
+	forward bool  // 扫的是不是正向 set (正向 set 吐右端)
+	bound   int32 // 解析时的回看上限 (0 = 不限)
+	// 正反已经是两个类型了, 所以方向在建工作区的时候就收进这两个闭包 ——
+	// 下面推进那段代码一个字都不用分方向。
+	scan    func(text string, fn func(reIndex, lo, hi int32)) error
+	resolve func(text string, from, bound, id int32) (int32, bool, error)
+	// 峰值那条测试要分别报"扫描 set"和"解析 set"的水位, 所以也一起收进来。
+	scanMem func() SetMemInfo
+	resMem  func() SetMemInfo
+	spans   []setSpan_t
 	out     []int32
 	cov     []int32 // runCov 用: 每条 pattern 上一处已解析命中的【内侧边界】
 }
@@ -234,29 +238,39 @@ func newBenchNew(tb testing.TB, forward bool) *benchNew {
 	return newBenchNewOn(tb, forward, fwd, rev)
 }
 
-func newBenchNewOn(tb testing.TB, forward bool, fwd, rev *RegexpSet) *benchNew {
+func newBenchNewOn(tb testing.TB, forward bool, fwd *RegexpSet, rev *RegexpSetReverse) *benchNew {
 	n := &benchNew{forward: forward}
-	var err error
 	if forward {
-		n.scanSet, n.resSet = fwd, rev
+		alloc, err := newFindAllIndexAlloc(fwd, 256)
+		if err != nil {
+			tb.Fatalf("NewFindAllIndexAlloc: %v", err)
+		}
+		n.scan = func(text string, fn func(reIndex, lo, hi int32) ) error {
+			return fwd.FindAllIndex(text, alloc, fn)
+		}
+		n.resolve = rev.ResolveSpanWithin
+		n.scanMem, n.resMem = fwd.MemInfo, rev.MemInfo
 	} else {
-		n.scanSet, n.resSet = rev, fwd
-	}
-	n.sc, err = n.scanSet.NewSpanScanner(256)
-	if err != nil {
-		tb.Fatalf("NewSpanScanner: %v", err)
+		alloc, err := newFindAllIndexAlloc(rev.s, 256)
+		if err != nil {
+			tb.Fatalf("NewFindAllIndexAlloc: %v", err)
+		}
+		n.scan = func(text string, fn func(reIndex, lo, hi int32)) error {
+			return rev.FindAllIndex(text, alloc, fn)
+		}
+		n.resolve = fwd.ResolveSpanWithin
+		n.scanMem, n.resMem = rev.MemInfo, fwd.MemInfo
 	}
 	return n
 }
 
 // scanOnly 只做定位那一步 (吐游程), 是新实现的成本下界。
-func (n *benchNew) scanOnly(tb testing.TB, text string) []SetSpan {
+func (n *benchNew) scanOnly(tb testing.TB, text string) []setSpan_t {
 	n.spans = n.spans[:0]
-	if err := n.sc.Scan(text, func(sp []SetSpan) bool {
-		n.spans = append(n.spans, sp...)
-		return true
+	if err := n.scan(text, func(reIndex, lo, hi int32) {
+		n.spans = append(n.spans, setSpan_t{reIndex, lo, hi})
 	}); err != nil {
-		tb.Fatalf("Scan: %v", err)
+		tb.Fatalf("FindAllIndex: %v", err)
 	}
 	return n.spans
 }
@@ -290,7 +304,7 @@ func (n *benchNew) run(tb testing.TB, text string, perEndpoint bool) []int32 {
 					bd = p + n.bound // 正向 set 解析: bound 是右上界
 				}
 			}
-			other, ok, err := n.resSet.ResolveSpanWithin(text, p, bd, sp.Index)
+			other, ok, err := n.resolve(text, p, bd, sp.Index)
 			if err != nil {
 				tb.Fatalf("ResolveSpan: %v", err)
 			}
@@ -347,7 +361,7 @@ func (n *benchNew) runCov(tb testing.TB, text string) []int32 {
 		if p < n.cov[id] {
 			continue // 落在上一处命中里面 ⟹ 旧口径不会从这里再起一处
 		}
-		end, ok, err := n.resSet.ResolveSpanWithin(text, p, -1, id)
+		end, ok, err := n.resolve(text, p, -1, id)
 		if err != nil {
 			tb.Fatalf("ResolveSpan: %v", err)
 		}
@@ -554,30 +568,31 @@ func TestSpanPerf_Shape(t *testing.T) {
 //    (cre2_set_resolve_span_r) + 把 more 挪进工作区之后归零。留这条测试免得再退回去。
 func TestSpanPerf_NoAlloc(t *testing.T) {
 	fwd, rev, _ := benchObjects(t)
-	sc, err := fwd.NewSpanScanner(256)
+	alloc, err := newFindAllIndexAlloc(fwd, 256)
 	if err != nil {
-		t.Fatalf("NewSpanScanner: %v", err)
+		t.Fatalf("NewFindAllIndexAlloc: %v", err)
 	}
-	defer sc.Close()
+	defer alloc.Close()
 	text := benchCorpus("few")
 
-	var spans []SetSpan
-	collect := func(sp []SetSpan) bool { spans = append(spans, sp...); return true }
-	if err := sc.Scan(text, collect); err != nil {
-		t.Fatalf("热身 Scan: %v", err)
+	var spans []setSpan_t
+	if err := fwd.FindAllIndex(text, alloc, func(i, lo, hi int32) {
+		spans = append(spans, setSpan_t{i, lo, hi})
+	}); err != nil {
+		t.Fatalf("热身 FindAllIndex: %v", err)
 	}
 	if len(spans) == 0 {
 		t.Fatalf("语料一条都没命中, 这条测试白跑了")
 	}
 
-	// Scan: 回调什么都不做 (往切片里 append 是【调用方】的分配, 不是库的)。
-	nop := func([]SetSpan) bool { return true }
+	// FindAllIndex: 回调什么都不做 (往切片里 append 是【调用方】的分配, 不是库的)。
+	nop := func(_, _, _ int32) {}
 	if n := testing.AllocsPerRun(50, func() {
-		if err := sc.Scan(text, nop); err != nil {
-			t.Fatalf("Scan: %v", err)
+		if err := fwd.FindAllIndex(text, alloc, nop); err != nil {
+			t.Fatalf("FindAllIndex: %v", err)
 		}
 	}); n != 0 {
-		t.Fatalf("Scan 每次分配 %g 笔, 要求 0", n)
+		t.Fatalf("FindAllIndex 每次分配 %g 笔, 要求 0", n)
 	}
 
 	// ResolveSpan: 正向 set 扫出来的右端, 拿反向 set 解析。
@@ -651,7 +666,7 @@ func TestSpanPerf_PeakChild(t *testing.T) {
 		for _, tx := range texts {
 			n.run(t, tx, false)
 		}
-		a, c := n.scanSet.MemInfo(), n.resSet.MemInfo()
+		a, c := n.scanMem(), n.resMem()
 		fmt.Printf("PEAK %-3s 增量=%dKB 扫描set: arena=%dKB 状态=%d 生涯建过=%d flush=%d | 解析set: arena=%dKB 状态=%d 生涯建过=%d flush=%d | 一共 2 份 DFA 缓存 (各自 %dMB 额度)\n",
 			path, (vmHWM(t)-base)>>10,
 			a.ArenaCap>>10, a.States, a.StatesBuiltTotal, a.FlushesTotal,

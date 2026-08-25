@@ -99,15 +99,20 @@
       实测 8MB 正文 + 命中落在第 0 字节: MatchAny 2.12µs vs len(Match(...))>0 11.18ms。
       与 Match 共用同一份 DFA 缓存, 不多占内存。要"哪几条"仍然用 Match —— 早退与完整命中集不可兼得。
     - CompileReverse / CompileReverseMaxMem / MustCompileReverse (类型 RegexpReverse, 方法
-      MatchString / Match / MatchStats), 整表 NewRegexpSetReverseMaxMem + set.Reverse():
+      MatchString / Match / MatchStats), 整表 NewRegexpSetReverseMaxMem (类型 RegexpSetReverse):
       【反着扫】—— 答案与 MatchString / 正向 Set 逐位相同, 但 DFA 从正文末尾往前走【原始 buffer】
       (不反转正文、不复制正文, 多字节 UTF-8 也不会被拆散: 反向程序是 RE2 编译器自己编的)。
       为的是 `S B{m,n} L` 这个形状 —— 起始类窄于重复类的计数重复, 正向 DFA 状态数对界指数,
       反向线性。实测 [A-Za-z][A-Za-z0-9]{2,19}key × 120 份 8KB 语料: 正向 35149 状态 / 5.35MB,
       反向 45 状态 / 0.01MB, 命中集一致。
       ⚠ Match 只回答"命中没有 / 哪几条命中", 不回答"在哪"。要位置别再走"命中之后正向
-      FindStringIndex 重扫整篇"那条老路 —— 用 NewSpanScanner (见下), 反向 set 直接给匹配左端,
+      FindStringIndex 重扫整篇"那条老路 —— 用 FindAllIndex (见下), 反向 set 直接给匹配左端,
       再用正向 set 的 ResolveSpan 取右端, 第二遍只碰命中那一段。
+      🔴 正向 RegexpSet 和反向 RegexpSetReverse 是【两个类型】, 不是一个类型上的 Reverse() 开关
+      (2026-08-25 拆的; 单条那边 Regexp / RegexpReverse 本来就是两个)。理由三条: 两份完全不同的
+      DFA 状态缓存混在一个对象里 MemInfo() 说不清是哪份; 两边贵法差三个数量级 (155 条表扫 6.4MB:
+      正向 18ms 零 flush, 反向 65 秒 · arena 顶满 254MB 还在 flush), 藏在 bool 后面看不见; 两边
+      吐的位置【含义相反】(右端 vs 左端), 同名方法返回意思相反的数字最容易写错。
       ⚠ 方向是【每条 pattern 各自】的决定: (?s).{20}key 正向 21 状态 / 反向 1,
       key(?s).{20} 正好反过来。拿真语料各建一个单条 set 比 MemInfo().States 就知道该往哪边放。
       ⚠ 这跟"自己把 pattern 倒着写 + 把正文倒过来"不是一回事, 而且库这条更省: RE2 的 Simplify
@@ -142,9 +147,13 @@
       Match/MatchAny/MatchBytes/MatchAnyBytes 不返回 error: Compile 过了之后运行期 DFA 不会爆
       (RE2 对 set 的 DFA 只 flush 缓存不 bail; 且 CompileSet 编译期就跑过 DFA 冒烟测试) —— 依据与
       实测见 README.md 的 "Why Match has no error return"。
-    - RegexpSet.NewSpanScanner + (*SpanScanner).Scan / ScanBytes / AppendSpans:
-      【流式游程扫描】—— Match 只回答"哪几条命中", 这个回答"命中在哪"。位置本来就在 DFA
-      热循环里算出来了 (lastmatch), 上游只是把它丢掉; 这套 API 把它收下来吐给调用方。
+    - RegexpSet.FindAllIndex / RegexpSetReverse.FindAllIndex (+ NewFindAllIndexAlloc,
+      工作区类型 RegexpSet_FindAllIndex_Alloc_t, 另有 FindAllIndexBytes):
+      【一遍扫正文, 边扫边说命中端点在哪】—— Match 只回答"哪几条命中", 这个回答"命中在哪"。
+      位置本来就在 DFA 热循环里算出来了 (lastmatch), 上游只是把它丢掉; 这套 API 把它收下来。
+        alloc, _ := set.NewFindAllIndexAlloc()          // 热路径上建一次留着; 不是并发安全的
+        set.FindAllIndex(body, alloc, func(ReIndex, endLo, endHi int32) { … })
+        // 反向: rev.FindAllIndex(body, ralloc, func(ReIndex, startLo, startHi int32) { … })
       为什么值得: 原来要位置只能"拿到 index 之后, 对那几条各跑一次 FindStringIndex", 每跑一次
       就是【又扫一遍整篇正文】, 而且用的是非锚定正则 —— .*? 前缀让"哪个位置能当匹配起点"
       变成"每个位置都能", 那正是状态数指数增长的引信 (见 doc/状态数为什么会相乘.txt:
@@ -152,27 +161,43 @@
       锚定的 \A(?:pat) —— 起点只剩一个, 走不通当场 DeadState 收工, 那套爆炸机制从根上不存在。
       🔴 第二遍【必须锚定】才有这一半收益。继续拿原来那条非锚定正则去扫 text[start:],
       .*? 前缀会让它一路扫到正文末尾, 省下来的只有 start 之前那一截, 状态照建不误。
-      吐的是【游程】(Index, Lo, Hi) 不是逐个位置: kManyMatch 的 DFA 在每一个能结束匹配的位置
-      都报一次, 一条可变长 pattern 会连出一串 (`[a-z]{3,}` 撞 "abcdef" 在 3/4/5/6 各报一次),
+      吐的是【端点游程】(ReIndex, lo, hi) 不是逐个位置: kManyMatch 的 DFA 在每一个能结束匹配的
+      位置都报一次, 一条可变长 pattern 会连出一串 (`[a-z]{3,}` 撞 "abcdef" 在 3/4/5/6 各报一次),
       按 pattern 把连号的收敛成一段再吐。正向 set 给的是匹配【右端】(不含), 反向 set 给的是
-      【左端】(含); 恒 Lo <= Hi (原文坐标)。
+      【左端】(含); 【两端都含】的闭区间, 恒 lo <= hi (原文坐标)。
+      🔴 闭区间不是笔误: 这三个数不是一个区间, 是"一串端点"的收敛写法, hi 是一个真端点。
+      写成半开就得记住 hi 算不算, 而那正是最容易错的地方。参数名也直说是哪一端
+      (endLo/endHi vs startLo/startHi), 不叫 Lo/Hi。
       🔴 两端都给是【必须】的, 不能只留一端: `ab|c` 撞 "abc" 的两个 end 是 2 和 3 —— 连号,
-      只留 3 就把 [0,2) 那个匹配悄悄弄丢了, 而且不报错。展开 [Lo,Hi] 就能无损还原逐个位置。
+      只留 3 就把 [0,2) 那个匹配悄悄弄丢了, 而且不报错。展开 lo..hi 就能无损还原逐个位置。
       🔴 顺序【不保证】全局按位置升序 (游程要等"这条再次命中且不连号"或"整篇扫完"才收口,
-      不同 pattern 会交错)。要有序自己排 —— 排的是游程条数, 不是位置数。
+      不同 pattern 会交错)。但【同一条 pattern 内部】是升序的 —— 上面那层 MatchScanner 的游标
+      就靠这条。要全局有序自己排, 排的是游程条数不是位置数。
       🔴 语义【不是】FindAllStringIndex: 那个只给 leftmost-first 的不重叠序列, 这里给的是
       所有 pattern 的所有匹配端点, 重叠的也在里面 (`abcd|bc` 撞 "abcd" 两条都报)。要取舍
-      (优先级贪心 / 相交即丢 / …) 是调用方的业务规则, 库这层不替它决定。
-      形态是"取一批再要一批"(sqlite3_step 式) 而不是一次吐完: 游程条数没有上界, 一次吐完
-      要么无界攒内存, 要么"缓冲不够就扩容重跑"—— 重跑付的正是最贵的那一遍 (新正文现造状态,
-      同档 0-flush 下 23.7ms/份 vs 重扫 0.36ms/份 = 66 倍)。攒满一批就挂起 (按内容存下 DFA
-      状态、放掉缓存读锁), 取走再进去接着扫; 挂起期间一把锁都不持有, 也不持有调用方指针。
-      SpanScanner 是可复用工作区, 热路径上建一次长期留着; 【不是并发安全的】—— 一个 goroutine
-      一个 (同一个 Set 上开多个 scanner 并发扫没问题, Set 本身只读)。
+      (优先级贪心 / 相交即丢 / …) 是调用方的业务规则, 库这层不替它决定 —— 要成品区间用
+      NewMatchScanner (见下)。
+      🔴 给的是【回调】不是数组: 游程条数没有上界 (真表约 30741 条/MB, 200MB body = 47MB),
+      攒成数组等于让内存跟着正文长度走。回调让调用方当场消费完, 库这边只留一个固定缓冲。
+      代价是每条游程一次间接调用 —— 6.4MB / 19.7 万条游程上实测整条链路 24.6ms → 25.2ms
+      (+2.4%), 结果逐处不变。
+      alloc 是什么: native 那层是 sqlite3_step 式的, 攒满一批 (4096 条 / 48KB) 就【挂起】——
+      按内容存下 DFA 状态、放掉缓存读锁、返回给 Go, 取走再进去接着扫。挂起期间一把锁都不持有
+      (换成"C 直接回调进 Go"就得攥着读锁跑 Go 代码, 谁想 flush 谁等着)。不能改成"缓冲不够就
+      扩容重跑": 重跑付的正是最贵的那一遍 (新正文现造状态, 同档 0-flush 下 23.7ms/份 vs
+      重扫 0.36ms/份 = 66 倍)。批大小【不是旋钮】—— 没有值得调的余地, 多个参数只是多一处能填错。
+      alloc 传 nil 也能用 (当场建一个用完就扔)。🔴 不是并发安全的, 一个 goroutine 一个;
+      也不能跨 set 用 (正反算两个 set), 串用返回 error 而不是给错答案。
+      🔴 偏移是 int32 不是 int 也不是 uint32: 宽度锁死且是 native 的原生宽度 (零转换);
+      不用无符号是因为上面那层算起点要做 end-minLen, 正文开头几个端点上这是负数 —— 有符号下
+      一眼可判, 无符号下回绕成 42 亿会【静默】通过边界检查然后在切片上炸。RE2 本来就把正文
+      卡在 2GiB。
+      ⚠ 没有"回调返 false 就地停"。只想知道"有没有命中"用 MatchAny —— 它在 RE2 那层打开
+      want_earliest_match, 比在 Go 这侧半途刹车还早收工。
       ⚠ Set 是 never_capture(true) 编的, 永远不给子组位置 —— 需要 FindAllStringSubmatchIndex
       (要 group1 的偏移) 的调用方, 这条路服务不了, 只能照旧单独跑那条正则。
-    - RegexpSet.ResolveSpan / ResolveSpanWithin / ResolveSpanBytes:
-      【锚定解析】—— 把 NewSpanScanner 吐的那【一端】补成一整段。方向跟着 set 走, 正反配成一对:
+    - RegexpSet.ResolveSpan / ResolveSpanWithin / ResolveSpanBytes (RegexpSetReverse 上同名同形):
+      【锚定解析】—— 把 FindAllIndex 吐的那【一端】补成一整段。方向跟着 set 走, 正反配成一对:
       正向 set 的 ResolveSpan(text, 左端, id) 给右端(不含); 反向 set 的给左端(含)。
       所以完整流水线是【两个方向各一个 set】: 一个负责扫出端点, 另一个负责把端点补全。
       🔴 这一步不要在 Go 那侧自己补。上面说的"第二遍必须锚定"就是这条: 拿原正则去扫
@@ -189,6 +214,10 @@
       判定用的上下文恒是【整篇正文】, 所以 \b / ^ / $ 看到的永远是真实邻居字节, 而不是
       bound 切出来的假边界 —— 掐 bound 只会让答案变短, 不会让它变错。
       无状态、只读 (自己拿 DFA 的缓存读锁), 可以和别的 goroutine 的扫描并发调。
+      🔴 补另一端【只能走这条】, 不能拿反向 FindAllIndex 去扫一遍。这里是"在一个点上问一句",
+      代价 = 这处命中能延伸多远, 1KB 和 6.4MB 的正文上一样贵; 反向扫全表在 6.4MB 上是 65 秒
+      (正向 18ms), 拆成一条一条反着扫倒是便宜, 可命中 k 条就是 k 遍全文 —— 正好是 FindAllIndex
+      存在的意义 (把 1+k 遍压成 1 遍) 原样赔回去。两个 API 长得对称, 用途不对称。
     - RegexpSet.NewMatchScanner + (*MatchScanner).SetWanted / Scan / HitIDs / Hit / AppendMatches
       + RegexpSet.PatternLenRange / PatternLenRange(pattern) / ReverseOneStats:
       【一遍扫, 直接给不重复的命中区间】—— 把上面两件 (游程扫 + 锚定解析) 拼成调用方真正要的
@@ -281,7 +310,7 @@
       对照的"旧实现"就是今天调用方那一套 —— set.Match 当门 + 逐条命中 pattern 在整篇正文上
       FindAllStringIndex (命中 k 条 = 1+k 遍全文扫描, 而且后面那 k 遍是最贵的非锚定扫描)。
       🔴 这一档的"推荐用法"只适用于【要与 FindAllStringIndex 逐字节等价】的调用方 ——
-         反向 set 扫 + 一次左到右的推进 (rev-cov, 判据抄在 SetSpan 注释里), 与 FindAll 逐处全等
+         反向 set 扫 + 一次左到右的推进 (rev-cov, 判据抄在 matchscan.go 注释里), 与 FindAll 逐处全等
          (TestSpanPerf_Shape 直接对账), 三档都不劣于旧实现:
                               0 命中     稀疏(39 处)   最坏输入(见下)
         旧实现                 93.1us      400.8us      596.0us  给 4 处
@@ -346,10 +375,10 @@
   + 状态数确实塌下来 + 方向是每条 pattern 各自的决定 + 库的反向比手写反转便宜 100 倍以上
   + 反向 DFA 放弃时退回正向且答案不变; 单条内存预算见 maxmem_test.go: 读回/编译失败/语义不变
   + "默认预算 flush、给够就 0 flush" 这条曲线;
-  流式游程扫描见 spanscan_test.go (与一个 O(n²) 暴力参考逐位对拍 —— 参考实现把前后缀按字面量
-  钉死再拿【整篇正文】去匹配, 这样 ^ $ \b 看到的是真实位置, 拿 text[s:e] 单独匹配会判出一堆
-  假命中; 外加"batch 只影响怎么吐不影响吐什么"、`ab|c` 连号游程可还原、半途 return false 之后
-  工作区能重用) · spanscan_need_test.go (按真实调用形态走完整流水线: 反向 set 拿左端 → 锚定
+  FindAllIndex 见 findallindex_test.go (与一个 O(n²) 暴力参考逐位对拍 —— 参考实现把前后缀按
+  字面量钉死再拿【整篇正文】去匹配, 这样 ^ $ \b 看到的是真实位置, 拿 text[s:e] 单独匹配会判出
+  一堆假命中; 外加"批大小只影响怎么吐不影响吐什么"、`ab|c` 连号游程可还原、同一个 alloc 反复
+  扫不串味、alloc 跨 set/Close 之后当场报错而不是给错答案) · spanscan_need_test.go (按真实调用形态走完整流水线: 反向 set 拿左端 → 锚定
   正则只跑命中那一段拿右端 → 优先级贪心相交即丢 → 一次升序替换, 并钉死边界精确到字节、
   条数不多不少、以及"锚定的在错位置当场死 / 非锚定的会一路扫过来"这个机制本身; 同一个需求
   再用 ResolveSpan 走一遍, 正向路(扫右端→求左端)与反向路(扫左端→求右端)两条互相对账) ·

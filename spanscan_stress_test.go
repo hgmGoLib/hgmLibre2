@@ -51,7 +51,7 @@ func stressText(n int) string {
 	return string(buf)
 }
 
-func spansEqual(t *testing.T, tag string, got, ref []SetSpan) {
+func spansEqual(t *testing.T, tag string, got, ref []setSpan_t) {
 	t.Helper()
 	sortSpans(got)
 	sortSpans(ref)
@@ -74,12 +74,7 @@ func TestSpanScan_FlushDuringSuspend(t *testing.T) {
 	if err != nil {
 		t.Fatalf("建参照 set: %v", err)
 	}
-	refSc, err := ref.NewSpanScanner(1 << 16)
-	if err != nil {
-		t.Fatalf("参照 scanner: %v", err)
-	}
-	defer refSc.Close()
-	want, err := refSc.AppendSpans(nil, text)
+	want, err := appendAllIndex(ref, nil, text, 1<<16)
 	if err != nil {
 		t.Fatalf("参照扫: %v", err)
 	}
@@ -94,12 +89,7 @@ func TestSpanScan_FlushDuringSuspend(t *testing.T) {
 	if err != nil {
 		t.Fatalf("建紧预算 set: %v", err)
 	}
-	sc, err := tight.NewSpanScanner(1) // 最小批: 每凑够一条就挂起一次
-	if err != nil {
-		t.Fatalf("紧 scanner: %v", err)
-	}
-	defer sc.Close()
-	got, err := sc.AppendSpans(nil, text)
+	got, err := appendAllIndex(tight, nil, text, 1) // 最小批: 每凑够一条就挂起一次
 	if err != nil {
 		t.Fatalf("紧预算扫: %v", err)
 	}
@@ -126,14 +116,9 @@ func TestSpanScan_ConcurrentScanners(t *testing.T) {
 	if err != nil {
 		t.Fatalf("建参照 set: %v", err)
 	}
-	refSc, err := ref.NewSpanScanner(1 << 16)
-	if err != nil {
-		t.Fatalf("参照 scanner: %v", err)
-	}
-	defer refSc.Close()
-	want := make([][]SetSpan, len(texts))
+	want := make([][]setSpan_t, len(texts))
 	for i, tx := range texts {
-		want[i], err = refSc.AppendSpans(nil, tx)
+		want[i], err = appendAllIndex(ref, nil, tx, 1<<16)
 		if err != nil {
 			t.Fatalf("参照扫 #%d: %v", i, err)
 		}
@@ -149,23 +134,25 @@ func TestSpanScan_ConcurrentScanners(t *testing.T) {
 		wg.Add(1)
 		go func(g int) {
 			defer wg.Done()
-			sc, err := shared.NewSpanScanner(1 + g) // 每个 goroutine 批大小不同
+			alloc, err := newFindAllIndexAlloc(shared, 1+g) // 每个 goroutine 批大小不同
 			if err != nil {
-				errCh <- "NewSpanScanner: " + err.Error()
+				errCh <- "NewFindAllIndexAlloc: " + err.Error()
 				return
 			}
-			defer sc.Close()
-			var buf []SetSpan
+			defer alloc.Close()
+			var buf []setSpan_t
 			for round := 0; round < 6; round++ {
 				i := (g + round) % len(texts)
-				buf, err = sc.AppendSpans(buf[:0], texts[i])
-				if err != nil {
-					errCh <- "Scan: " + err.Error()
+				buf = buf[:0]
+				if err := shared.FindAllIndex(texts[i], alloc, func(id, lo, hi int32) {
+					buf = append(buf, setSpan_t{id, lo, hi})
+				}); err != nil {
+					errCh <- "FindAllIndex: " + err.Error()
 					return
 				}
-				cp := append([]SetSpan(nil), buf...)
+				cp := append([]setSpan_t(nil), buf...)
 				sortSpans(cp)
-				w := append([]SetSpan(nil), want[i]...)
+				w := append([]setSpan_t(nil), want[i]...)
 				sortSpans(w)
 				if len(cp) != len(w) {
 					errCh <- "并发结果条数不一致"
@@ -202,12 +189,7 @@ func TestSpanResolve_FlushDuringResolve(t *testing.T) {
 	if err != nil {
 		t.Fatalf("建反向 set: %v", err)
 	}
-	revSc, err := rev.NewSpanScanner(1 << 16)
-	if err != nil {
-		t.Fatalf("反向 scanner: %v", err)
-	}
-	defer revSc.Close()
-	spans, err := revSc.AppendSpans(nil, text)
+	spans, err := appendAllIndexRev(rev, nil, text, 1<<16)
 	if err != nil {
 		t.Fatalf("反向扫: %v", err)
 	}
@@ -236,16 +218,16 @@ func TestSpanResolve_FlushDuringResolve(t *testing.T) {
 	if err != nil {
 		t.Fatalf("建紧预算 set: %v", err)
 	}
-	churn, err := tight.NewSpanScanner(1)
+	churn, err := newFindAllIndexAlloc(tight, 1)
 	if err != nil {
-		t.Fatalf("紧 scanner: %v", err)
+		t.Fatalf("紧 alloc: %v", err)
 	}
 	defer churn.Close()
 
 	for i, p := range pts {
 		// 每隔一段就整篇扫一遍, 把紧预算那份缓存搅乱 (顺带把起点状态冲掉)。
 		if i%1000 == 0 {
-			if _, err := churn.AppendSpans(nil, text); err != nil {
+			if err := tight.FindAllIndex(text, churn, func(_, _, _ int32) {}); err != nil {
 				t.Fatalf("搅缓存: %v", err)
 			}
 		}

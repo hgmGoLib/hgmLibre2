@@ -46,7 +46,7 @@ type RegexpSet struct {
 	//    拆成一条一个就没有这个乘法; 而且这些 set 只用来【锚定解析】、从不用来扫正文,
 	//    那条 .*? 前缀引起的状态爆炸机制从根上就不存在。
 	//    再加上惰性: 只有真命中过的那几条才会被建出来。
-	rev1   []*RegexpSet
+	rev1   []*RegexpSetReverse
 	rev1No []bool // 第 i 条试过且【建不出来】—— 记下来免得每遍扫描重编一次
 	rev1Mu sync.Mutex
 }
@@ -71,14 +71,14 @@ func (s *RegexpSet) ReverseOneStats() (n int, states, arenaCap int64) {
 
 // reverseOne 返回第 i 条 pattern 自己一条的反向 set (惰性建, 建不出来返回 nil)。
 // 只读用途 (ResolveSpan*), 并发安全。
-func (s *RegexpSet) reverseOne(i int) *RegexpSet {
+func (s *RegexpSet) reverseOne(i int) *RegexpSetReverse {
 	if i < 0 || i >= len(s.pats) {
 		return nil
 	}
 	s.rev1Mu.Lock()
 	defer s.rev1Mu.Unlock()
 	if s.rev1 == nil {
-		s.rev1 = make([]*RegexpSet, len(s.pats))
+		s.rev1 = make([]*RegexpSetReverse, len(s.pats))
 		s.rev1No = make([]bool, len(s.pats))
 	}
 	if r := s.rev1[i]; r != nil {

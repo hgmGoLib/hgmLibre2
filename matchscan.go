@@ -6,9 +6,9 @@
 // 就是 1 + k 遍全文。
 //
 // 可是位置本来就在第一遍里算出来过 —— kManyMatch 的 DFA 每走到一个能结束匹配的字节都会记一次,
-// 走完把它扔了 (这正是 NewSpanScanner 接出来的东西, 且【不额外要钱】: 同一份正文同一份 DFA
-// 缓存, 6.4MB 上实测 Match 18.5ms / 收游程 18.4ms)。MatchScanner 就是把这一遍留下来的右端
-// 补成完整区间。
+// 走完把它扔了 (这正是 FindAllIndex 接出来的东西, 且【不额外要钱】: 同一份正文同一份 DFA
+// 缓存, 6.4MB 上实测 Match 18.5ms / 收游程 18.4ms)。MatchScanner 就是把 FindAllIndex 给的
+// 右端补成完整区间 —— 它整个就是【搭在 FindAllIndex 上面的一层】, 自己不碰 native。
 //
 //	SetWanted(mask)            【哪几条要位置】。门上很多位只当 bool 用 (某某类内容在不在),
 //	                           从来没人问它在哪 —— 那几条一个字节都不该攒。默认全要。
@@ -16,7 +16,7 @@
 //	                           要位置的那几条的命中区间, 【边扫边收口】。
 //	AppendMatches(dst, id)     取第 id 条的结果 (照抄一份, 不再算)。
 //
-// 🔴 边扫边收口是【内存】上的要求, 不是风格。native 那层本来就是 sqlite3_step 式的:
+// 🔴 边扫边收口是【内存】上的要求, 不是风格。FindAllIndex 那层本来就是 sqlite3_step 式的:
 //    一批 4096 条游程 (48KB) 装满就挂起、回调给 Go、取走再进去接着扫, 缓冲循环复用, 不随
 //    正文长度涨。要是 Go 这侧把每一批都 append 攒起来等扫完再算, 那个固定缓冲就白设计了 ——
 //    实测真表上游程约 30741 条/MB (0.23MB/MB), 200MB 的 body 就是每个并发扫描 47MB。
@@ -32,7 +32,8 @@
 // ── 左端怎么补: 看 PatternLenRange 的两档 (patlen.go) ────────────────────────
 //	min == max   定长 (NRIC 9 字节 · 身份证 18 字节): Lo = Hi - min。【不进正则引擎】, 一句减法。
 //	其余         从 Hi 往左【锚定】推一次, 用【这一条 pattern 自己一条】的反向 set
-//	             (RegexpSet.reverseOne → ResolveSpanWithin), 一次调用给最靠左的那个起点。
+//	             (RegexpSet.reverseOne → RegexpSetReverse.ResolveSpanWithin), 一次调用
+//	             给最靠左的那个起点。代价 = 回看多远, 与正文长度无关。
 //	             反向编译不出来的那几条 AppendMatches 返回 ok=false, 请调用方照老路 FindAll。
 //
 // 🔴 反向必须是【一条一个 set】。整表建一个反向 set 是死路: set 里状态数是相乘的
@@ -120,7 +121,7 @@
 // 游程乱序 / DFA 预算不够) 请调用方照老路对它跑 FindAll ——
 // 库这边宁可退回去也不给一个"像是对的"答案。
 //
-// 生命周期同 SpanScanner: 可复用工作区, 热路径上建一次留着, 【不是并发安全的】。
+// 生命周期同 FindAllIndex 的 alloc: 可复用工作区, 热路径上建一次留着,【不是并发安全的】。
 // Scan 之后 text 一直被 scanner 引用着 (AppendMatches 要用), 直到下一次 Scan 或 Reset。
 package hgmLibre2
 
@@ -135,14 +136,13 @@ type SetMatch struct {
 
 // MatchScanner 是可复用工作区。用 (*RegexpSet).NewMatchScanner 开, 不用了 Close。
 type MatchScanner struct {
-	set  *RegexpSet
-	sc   *SpanScanner
-	text string
-	per  []msPat_t
-	want []bool // nil = 全要
-	hit  []bool
-	hits []int32 // 上一遍命中过的下标 (= Set.Match 那张表), 去重且只含真命中
-	err  error   // 回调里出的错 (回调没法返 error)
+	set   *RegexpSet
+	alloc *RegexpSet_FindAllIndex_Alloc_t
+	text  string
+	per   []msPat_t
+	want  []bool // nil = 全要
+	hit   []bool
+	hits  []int32 // 上一遍命中过的下标 (= Set.Match 那张表), 去重且只含真命中
 }
 
 // msPat_t 是每条 pattern 的推进状态。cur 就是那把游标, out 是已经收口的输出。
@@ -152,7 +152,7 @@ type msPat_t struct {
 	fixed  bool
 	bad    bool // 补不出左端 (能匹配空串 / 反向编不出来 / 游程乱序) → 调用方走老路
 	minL   int32
-	rev    *RegexpSet
+	rev    *RegexpSetReverse
 	cur    int32 // 已吐出去的最右字节
 	lastLo int32 // 上一条游程的左端, 用来确认升序
 	out    []int32
@@ -160,17 +160,15 @@ type msPat_t struct {
 
 // NewMatchScanner 开一个工作区。热路径上建一次长期留着, 别每次扫描新建。
 func (s *RegexpSet) NewMatchScanner() (*MatchScanner, error) {
-	// batch 开大: 每一批都是一次 cgo 往返 + 一次 DFA 状态挂起/恢复。取 155 条那种默认值
-	// (= pattern 条数) 时 6.4MB 正文上要往返 1270 次, 实测比 4096 那档慢一倍。
-	sc, err := s.NewSpanScanner(4096)
+	alloc, err := s.NewFindAllIndexAlloc()
 	if err != nil {
 		return nil, err
 	}
 	return &MatchScanner{
-		set: s,
-		sc:  sc,
-		per: make([]msPat_t, s.size),
-		hit: make([]bool, s.size),
+		set:   s,
+		alloc: alloc,
+		per:   make([]msPat_t, s.size),
+		hit:   make([]bool, s.size),
 	}, nil
 }
 
@@ -187,11 +185,11 @@ func (m *MatchScanner) wants(i int) bool {
 	return i < len(m.want) && m.want[i]
 }
 
-// Close 释放底层 SpanScanner。可重复调。
+// Close 释放底层的 FindAllIndex 工作区。可重复调。
 func (m *MatchScanner) Close() {
-	if m.sc != nil {
-		m.sc.Close()
-		m.sc = nil
+	if m.alloc != nil {
+		m.alloc.Close()
+		m.alloc = nil
 	}
 	m.text = ""
 }
@@ -199,7 +197,7 @@ func (m *MatchScanner) Close() {
 // Scan 扫 text 一遍 —— 这是【唯一】一遍全文。之后 HitIDs/Hit 就能用, 想要位置再按条问
 // AppendMatches。text 会被留住直到下一次 Scan。
 func (m *MatchScanner) Scan(text string) error {
-	if m.sc == nil {
+	if m.alloc == nil {
 		return errClosedMatchScanner
 	}
 	for _, id := range m.hits {
@@ -211,28 +209,20 @@ func (m *MatchScanner) Scan(text string) error {
 	}
 	m.hits = m.hits[:0]
 	m.text = text
-	m.err = nil
-	err := m.sc.Scan(text, func(spans []SetSpan) bool {
-		for _, sp := range spans {
-			i := int(sp.Index)
-			if i < 0 || i >= len(m.per) {
-				continue
-			}
-			if !m.hit[i] {
-				m.hit[i] = true
-				m.hits = append(m.hits, sp.Index)
-			}
-			if !m.wants(i) {
-				continue // 只当 bool 用的那几条: 到此为止, 一个字节不攒
-			}
-			m.feed(i, sp.Lo, sp.Hi)
+	return m.set.FindAllIndex(text, m.alloc, func(reIndex, endLo, endHi int32) {
+		i := int(reIndex)
+		if i < 0 || i >= len(m.per) {
+			return
 		}
-		return m.err == nil
+		if !m.hit[i] {
+			m.hit[i] = true
+			m.hits = append(m.hits, reIndex)
+		}
+		if !m.wants(i) {
+			return // 只当 bool 用的那几条: 到此为止, 一个字节不攒
+		}
+		m.feed(i, endLo, endHi)
 	})
-	if err != nil {
-		return err
-	}
-	return m.err
 }
 
 // feed 把一条游程 [lo,hi] (都是右端偏移) 喂给第 i 条的游标, 当场推进并收口。
@@ -324,7 +314,7 @@ func (m *MatchScanner) Hit(i int) bool {
 // ok=false 表示这一条这次拿不到 (没在 SetWanted 里 / 能匹配空串 / 反向编不出来 / 游程乱序)
 // —— 调用方照老路对它跑一遍 FindAll。没命中的条返回 dst 原样 + ok=true。
 func (m *MatchScanner) AppendMatches(dst []int32, id int32) (out []int32, ok bool, err error) {
-	if m.sc == nil {
+	if m.alloc == nil {
 		return dst, false, errClosedMatchScanner
 	}
 	i := int(id)

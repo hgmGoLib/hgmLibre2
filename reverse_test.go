@@ -99,12 +99,8 @@ func TestRegexpSetReverse_EquivForward(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRegexpSetReverseMaxMem: %v", err)
 	}
-	if fwdSet.Reverse() {
-		t.Fatal("NewRegexpSet 出来的 set 不该是反向的")
-	}
-	if !revSet.Reverse() {
-		t.Fatal("NewRegexpSetReverseMaxMem 出来的 set 该是反向的")
-	}
+	// (方向不再是对象上的一个 bool —— NewRegexpSet 给 *RegexpSet, NewRegexpSetReverseMaxMem
+	//  给 *RegexpSetReverse, 走错方向是【编译期】错误, 不需要运行期问一句。)
 	if revSet.GetPatternLen() != len(revEquivPatterns) {
 		t.Fatalf("GetPatternLen=%d want %d", revSet.GetPatternLen(), len(revEquivPatterns))
 	}
@@ -181,21 +177,27 @@ func revBodiesFrom(n, size int, alphabet string) []string {
 // 方向由 reversed 决定, 其余一律相同。预算给足 64MB, 免得读到的是 flush 之后的残值。
 func setStates(t *testing.T, pat string, reversed bool, bodies []string) (states int64, usedMB float64, hits int) {
 	t.Helper()
-	var s *RegexpSet
-	var err error
+	// 正反是两个类型, 所以这里收成两个闭包再往下走。
+	var match func(text string, buf []int32) []int32
+	var memInfo func() SetMemInfo
 	if reversed {
-		s, err = NewRegexpSetReverseMaxMem([]string{pat}, 64<<20)
+		s, err := NewRegexpSetReverseMaxMem([]string{pat}, 64<<20)
+		if err != nil {
+			t.Fatalf("建反向 set (pat=%q): %v", pat, err)
+		}
+		match, memInfo = s.Match, s.MemInfo
 	} else {
-		s, err = NewRegexpSetMaxMem([]string{pat}, 64<<20)
-	}
-	if err != nil {
-		t.Fatalf("建 set (pat=%q reversed=%v): %v", pat, reversed, err)
+		s, err := NewRegexpSetMaxMem([]string{pat}, 64<<20)
+		if err != nil {
+			t.Fatalf("建正向 set (pat=%q): %v", pat, err)
+		}
+		match, memInfo = s.Match, s.MemInfo
 	}
 	var buf []int32
 	for _, b := range bodies {
-		hits += len(s.Match(b, buf))
+		hits += len(match(b, buf))
 	}
-	mi := s.MemInfo()
+	mi := memInfo()
 	return mi.States, float64(mi.Used()) / (1 << 20), hits
 }
 

@@ -73,23 +73,14 @@ func TestSpanScan_RedactPipeline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("建反向 set: %v", err)
 	}
-	sc, err := set.NewSpanScanner(16)
-	if err != nil {
-		t.Fatalf("NewSpanScanner: %v", err)
-	}
-	defer sc.Close()
-
 	var starts []needSpan // 先只填 rule + lo
-	if err := sc.Scan(needText, func(spans []SetSpan) bool {
-		for _, sp := range spans {
-			// 游程要展开: [Lo,Hi] 里【每一个】值都是一个真实的匹配左端。
-			for p := sp.Lo; p <= sp.Hi; p++ {
-				starts = append(starts, needSpan{rule: int(sp.Index), lo: int(p)})
-			}
+	if err := set.FindAllIndex(needText, nil, func(reIndex, startLo, startHi int32) {
+		// 游程要展开: startLo..startHi 里【每一个】值都是一个真实的匹配左端。
+		for p := startLo; p <= startHi; p++ {
+			starts = append(starts, needSpan{rule: int(reIndex), lo: int(p)})
 		}
-		return true
 	}); err != nil {
-		t.Fatalf("Scan: %v", err)
+		t.Fatalf("FindAllIndex: %v", err)
 	}
 	if len(starts) == 0 {
 		t.Fatalf("一个左端都没扫到")
@@ -290,33 +281,26 @@ func TestSpanScan_RedactPipelineBothDirections(t *testing.T) {
 		t.Fatalf("建反向 set: %v", err)
 	}
 
-	// scanEnds 把一个 set 扫出来的游程展开成 (规则, 端点) 列表。
-	scanEnds := func(s *RegexpSet) []needSpan {
-		sc, err := s.NewSpanScanner(4)
-		if err != nil {
-			t.Fatalf("NewSpanScanner: %v", err)
-		}
-		defer sc.Close()
+	// scanEnds 把一遍扫描吐的游程展开成 (规则, 端点) 列表。
+	// 正反是两个类型, 所以这里收的是 FindAllIndex 那个方法本身。
+	scanEnds := func(find func(string, *RegexpSet_FindAllIndex_Alloc_t, func(int32, int32, int32)) error) []needSpan {
 		var out []needSpan
-		if err := sc.Scan(needText, func(spans []SetSpan) bool {
-			for _, sp := range spans {
-				for p := sp.Lo; p <= sp.Hi; p++ {
-					out = append(out, needSpan{rule: int(sp.Index), lo: int(p)})
-				}
+		if err := find(needText, nil, func(reIndex, lo, hi int32) {
+			for p := lo; p <= hi; p++ {
+				out = append(out, needSpan{rule: int(reIndex), lo: int(p)})
 			}
-			return true
 		}); err != nil {
-			t.Fatalf("Scan: %v", err)
+			t.Fatalf("FindAllIndex: %v", err)
 		}
 		return out
 	}
 
 	// resolve 把"一个端点"补成"一整段"。other 是【另一个方向】的那个 set:
 	// 正向 set 吐的右端要拿反向 set 求左端, 反过来也一样。
-	resolve := func(other *RegexpSet, ends []needSpan, endIsRight bool) []needSpan {
+	resolve := func(other func(string, int32, int32) (int32, bool, error), ends []needSpan, endIsRight bool) []needSpan {
 		out := make([]needSpan, 0, len(ends))
 		for _, e := range ends {
-			pos, ok, err := other.ResolveSpan(needText, int32(e.lo), int32(e.rule))
+			pos, ok, err := other(needText, int32(e.lo), int32(e.rule))
 			if err != nil {
 				t.Fatalf("ResolveSpan(规则 #%d, 端点 %d): %v", e.rule, e.lo, err)
 			}
@@ -374,9 +358,9 @@ func TestSpanScan_RedactPipelineBothDirections(t *testing.T) {
 	}
 
 	// 正向路: 正向 set 的端点是【右端】, 拿反向 set 求左端。
-	fwdCands := resolve(rev, scanEnds(fwd), true)
+	fwdCands := resolve(rev.ResolveSpan, scanEnds(fwd.FindAllIndex), true)
 	// 反向路: 反向 set 的端点是【左端】, 拿正向 set 求右端。
-	revCands := resolve(fwd, scanEnds(rev), false)
+	revCands := resolve(fwd.ResolveSpan, scanEnds(rev.FindAllIndex), false)
 	if len(fwdCands) == 0 || len(revCands) == 0 {
 		t.Fatalf("有一条路一个候选都没出: 正向 %d 条, 反向 %d 条", len(fwdCands), len(revCands))
 	}
