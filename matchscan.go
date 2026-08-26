@@ -10,8 +10,8 @@
 // 缓存, 6.4MB 上实测 Match 18.5ms / 收游程 18.4ms)。MatchScanner 就是把 FindAllIndex 给的
 // 右端补成完整区间 —— 它整个就是【搭在 FindAllIndex 上面的一层】, 自己不碰 native。
 //
-//	SetWanted(mask)            【哪几条要位置】。门上很多位只当 bool 用 (某某类内容在不在),
-//	                           从来没人问它在哪 —— 那几条不该为它补左端。默认全要。
+//	SetModes(modes)            【每条要什么】三态: 只要 bool / 要区间(默认, 自动分档) /
+//	                           要区间但强制走便宜那条路。全文见下一节。
 //	Scan(text, batchFn)        一遍全文。命中表 (HitIDs / Hit, 与 Set.Match 同解) 边扫边填,
 //	                           命中区间【边扫边收口、攒够一批就交出去】。
 //	                           返回 unresolved: 这几条补不出来, 请调用方走老路。
@@ -24,7 +24,7 @@
 //    两份缓冲。现在这一层【一个字节都不留】: 游标推进在回调里当场跑完, 收口出来的区间写进
 //    一块固定的 matchScanBatch 缓冲, 满了就交出去、就地复用。
 //    真表实测: 游程 196744 条 → 输出 74249 处, 而且其中 57% 的游程来自两条【只当 bool 用】的
-//    pattern, SetWanted 一挡就没了 —— 挡掉的是那几条的【左端回推】(真花钱的那步), 不只是内存。
+//    pattern, boolOnly 一挡就没了 —— 挡掉的是那几条的【端点补全】(真花钱的那步), 不只是内存。
 //
 // 🔴 交给 batchFn 的那段切片是内部缓冲【本身】, 下一批原地覆写。要留就自己 append 走。
 //
@@ -36,12 +36,53 @@
 // 错答案。🔴 作废可能发生在【已经交出去几处之后】(乱序 / DFA 中途放弃都是走到一半才知道),
 // 所以调用方对 unresolved 里的下标要把本遍已收到的结果【全丢掉】再走老路, 不能只补后半截。
 //
-// ── 左端怎么补: 看 PatternLenRange 的两档 (patlen.go) ────────────────────────
-//	min == max   定长 (NRIC 9 字节 · 身份证 18 字节): Lo = Hi - min。【不进正则引擎】, 一句减法。
-//	其余         从 Hi 往左【锚定】推一次, 用【这一条 pattern 自己一条】的反向 set
-//	             (RegexpSet.reverseOne → RegexpSetReverse.ResolveSpanWithin), 一次调用
-//	             给最靠左的那个起点。代价 = 回看多远, 与正文长度无关。
-//	             反向编译不出来的那几条进 unresolved, 请调用方照老路 FindAll。
+// ── 三态旋钮 (SetModes): 每条 pattern 要什么 ─────────────────────────────────
+//
+//	MatchScanMode_boolOnly           只要"命中没命中"。一处区间都不收口、一次端点都不补。
+//	                                 门上很多位只当 bool 用 (某某类内容在不在), 从来没人问它
+//	                                 在哪 —— 那几条不该为它花补端点的钱。
+//	MatchScanMode_span               要区间。【零值 = 默认档】。库自动分档 (下一节),
+//	                                 对外保证 leftmost-longest。
+//	MatchScanMode_spanUnsafeCursor   要区间, 但强制走路 A (便宜, 口径是第三种)。
+//	                                 举证责任在调用方, 见 SetModes 那段红字。
+//
+// 🔴 三态而不是"两张 mask"(要不要位置 × 走哪条路), 是因为 want=false 且 pathB=true 是个
+//    无意义组合 —— 两张 mask 早晚打架, 一张三态的表打不起来。
+//
+// ── 对外那条保证, 逐字读 ─────────────────────────────────────────────────────
+//
+// 默认档 (MatchScanMode_span) 交出来的区间:
+//   ① text[Lo:Hi] 是这条 pattern 的一个真匹配;
+//   ② 【同一条 pattern】吐的区间互不相交, 按 Lo 升序;
+//   ③ 口径是 leftmost-longest (= stdlib 的 re.Longest().FindAllStringIndex)。
+//
+// 三处容易读错的地方:
+//   🔴 ② 只管【单条】。两条 pattern 在同一片正文上照样重叠 —— 那不是重复, 是两个问题各要
+//      一个答案 (下面那段"只在同一条 pattern 内部去重"讲的就是这件事)。
+//   🔴 ③ 【不是】"与 FindAllStringIndex 相同"。stdlib 默认的 FindAll 是 leftmost-first
+//      (贪心), 两者在"同一起点上贪心先撞到的比最长的短"时给不同的右端。要对拍就拿
+//      Longest() 那个去对, 拿默认那个对会是【假红】。
+//   🔴 能匹配空串的 pattern 只能配 boolOnly, SetModes 当场报错 —— 不是运行时静默退化。
+//
+// ── 端点怎么补: 两条路 + 一句减法 ────────────────────────────────────────────
+//
+//	定长 (min == max)  Lo = Hi - min。【不进正则引擎】, 一句减法。两条路在定长上必然同解
+//	                   (起点唯一), 所以定长恒走这句, 档位对它不生效。
+//
+//	路 B (默认档)      从 max(cur, Hi-maxL) 起做一次【正向非锚定】搜索拿最左起点 s, 再从 s
+//	                   锚定取最长右端。恒等于 leftmost-longest (那就是它的定义), 不挑
+//	                   pattern 形状。用的是【这一条自己一条】的正向 Regexp
+//	                   (RegexpSet.forwardOne → Regexp.FindStringIndexFrom, 整串 + startpos,
+//	                   不切片 ⟹ \b / ^ / $ 看到的是真实邻字节)。
+//	                   代价: 每处命中比路 A 贵约 1.6x, 外加无上界的条目要走完空隙 ——
+//	                   各轮窗口两两不交且递增, 累加封顶 = 多扫一遍正文 (2.00x)。
+//
+//	路 A (降级档)      从 Hi 往左【锚定】推一次, 用【这一条自己一条】的反向对象
+//	                   (RegexpSet.reverseOne → RegexpSetReverse.ResolveSpanWithin), 一次调用
+//	                   给最靠左的那个起点。代价 = 回看多远, 与正文长度【无关】—— 这是它比
+//	                   B 便宜的全部原因。给的口径见下面"第三种口径"那一节。
+//
+//	两条路要的那个单条对象编译不出来的, 进 unresolved, 请调用方照老路 FindAll。
 //
 // 🔴 反向必须是【一条一个 set】。整表建一个反向 set 是死路: set 里状态数是相乘的
 //    (doc/状态数为什么会相乘.txt), 155 条的反向表在 6.4MB 正文上实测 65 秒 / arena 顶满 254MB
@@ -75,7 +116,9 @@
 //    "谁能活"要等消费点把校验位跑完才知道 —— 库这层两样都不知道。真语料上被 ≥2 条 pattern
 //    盖住的字节占已盖住字节的 55.6%, 同一字节最多被 8 条盖, 所以这是常态不是边角。
 //
-// ── 和 FindAllStringIndex 的关系: 分两档, 只有一档敢说"一样" ─────────────────
+// ── 路 A 给的是"第三种口径" (选 spanUnsafeCursor 之前必须读完这一节) ─────────
+//
+// 下面整节讲的都是【路 A】。默认档走 B, 没有这些坑 —— 代价是上一节那 1.6x / 2.00x。
 //
 //	定长档 (min == max)      与 FindAllStringIndex 【逐字节相同】, 而且是可以论证的:
 //	                         右端 e 的起点只能是 e-min (唯一), 所以"起点随右端单调"必然成立;
@@ -83,7 +126,7 @@
 //	                         "从左往右贪心取不相交", 那正是 FindAll 的规则。
 //	                         回归钉在 TestMatchScanStrictVsFindAll + 6 万条随机定长 pattern 对拍。
 //
-//	变长档 (min < max)       【第三种口径】, 既不是 leftmost-first (贪心 / FindAll), 也不是
+//	变长档 (min < max)       【第三种口径】(路 A 才有), 既不是 leftmost-first (贪心 / FindAll), 也不是
 //	                         leftmost-longest (POSIX / re.Longest())。只保证三条:
 //	                         ① text[Lo:Hi] 是这条 pattern 的一个【真匹配】
 //	                         ② 同一条吐的区间互不相交、按 Lo 升序
@@ -113,7 +156,7 @@
 //    ② 边界偏了 —— text[Lo:Hi] 拿去过校验位 (身份证 · IBAN mod-97 · Luhn) 会失败,
 //       整条真命中被调用方自己毙掉 = 无声漏报, 比"没检测到"更难查。
 //
-// 🔴 但这件事【两头 \b 一锚就没了】: word boundary 把起点钉死, 回看窗口里合法起点只剩一个,
+// 🔴 路 A 这件事【两头 \b 一锚就没了】: word boundary 把起点钉死, 回看窗口里合法起点只剩一个,
 //    "挑哪个"根本不发生。量过 (各 12 万处对账): 裸 pattern 与 FindAll 不同 60 处 (少盖 30
 //    字节 · 多盖 17 字节 · 处数变了 16 处), 换成 \b(?:…)\b 之后【0 处】。
 //    所以规矩是: 变长条【两头有锚点】(\b · ^ · $ · 固定分隔符) 才可以拿位置去切片再判;
@@ -124,15 +167,18 @@
 //     把口子堵严的话它就退化成 min == max 本身 —— 也就是变长快路整个清空。既然它兑现不了
 //     "等于 FindAll"这个承诺, 就不该拿 8 倍的钱去买: 真表上闸装着 1.82×, 拆掉 15.01×。)
 //
-// unresolved 里的那几条 (能匹配空串 / 反向编不出来 / 游程乱序 / DFA 预算不够) 请调用方
-// 照老路对它跑 FindAll —— 库这边宁可退回去也不给一个"像是对的"答案。
-// 没在 SetWanted 里的【不】进 unresolved: 那是调用方自己关掉的, 不是库补不出来。
+// unresolved 里的那几条 (单条对象编不出来 / 游程乱序 / DFA 预算不够) 请调用方照老路对它跑
+// FindAll —— 库这边宁可退回去也不给一个"像是对的"答案。
+// 配了 boolOnly 的【不】进 unresolved: 那是调用方自己关掉的, 不是库补不出来。
 //
 // 生命周期同 FindAllIndex 的 alloc: 可复用工作区, 热路径上建一次留着,【不是并发安全的】。
 // text 只在 Scan 那一遍里被引用 (补左端要读它), Scan 返回之后这一层不再持有它。
 package hgmLibre2
 
-import "errors"
+import (
+	"errors"
+	"strconv"
+)
 
 // matchScanBatch 是一批最多交出去几处命中区间。12 字节一处, 1024 处 = 12KB, 一次性的固定
 // 开销, 不随正文长度涨。跟 findAllIndexBatch 一样【不做成旋钮】—— 底下那批 4096 条游程收口
@@ -152,7 +198,7 @@ type MatchScanner struct {
 	alloc *RegexpSet_FindAllIndex_Alloc_t
 	text  string
 	per   []msPat_t
-	want  []bool // nil = 全要
+	mode  []MatchScanMode_t // 每条要什么 (见 SetModes); nil = 全走默认档
 	hit   []bool
 	hits  []int32 // 上一遍命中过的下标 (= Set.Match 那张表), 去重且只含真命中
 	bad   []int32 // 本遍作废的下标, Scan 收尾时原样还给调用方
@@ -161,17 +207,25 @@ type MatchScanner struct {
 	out  []SetMatch
 	outN int
 	fn   func([]SetMatch)
+	// findCtx 是 B 路那一步"从游标起找最左匹配"的复用 scratch (稳态零分配)。
+	findCtx *FindStringIndex_ctx_t
 }
 
 // msPat_t 是每条 pattern 的推进状态。cur 就是那把游标。
 type msPat_t struct {
 	inited bool
 	fixed  bool
-	bad    bool // 补不出左端 (能匹配空串 / 反向编不出来 / 游程乱序) → 调用方走老路
+	bad    bool // 补不出左端 (能匹配空串 / 编不出单条对象 / 游程乱序) → 调用方走老路
 	minL   int32
-	rev    *RegexpSetReverse
-	cur    int32 // 已吐出去的最右字节
-	lastLo int32 // 上一条游程的左端, 用来确认升序
+	rev    *RegexpSetReverse // 路 A 用: 反向锚定回推起点
+	cur    int32             // 已吐出去的最右字节
+	lastLo int32             // 上一条游程的左端, 用来确认升序
+
+	// ── 以下三个只给路 B ──
+	pathB bool
+	maxL  int32   // PatternLenRange 的上界; <0 = 无上界 (窗口退化成"从游标起")
+	fwd   *Regexp // 这一条自己那条正向正则, 惰性建
+	done  bool    // 从游标起整篇再没有匹配了 —— 本遍这一条到此为止
 }
 
 // NewMatchScanner 开一个工作区。热路径上建一次长期留着, 别每次扫描新建。
@@ -181,26 +235,63 @@ func (s *RegexpSet) NewMatchScanner() (*MatchScanner, error) {
 		return nil, err
 	}
 	return &MatchScanner{
-		set:   s,
-		alloc: alloc,
-		per:   make([]msPat_t, s.size),
-		hit:   make([]bool, s.size),
-		out:   make([]SetMatch, matchScanBatch),
+		set:     s,
+		alloc:   alloc,
+		per:     make([]msPat_t, s.size),
+		hit:     make([]bool, s.size),
+		out:     make([]SetMatch, matchScanBatch),
+		findCtx: NewFindStringIndex_ctx(),
 	}, nil
 }
 
-// SetWanted 声明【哪几条要位置】(下标即 pattern 下标, 长度不足的当 false)。传 nil = 全要。
-// 没要位置的那几条照样进命中表 (Hit/HitIDs), 只是一处区间都不收口、一次左端都不补 ——
-// 真表上光这一挡就去掉 57% 的游程, 而变长条的左端回推是这一层最花钱的一步。
-// 调用方那边这是【静态】信息: 哪几个门分支的消费点会问位置, 哪几个只是外层短路的 bool,
-// 建集的时候就知道。
-func (m *MatchScanner) SetWanted(mask []bool) { m.want = mask }
+// MatchScanMode_t 是【每条 pattern 要什么】。三态, 零值 = 默认档 (要区间, 自动分档)。
+// 全文见文件头"三态旋钮"那一节。
+type MatchScanMode_t string
 
-func (m *MatchScanner) wants(i int) bool {
-	if m.want == nil {
-		return true
+// MatchScanMode_span 要区间, 由库【自动分档】, 保证 leftmost-longest (定长走减法, 变长走
+// 路 B)。零值就是它 —— mask 里没显式写的那几条都是这一档。
+const MatchScanMode_span MatchScanMode_t = ""
+
+// MatchScanMode_boolOnly 只要"命中没命中", 一处区间都不收口、一次端点都不补。
+// 这几条照样进命中表 (Hit/HitIDs), 也【不】进 unresolved (是调用方自己关掉的, 不是库补不出来)。
+//
+// 🔴 这是最值钱的一档: 真表上 57% 的游程来自两条只当 bool 用的宽 pattern, 这一挡挡掉的是
+//    它们的端点补全 (真花钱的那步), 不只是内存。
+const MatchScanMode_boolOnly MatchScanMode_t = "boolOnly"
+
+// MatchScanMode_spanUnsafeCursor 要区间, 但【强制走路 A】(游标启发式)。比默认档便宜, 代价是
+// 它给的是文件头说的【第三种口径】—— 只在"起点随右端单调"时才等于 leftmost-longest。
+//
+// 🔴 名字里带 Unsafe 是认真的: 选它 = 调用方自己承担"这条 pattern 没有歧义"的举证责任
+//    (静态可论证, 或者拿对拍 + 真语料钉住)。举证不了就别选, 默认档的保证是无条件的。
+const MatchScanMode_spanUnsafeCursor MatchScanMode_t = "spanUnsafeCursor"
+
+// SetModes 声明每条 pattern 要什么 (下标即 pattern 下标, 长度不足的按零值 = 默认档)。
+// 传 nil = 全默认档。调用方那边这是【静态】信息, 建集的时候就知道, 热路径上不该每遍改。
+//
+// 🔴 能匹配空串的 pattern (PatternLenRange 的 min <= 0) 只允许配 boolOnly, 否则这里【当场
+//    报错】而不是运行时静默退回老路: 每个位置都是一处零长命中, 游标压不住, 吐出来的
+//    text[Lo:Lo] 对下游也没有意义。这种事该在建工作区的时候就被发现。
+func (m *MatchScanner) SetModes(modes []MatchScanMode_t) error {
+	for i := 0; i < len(modes) && i < len(m.per); i++ {
+		if modes[i] == MatchScanMode_boolOnly {
+			continue
+		}
+		if minL, _ := m.set.PatternLenRange(i); minL <= 0 {
+			return errors.New("re2native: match scanner pattern " + strconv.Itoa(i) +
+				" 能匹配空串, 只能配 MatchScanMode_boolOnly; pattern=" + m.set.pats[i])
+		}
 	}
-	return i < len(m.want) && m.want[i]
+	m.mode = modes
+	return nil
+}
+
+// modeOf 取第 i 条的档位 (越界 = 默认档)。
+func (m *MatchScanner) modeOf(i int) MatchScanMode_t {
+	if i < 0 || i >= len(m.mode) {
+		return MatchScanMode_span
+	}
+	return m.mode[i]
 }
 
 // Close 释放底层的 FindAllIndex 工作区。可重复调。
@@ -232,6 +323,7 @@ func (m *MatchScanner) Scan(text string, batchFn func(ms []SetMatch)) (unresolve
 		p := &m.per[id]
 		p.inited, p.fixed, p.bad = false, false, false
 		p.cur, p.lastLo = 0, 0
+		p.pathB, p.done = false, false
 		m.hit[id] = false
 	}
 	m.hits = m.hits[:0]
@@ -250,8 +342,8 @@ func (m *MatchScanner) Scan(text string, batchFn func(ms []SetMatch)) (unresolve
 				m.hit[i] = true
 				m.hits = append(m.hits, r.ReIndex)
 			}
-			if batchFn == nil || !m.wants(i) {
-				continue // 只当 bool 用的那几条: 到此为止, 一次左端都不补
+			if batchFn == nil || m.modeOf(i) == MatchScanMode_boolOnly {
+				continue // 只当 bool 用的那几条: 到此为止, 一次端点都不补
 			}
 			m.feed(i, r.Lo, r.Hi)
 		}
@@ -303,9 +395,23 @@ func (m *MatchScanner) feed(i int, lo, hi int32) {
 		}
 		p.minL = int32(minL)
 		p.fixed = minL == maxL && maxL >= 0
-		if !p.fixed {
-			// 变长: 起点靠这一条自己的反向 set 锚定回推。给出来的口径不是 FindAll ——
-			// 见文件头"变长档"那一节, 调用方自己判断能不能用。
+		// 分档就这一句: 定长恒走减法 (两条路在定长上是同一个答案, 见文件头那一节),
+		// 变长看档位 —— 默认档走 B (保 leftmost-longest), 显式降级的走 A。
+		p.pathB = !p.fixed && m.modeOf(i) != MatchScanMode_spanUnsafeCursor
+		switch {
+		case p.fixed:
+			// 定长: 起点唯一 (e-minL), 一句减法, 不进正则引擎。什么对象都不用建。
+		case p.pathB:
+			// 路 B: 只要这一条自己那条【正向】正则 + 一个长度上界当窗口。
+			// 🔴 反向对象一个都不建 —— 这正是 B 相对 A 省下的那一半。
+			p.maxL = int32(maxL) // maxL < 0 (无上界) 原样带下去, 窗口退化成"从游标起"
+			if p.fwd = m.set.forwardOne(i); p.fwd == nil {
+				m.markBad(i)
+				return
+			}
+		default:
+			// 路 A: 起点靠这一条自己的反向对象锚定回推。给出来的口径是第三种 ——
+			// 见文件头那一节, 选了 spanUnsafeCursor 的调用方自己举证。
 			if p.rev = m.set.reverseOne(i); p.rev == nil {
 				m.markBad(i)
 				return
@@ -330,6 +436,40 @@ func (m *MatchScanner) feed(i int, lo, hi int32) {
 			}
 			m.emit(i, start, e)
 			p.cur = e
+			continue
+		}
+		if p.pathB {
+			if p.done {
+				return // 从游标起整篇已无匹配, 后面的右端不必再看
+			}
+			// 窗口下界 from: 要找的是"起点 >= cur 的最左匹配"[s,E)。E 是一个右端且 E > s >= cur,
+			// 而 e 是 > cur 的最小右端 ⟹ E >= e; 又 E - s <= maxL ⟹ s >= e - maxL。
+			// 同时 s >= cur。故 s >= max(cur, e-maxL)。∎ 从这里起搜不会漏掉答案。
+			from := p.cur
+			if p.maxL >= 0 {
+				if w := e - p.maxL; w > from {
+					from = w
+				}
+			}
+			loc := m.findCtx.FindStringIndexFrom(p.fwd, m.text, int(from))
+			if loc == nil {
+				// 从 from 起没有匹配 ⟹ 从任何 >= from 的位置起也没有 (后面的 from 只增不减)。
+				p.done = true
+				return
+			}
+			start, end := int32(loc[0]), int32(loc[1])
+			// leftmost-first 与 leftmost-longest 选【同一个起点】, 只在终点上分歧 ——
+			// 所以终点这一下要重新取最长 (锚定, 代价 = 这处命中有多长)。
+			pos, ok, err := m.set.ResolveSpan(m.text, start, int32(i))
+			if err != nil {
+				m.markBad(i)
+				return
+			}
+			if ok && pos > end {
+				end = pos
+			}
+			m.emit(i, start, end)
+			p.cur = end
 			continue
 		}
 		// 🔴 bound = cur: 回看【绝不越过游标】。是正确性不是省钱, 见文件头 ②。

@@ -162,7 +162,8 @@ as `regexp.Compile` (RE2's default Perl mode), *not* leftmost-longest — e.g.
   `RegexpSet_FindAllIndex_Alloc_t`, `RegexpSet_FindAllIndex_Run_t`) — *not* in stdlib;
   one scan reporting **where** each pattern of the set can end, handed back in batches;
   see [FindAllIndex](#findallindex-the-raw-end-point-runs) below
-- `RegexpSet.NewMatchScanner` (`MatchScanner`, `SetMatch`, `Scan`, `SetWanted`, `Hit`,
+- `RegexpSet.NewMatchScanner` (`MatchScanner`, `SetMatch`, `Scan`, `SetModes`,
+  `MatchScanMode_t`, `Hit`,
   `HitIDs`, `AppendAllMatches`, `Close`) — *not* in stdlib; the finished form of the
   above: one pass giving the hit table **and** de-duplicated match spans, replacing
   `Match` + one `FindAllStringIndex` per hit pattern;
@@ -519,7 +520,7 @@ footprint.
 ms, err := set.NewMatchScanner()  // reusable workspace: build once, keep it, Close it
 defer ms.Close()
 
-ms.SetWanted(mask)                // optional: which patterns need positions (default: all)
+ms.SetModes(modes)                // optional: what each pattern needs (default: spans, auto-tiered)
 
 unresolved, err := ms.Scan(body, func(batch []hgmLibre2.SetMatch) {
     for _, m := range batch {     // body[m.Lo:m.Hi] is a real match of pattern m.Index
@@ -559,27 +560,62 @@ Rules that matter, all pinned by tests (`matchscan_test.go`, `spanscan_*_test.go
 - **`text` is only referenced during `Scan`** (the left edge is recovered by reading
   it); the scanner does not retain it afterwards.
 
-#### `SetWanted`: which patterns actually need positions
+#### `SetModes`: what each pattern needs
 
-`ms.SetWanted(mask)` declares which pattern indices need spans (`mask[i]`, indices
-missing from a short mask count as `false`; `nil` = all, the default). Patterns left
-out still appear in the hit table — they just never get a span closed and never pay
-for a left-edge recovery, which is the expensive half of the work. Many entries in a
-big table are pure booleans ("does this class of content appear at all"), and nobody
-ever asks where they hit; on the table above, two such patterns alone accounted for
-**57%** of all runs. This is static information — you know at build time which
-branches consult a position — so set it once, right after building the scanner.
+`ms.SetModes(modes)` declares, per pattern index, one of three things (indices beyond
+a short slice take the zero value; `nil` = all default):
 
-#### What `Scan` guarantees, and where it differs from `FindAllStringIndex`
+| mode | what it means |
+|---|---|
+| `MatchScanMode_span` (zero value) | give me spans. The library picks the strategy per pattern and guarantees **leftmost-longest**. |
+| `MatchScanMode_boolOnly` | I only need "did it hit". No span is ever closed, no endpoint recovered. |
+| `MatchScanMode_spanUnsafeCursor` | give me spans, but force the cheap cursor path. Its semantics are the third kind described below — **you** carry the burden of proof that this pattern is unambiguous. |
 
-The left edge is recovered in one of two ways, decided per pattern by its byte-length
-range (see [`PatternLenRange`](#patternlenrange)):
+`boolOnly` is the one that pays: patterns left out of span work still appear in the
+hit table, they just never pay for endpoint recovery, which is the expensive half.
+Many entries in a big table are pure booleans ("does this class of content appear at
+all") and nobody ever asks where they hit; on the table above, two such patterns
+alone accounted for **57%** of all runs. This is static information — you know at
+build time which branches consult a position — so set it once, right after building
+the scanner.
 
-| pattern shape | how the left edge is found | relation to `FindAllStringIndex` |
+It is one three-state table rather than two masks ("wants a span" × "which path")
+because *wants-no-span-but-use-path-B* is not a meaningful combination; two masks
+would eventually contradict each other.
+
+`SetModes` returns an error if a pattern that can match the empty string is given
+anything other than `boolOnly` — every offset would be a zero-length hit and the
+cursor cannot advance past it. That is rejected up front rather than degrading
+silently at scan time.
+
+#### What `Scan` guarantees
+
+In the default mode (`MatchScanMode_span`) the spans handed to you satisfy:
+
+1. `text[Lo:Hi]` is a **real** match of that pattern;
+2. spans **of one pattern** are non-overlapping and ascending by `Lo`;
+3. the semantics are **leftmost-longest** — i.e. `re.Longest().FindAllStringIndex`.
+
+Three things are easy to misread there:
+
+- (2) is per pattern. Two *different* patterns still overlap freely; that is not
+  duplication, it is two questions each wanting an answer.
+- (3) is **not** "same as `FindAllStringIndex`". The stdlib default is
+  leftmost-*first* (greedy); the two disagree wherever the greedy first hit at a
+  start is shorter than the longest one. Compare against `Longest()`, or you get a
+  false red.
+- Empty-capable patterns are rejected by `SetModes`, not silently degraded.
+
+How the endpoint is recovered, per pattern:
+
+| pattern shape | mode | how |
 |---|---|---|
-| `min == max` (fixed length) | `Lo = Hi - min`, one subtraction, the regex engine is never entered | **byte-for-byte identical** |
-| `min < max` (variable) | one anchored look-back from `Hi` using a reverse set built for **that one pattern**, bounded by the cursor | a third semantics — see below |
-| `max` unbounded | not attempted | reported in `unresolved` |
+| `min == max` (fixed length) | any | `Lo = Hi - min`, one subtraction, the regex engine is never entered. Both paths agree here, so the mode does not apply. |
+| variable | `span` (default) | forward unanchored search from `max(cursor, Hi-maxLen)` for the leftmost start, then an anchored longest end. This *is* the definition of leftmost-longest, so it holds for any pattern shape. Costs ~1.6× path A per hit, plus walking the gaps for patterns with no length bound (bounded by one extra pass over the text). |
+| variable | `spanUnsafeCursor` | one anchored look-back from `Hi` using a reverse object built for **that one pattern**, bounded by the cursor. Cost is independent of text length — that is the whole reason it exists. Semantics: the third kind, below. |
+| — | — | patterns whose single-pattern object will not compile are reported in `unresolved`. |
+
+#### `spanUnsafeCursor`: the third semantics
 
 For the fixed-length tier the equality is provable, not merely measured: an end `e`
 has exactly one possible start `e-min`, so starts are monotone in ends and "greedy
@@ -587,7 +623,7 @@ leftmost non-overlapping" is precisely what the cursor produces. It is cross-che
 against `FindAllStringIndex` on 60 000 random fixed-length patterns
 (`TestMatchScanStrictVsFindAll`).
 
-The variable-length tier is **neither** leftmost-first (`FindAll`) **nor**
+The variable-length tier *on this path* is **neither** leftmost-first (`FindAll`) **nor**
 leftmost-longest (`Longest()`), and cannot be: this scan yields the *set of end
 offsets*, with no start/end pairing and no priority information in it — RE2's
 greediness lives in the NFA instruction priority order, which `kManyMatch` (the only
@@ -620,7 +656,7 @@ arrived out of order, or the DFA gave up on budget. For those indices, **discard
 everything you already received in this pass** and run the old path
 (`re.FindAllStringIndex`) for them: a pattern can be invalidated after some of its
 spans were already handed out, so patching only the tail would silently lose spans.
-Indices you excluded via `SetWanted` are never listed — those are your choice, not a
+Indices you set to `boolOnly` are never listed — those are your choice, not a
 library limitation. The slice is overwritten by the next `Scan`.
 
 `(*MatchScanner).AppendAllMatches(dst, text)` is the convenience form that appends
