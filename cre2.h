@@ -37,6 +37,49 @@ int cre2_group_name(const cre2_re *h, int idx, char *buf, int buflen);
  * (长度须 = 2*nmatch, 每组 [start,end); 未参与的组写 -1,-1). 1=有匹配 0=无. */
 int cre2_match_at(const cre2_re *h, const char *text, int textlen, int startpos, int *match, int nmatch);
 
+/* cre2_match_step_result: cre2_match_all_step 的返回值。
+ *   rc       : 1=正常; 0=参数不合法(当无匹配处理)。
+ *   nmatches : 本批填进 outBuf 的匹配【处】数 (写入 int 数 = nmatches * 2 * nmatch)。
+ *   pos      : 游标, 下次 step 原样传回来。
+ *   prevEnd  : 空匹配去重游标, 下次 step 原样传回来。
+ *   done     : 1=已扫到底(或已满 maxn), 不必再 step。 */
+typedef struct {
+	int rc;
+	int nmatches;
+	int pos;
+	int prevEnd;
+	int done;
+} cre2_match_step_result;
+
+/* cre2_match_all_step: cre2_match_all 的【分批】孪生 —— 逐处匹配的循环仍整段留在 C 内,
+ * 一直填到 outBuf 装满 (outCapMatches 处) 或扫到底才返回, 所以 cgo 过境次数是
+ * ceil(匹配数/outCapMatches)+1 而不是每处一次; 无匹配时就 1 次, 与 cre2_match_all 相同。
+ *
+ * 与 cre2_match_all 的差别只有"结果落在哪": 匹配集合 / 顺序 / 空匹配去重推进逐字相同
+ * (同一段循环)。结果【直接写进调用方给的 outBuf】—— 没有 std::vector 累积, 没有 malloc,
+ * 没有拷贝, 因此 C 侧不再出现"整张命中表的两份"那个峰值。
+ *
+ * 参数:
+ *   maxn_left     : 本次还允许再填几处; <0 = 不限。跨批的剩余额度由调用方递减。
+ *   pos, prevEnd  : 游标。首次调用传 pos=0, prevEnd=-1。
+ *   outBuf        : 调用方内存 (Go 侧就是一块 []int 的首元素地址); 本函数返回即不再引用,
+ *                   不留存 —— 满足 cgo "C 不得保存 Go 指针" 的规则。
+ *   outCapMatches : outBuf 能装几【处】匹配 (即 outBuf 至少有 outCapMatches*2*nmatch 个 int)。
+ *
+ * 🔴 native 侧不保存正文指针: text/textlen 每次 step 重新传进来。 */
+cre2_match_step_result cre2_match_all_step(const cre2_re *h, const char *text, int textlen, int nmatch,
+                                           int maxn_left, int pos, int prevEnd,
+                                           int *outBuf, int outCapMatches);
+
+/* cre2_match_all vs cre2_match_all_step 的分工 (2026-08-26 实测定的, 别再改回去):
+ *   · 调用方【不需要全部物化】(顺序遍历一遍就完事) ⇒ step。零 Go 分配, C 侧也不攒表。
+ *   · 调用方【就是要一次吐完的数组】(FindAll* 的契约) ⇒ 本函数。因为"先在 C 里数好个数,
+ *     再一次精确 malloc"本来就是这个契约下的最优解: Go 侧拿到 count 后一次精确 make。
+ *     用 step 物化反而更贵 —— Go append 阶梯累计收敛到 5N, 实测 20000 处命中
+ *     1.45MB/4 笔 → 5.70MB/26 笔, CPU +17%。
+ * 所以两个都留着, 各管各的。中间那种"半物化"形态 (AppendAllStringIndexFlat) 才是两头不靠的
+ * 那个 —— 不物化就用 step, 要物化就用 FindAll*, 它没有自己的地盘, 所以它被删。 */
+
 /* 批量全匹配: 在 C 内一次循环跑完整个 text 的所有(最多 maxn 个; maxn<0=不限)非锚定匹配,
  * 复刻调用方 allMatches 的空匹配去重 + UTF-8 rune 推进语义. 每处匹配顺序写 2*nmatch 个 int
  * (group0..groupN-1 的 [start,end); 未参与的组 -1,-1). 用途: 把原本「每处匹配一次 cgo」的

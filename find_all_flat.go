@@ -25,6 +25,18 @@ import (
 	"unsafe"
 )
 
+// 🔴 待删除 (2026-08-26) —— 新代码一律改用 (*Regexp).StepAllStringIndex (match_step.go)。
+//
+// 理由: 本方法只干掉了「Go 侧那笔 flat + [][]int 外壳」, 干不掉 C 侧 cre2_match_all 的
+// std::vector 累积表 + malloc (峰值是整张命中表的两份, 纯 RSS, Go profile 上看不见);
+// 而且它省下的累计分配是拿 live-max 换的 —— dst 这块复用缓冲会涨到历史最大命中数就再也不缩,
+// 挂在 plan/pool 上 × 并发度常驻。step 形态两头都没有: C 直接写进 Go 缓冲, 缓冲固定一批大小。
+// StepAllStringIndex 与本方法语义逐处相同 (同一段 C 循环), 对拍见 match_step_test.go 的
+// TestStepAllStringIndex_VsFindAll —— 它每轮都拿本方法的结果再对一遍。
+//
+// 现在还留着只是让 7 个存量调用点能编过; 调用点全部换完、性能确认之后, 本文件连同
+// cre2_match_all / cre2_match_all_r 一起删。
+//
 // AppendAllStringIndexFlat 把 re 在 s 上前 n 处匹配的 [start,end) 追加进 dst, 返回追加后的切片。
 // n < 0 = 全部。无匹配时原样返回 dst (一个元素都不追加, 同 FindAllStringIndex 返 nil 的语义)。
 //

@@ -233,6 +233,12 @@ func (re *Regexp) FindStringSubmatchIndex(s string) []int {
 	return re.findFrom(s, 0)
 }
 
+// 保留 (2026-08-26 量过才决定的, 别再改回 step): 本函数服务 FindAll* 的"一次吐完"契约。
+// 曾试过把它换成"内部 step 到底、边走边物化", 结果是净亏 —— C 侧那笔 vector+malloc 是省了,
+// 但 Go 侧 append 阶梯累计收敛到 5N, 实测 20000 处命中 1.45MB/4 笔 → 5.70MB/26 笔, CPU +17%
+// (BenchmarkFindAllSub_matAll_vs_step)。要"不物化"的调用方请直接用 StepAll* (match_step.go),
+// 别为了统一形状把这条路也改了。
+//
 // matchAllFlat 跑批量全匹配 (单次 cgo), 把 C 返回的所有匹配 index 一次性拷进【单块】Go []int 返回:
 // 每处匹配 per=2*(numSubexp+1) 个 int (group0.start,group0.end, group1.start,...; 未参与组 -1,-1),
 // 顺序排布. 无匹配返回 nil,0.

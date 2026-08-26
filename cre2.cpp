@@ -131,6 +131,97 @@ static int utf8WidthGo(const char *s, int n) {
 	return w;
 }
 
+/* cre2_match_all_step: 见 cre2.h 的契约。
+ *
+ * 循环体与 cre2_match_all 【逐字相同】(pos 推进 · 空匹配去重 · utf8WidthGo · 未参与组 -1,-1),
+ * 唯二的差别:
+ *   ① 结果写进调用方的 outBuf, 不进 std::vector, 收尾也不 malloc/拷贝;
+ *   ② 填满 outCapMatches 处就【挂起】返回 (done=0), 把 pos/prevEnd 交回给调用方下次传进来。
+ * 挂起不需要保存任何 native 状态 —— 每处匹配本来就是一次独立的 h->re->Match(full, pos, …),
+ * DFA 状态与 cache 锁都在那一次 Match 内部生灭, 循环切在哪一处都不影响结果。
+ *
+ * 🔴 这两份实现【没有】共用同一段代码, 而且两个都会长期留着 (分工见 cre2.h 里那段)。
+ *    让 cre2_match_all 绕道本函数会给它凭空加一次拷贝, 拿本函数绕道它则要先攒完整张表 ——
+ *    两个契约不同, 硬合成一份只会两头都变慢。防止语义漂移靠的是对拍门:
+ *    match_step_test.go 拿 batch=1/2/3 强制切在批边界上 (跨批携带的 pos/prevEnd 是唯一会
+ *    静默出错的地方), 与 FindAllStringSubmatchIndex 以及 stdlib regexp 三方逐处逐组对拍。 */
+cre2_match_step_result cre2_match_all_step(const cre2_re *h, const char *text, int textlen, int nmatch,
+                                           int maxn_left, int pos, int prevEnd,
+                                           int *outBuf, int outCapMatches) {
+	cre2_match_step_result res;
+	res.rc = 1;
+	res.nmatches = 0;
+	res.pos = pos;
+	res.prevEnd = prevEnd;
+	res.done = 1; /* 只有"缓冲填满而不是扫完"那一条出口才会改成 0 */
+	if (h == NULL || nmatch < 1 || outBuf == NULL || outCapMatches < 1 || textlen < 0 || pos < 0) {
+		res.rc = 0;
+		return res;
+	}
+	if (maxn_left == 0) {
+		return res; /* 额度已用尽: 一处不填, 且已经结束 */
+	}
+	const char *base = text ? text : "";
+	re2::StringPiece full(base, textlen);
+	std::vector<re2::StringPiece> sub(nmatch);
+	int end = textlen;
+	int count = 0; /* 本批已【接受】的匹配处数 */
+	int w = 0;     /* outBuf 写游标 (int 数) */
+	while (pos <= end) {
+		if (count >= outCapMatches) {
+			res.done = 0; /* 缓冲满 —— 正文还没扫完, 调用方要再 step 一次 */
+			break;
+		}
+		if (maxn_left > 0 && count >= maxn_left) {
+			break; /* 本次额度用尽; done 保持 1 */
+		}
+		bool ok = h->re->Match(full, (size_t)pos, (size_t)textlen, RE2::UNANCHORED, sub.data(), nmatch);
+		if (!ok) {
+			break;
+		}
+		/* group0 在成功匹配时必参与, data() 非 NULL. */
+		int m0 = (int)(sub[0].data() - base);
+		int m1 = m0 + (int)sub[0].size();
+		bool accept = true;
+		if (m1 == m0) {
+			/* 空匹配: 紧贴上一处匹配末尾的空匹配丢弃, 避免重复; 按 rune 宽度推进 pos. */
+			if (m0 == prevEnd) {
+				accept = false;
+			}
+			int width = utf8WidthGo(base + pos, end - pos);
+			if (width > 0) {
+				pos += width;
+			} else {
+				pos = end + 1;
+			}
+		} else {
+			pos = m1;
+		}
+		prevEnd = m1;
+		if (accept) {
+			for (int i = 0; i < nmatch; i++) {
+				if (sub[i].data() == nullptr) {
+					outBuf[w++] = -1;
+					outBuf[w++] = -1;
+				} else {
+					int b = (int)(sub[i].data() - base);
+					outBuf[w++] = b;
+					outBuf[w++] = b + (int)sub[i].size();
+				}
+			}
+			count++;
+		}
+	}
+	res.nmatches = count;
+	res.pos = pos;
+	res.prevEnd = prevEnd;
+	return res;
+}
+
+/* 保留 (不是待删除): 本函数服务 FindAll* 那个"一次吐完数组"的契约 —— 在 C 里数好个数再一次
+ * 精确 malloc, Go 侧据此一次精确 make, 是该契约下的最优解。用 step 物化反而 +17% CPU / 分配翻 4 倍
+ * (数字见 cre2.h 上面那段与 match_step_bench_test.go 的 BenchmarkFindAllSub_matAll_vs_step)。
+ * 不需要全部物化的调用方走 cre2_match_all_step。 */
 int cre2_match_all(const cre2_re *h, const char *text, int textlen, int nmatch, int maxn, int **out, int *nmatches) {
 	*out = NULL;
 	*nmatches = 0;
