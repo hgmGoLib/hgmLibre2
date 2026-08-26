@@ -218,6 +218,111 @@ cre2_match_step_result cre2_match_all_step(const cre2_re *h, const char *text, i
 	return res;
 }
 
+/* ── 实验中 (2026-08-26): 缓冲改由 C 侧持有, 见 cre2.h 的契约。 ──────────────────────
+ * 循环体与 cre2_match_all_step 逐字相同, 只在"第一次要写命中"处插了一句惰性 malloc。 */
+cre2_match_step_alloc_result cre2_match_all_step_alloc(const cre2_re *h, const char *text, int textlen, int nmatch,
+                                                       int maxn_left, int pos, int prevEnd,
+                                                       int *inBuf, int capMatches) {
+	cre2_match_step_alloc_result res;
+	res.rc = 1;
+	res.nmatches = 0;
+	res.pos = pos;
+	res.prevEnd = prevEnd;
+	res.done = 1;
+	res.buf = inBuf;
+	if (h == NULL || nmatch < 1 || capMatches < 1 || textlen < 0 || pos < 0) {
+		res.rc = 0;
+		return res;
+	}
+	if (maxn_left == 0) {
+		return res;
+	}
+	const char *base = text ? text : "";
+	re2::StringPiece full(base, textlen);
+	std::vector<re2::StringPiece> sub(nmatch);
+	int *out = inBuf;
+	int end = textlen;
+	int count = 0;
+	int w = 0;
+	while (pos <= end) {
+		if (count >= capMatches) {
+			res.done = 0;
+			break;
+		}
+		if (maxn_left > 0 && count >= maxn_left) {
+			break;
+		}
+		bool ok = h->re->Match(full, (size_t)pos, (size_t)textlen, RE2::UNANCHORED, sub.data(), nmatch);
+		if (!ok) {
+			break;
+		}
+		int m0 = (int)(sub[0].data() - base);
+		int m1 = m0 + (int)sub[0].size();
+		bool accept = true;
+		if (m1 == m0) {
+			if (m0 == prevEnd) {
+				accept = false;
+			}
+			int width = utf8WidthGo(base + pos, end - pos);
+			if (width > 0) {
+				pos += width;
+			} else {
+				pos = end + 1;
+			}
+		} else {
+			pos = m1;
+		}
+		prevEnd = m1;
+		if (accept) {
+			if (out == NULL) {
+				/* 惰性: 到这里才知道真的有命中。miss 路径一分钱不花。 */
+				out = (int *)malloc(sizeof(int) * (size_t)capMatches * 2 * (size_t)nmatch);
+				if (out == NULL) {
+					res.rc = 0;
+					return res;
+				}
+				res.buf = out;
+			}
+			for (int i = 0; i < nmatch; i++) {
+				if (sub[i].data() == nullptr) {
+					out[w++] = -1;
+					out[w++] = -1;
+				} else {
+					int b = (int)(sub[i].data() - base);
+					out[w++] = b;
+					out[w++] = b + (int)sub[i].size();
+				}
+			}
+			count++;
+		}
+	}
+	res.nmatches = count;
+	res.pos = pos;
+	res.prevEnd = prevEnd;
+	return res;
+}
+
+void cre2_step_buf_free(int *p) {
+	free(p);
+}
+
+void cre2_nop(void) {
+}
+
+void cre2_malloc_free_roundtrip(int n, int nbytes) {
+	volatile int sink = 0;
+	for (int i = 0; i < n; i++) {
+		void *p = malloc((size_t)nbytes);
+		if (p == NULL) {
+			return;
+		}
+		((char *)p)[0] = (char)i; /* 防止编译器把 malloc/free 对消掉 */
+		sink += ((char *)p)[0];
+		free(p);
+	}
+	(void)sink;
+}
+
 /* 保留 (不是待删除): 本函数服务 FindAll* 那个"一次吐完数组"的契约 —— 在 C 里数好个数再一次
  * 精确 malloc, Go 侧据此一次精确 make, 是该契约下的最优解。用 step 物化反而 +17% CPU / 分配翻 4 倍
  * (数字见 cre2.h 上面那段与 match_step_bench_test.go 的 BenchmarkFindAllSub_matAll_vs_step)。

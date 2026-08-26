@@ -71,6 +71,31 @@ cre2_match_step_result cre2_match_all_step(const cre2_re *h, const char *text, i
                                            int maxn_left, int pos, int prevEnd,
                                            int *outBuf, int outCapMatches);
 
+/* ── 实验中 (2026-08-26): 缓冲改由 C 侧持有 ────────────────────────────────────────
+ * cre2_match_all_step_alloc 与上面那个逐字同一段循环, 唯一差别是【缓冲谁分配】:
+ *   inBuf==NULL 时不预先分配, 直到真的要写第一处命中才 malloc(capMatches*2*nmatch 个 int),
+ *   并把指针放进 res.buf 交回调用方; 之后每次 step 原样传回来。扫完由调用方 cre2_step_buf_free。
+ * 目的是回答"能不能干掉调用方持有的工作区(Go 侧 MatchStep_t)、让 miss 路径一分钱不花"。
+ * 结论见 match_step_alloc_bench_test.go 顶部。 */
+typedef struct {
+	int rc;
+	int nmatches;
+	int pos;
+	int prevEnd;
+	int done;
+	int *buf; /* C 侧缓冲 (可能是本次刚 malloc 的); 调用方负责最后 cre2_step_buf_free */
+} cre2_match_step_alloc_result;
+
+cre2_match_step_alloc_result cre2_match_all_step_alloc(const cre2_re *h, const char *text, int textlen, int nmatch,
+                                                       int maxn_left, int pos, int prevEnd,
+                                                       int *inBuf, int capMatches);
+void cre2_step_buf_free(int *p);
+/* cre2_nop: 量一次纯 cgo 过境要多少 ns (给上面那个方案的"额外一次 free 过境"定价)。 */
+void cre2_nop(void);
+/* cre2_malloc_free_roundtrip: 在 C 内做 n 轮 malloc(nbytes)+free, 量 glibc 分配器本身的价
+ * (不含 cgo 过境)。用来验证"C 的 malloc/free 是不是一个高效的 sync.Pool"。 */
+void cre2_malloc_free_roundtrip(int n, int nbytes);
+
 /* cre2_match_all vs cre2_match_all_step 的分工 (2026-08-26 实测定的, 别再改回去):
  *   · 调用方【不需要全部物化】(顺序遍历一遍就完事) ⇒ step。零 Go 分配, C 侧也不攒表。
  *   · 调用方【就是要一次吐完的数组】(FindAll* 的契约) ⇒ 本函数。因为"先在 C 里数好个数,
