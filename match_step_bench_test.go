@@ -195,3 +195,62 @@ func BenchmarkFindAllSub_matAll_vs_step(b *testing.B) {
 		})
 	}
 }
+
+// ── 决策用②: 调用方【必须物化】但底是【跨调用复用】的场景, step 打不打得过 Append? ──────
+// 这与上面那个 FindAllSub 的决策不同: 那里的目的地是每次新开的 []int (append 阶梯每次都付),
+// 这里 dst 传 buf[:0] —— 阶梯只在第一趟付一次, 稳态两边都是零 Go 分配。
+// 于是差别只剩 C 侧:
+//   Append: std::vector 逐处 push_back(倍增) → malloc(精确) → C→Go 一次全量拷贝
+//   step  : C 直接写进固定批缓冲 → Go 侧一批一批抄进 dst (多一次小拷贝, 但没有 vector/malloc)
+// asc 里 cred_credential.go 那两处(倒序遍历 flat / 与 fillerLocs 共用底)正是这个形状,
+// 它们能不能换, 由这条基准说了算。
+//
+// 实测结论 (5900X · 2026-08-26 · 两边稳态都是 0 B/op 0 allocs/op):
+//   hits=5      append  704ns  ·  step  668ns
+//   hits=50     append 5681ns  ·  step 5515ns
+//   hits=500    append 54.0µs  ·  step 53.6µs
+//   hits=20000  append 2.136ms ·  step 2.118ms
+// ⟹ 打平到略优。而这条基准【看不见】的那一头是 step 真正赚的地方: C 侧那份 std::vector 累积表
+// 与随后的 malloc(峰值是整张命中表的两份, 纯 RSS)在 step 这边根本不存在。
+// ⟹ 结论: 连"调用方必须物化"的复用底场景, Append 形态也没有存在理由 —— 它可以全量退役。
+
+func stepMaterializeReuse(re *Regexp, st *MatchStep_t, dst []int, s string) []int {
+	re.StepAllStringIndex(st, s, -1, func(flat []int32) bool {
+		for _, v := range flat {
+			dst = append(dst, int(v))
+		}
+		return true
+	})
+	return dst
+}
+
+func BenchmarkReuseBuf_append_vs_step(b *testing.B) {
+	for _, hits := range []int{5, 50, 500, 20000} {
+		body := stepBenchNHits(hits)
+		b.Run("append/hits="+strconv.Itoa(hits), func(b *testing.B) {
+			b.ReportAllocs()
+			var buf []int
+			sink := 0
+			buf = benchRe.AppendAllStringIndexFlat(buf[:0], body, -1) // 预热底
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				buf = benchRe.AppendAllStringIndexFlat(buf[:0], body, -1)
+				sink += len(buf)
+			}
+			_ = sink
+		})
+		b.Run("step/hits="+strconv.Itoa(hits), func(b *testing.B) {
+			b.ReportAllocs()
+			var st MatchStep_t
+			var buf []int
+			sink := 0
+			buf = stepMaterializeReuse(benchRe, &st, buf[:0], body) // 预热两块底
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				buf = stepMaterializeReuse(benchRe, &st, buf[:0], body)
+				sink += len(buf)
+			}
+			_ = sink
+		})
+	}
+}
