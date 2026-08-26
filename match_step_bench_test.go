@@ -51,12 +51,11 @@ func BenchmarkMatchAll_new_StepAllStringSubmatchIndex(b *testing.B) {
 		b.Run(stepSizeName(sz), func(b *testing.B) {
 			b.ReportAllocs()
 			b.SetBytes(int64(len(body)))
-			st := &MatchStep_t{}
 			sink := 0
-			benchRe.StepAllStringSubmatchIndex(st, body, -1, func(flat []int32) bool { return true }) // 预热缓冲
+			benchRe.StepAllStringSubmatchIndex(body, -1, func(flat []int32) bool { return true }) // 预热池块
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				benchRe.StepAllStringSubmatchIndex(st, body, -1, func(flat []int32) bool {
+				benchRe.StepAllStringSubmatchIndex(body, -1, func(flat []int32) bool {
 					for k := 0; k+6 <= len(flat); k += 6 {
 						sink += int(flat[k+2]) + int(flat[k+3])
 					}
@@ -93,12 +92,11 @@ func BenchmarkMatchAll_new_StepAllStringIndex(b *testing.B) {
 		b.Run(stepSizeName(sz), func(b *testing.B) {
 			b.ReportAllocs()
 			b.SetBytes(int64(len(body)))
-			st := &MatchStep_t{}
 			sink := 0
-			benchRe.StepAllStringIndex(st, body, -1, func(flat []int32) bool { return true })
+			benchRe.StepAllStringIndex(body, -1, func(flat []int32) bool { return true })
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				benchRe.StepAllStringIndex(st, body, -1, func(flat []int32) bool {
+				benchRe.StepAllStringIndex(body, -1, func(flat []int32) bool {
 					for k := 0; k+2 <= len(flat); k += 2 {
 						sink += int(flat[k]) + int(flat[k+1])
 					}
@@ -124,12 +122,11 @@ func BenchmarkMatchAll_miss_old(b *testing.B) {
 func BenchmarkMatchAll_miss_new(b *testing.B) {
 	body := stepBenchBody(64, 64)
 	re := MustCompile(`zzzz(qqq)=(www)`)
-	st := &MatchStep_t{}
-	re.StepAllStringSubmatchIndex(st, body, -1, func(flat []int32) bool { return true }) // 预热缓冲
+	re.StepAllStringSubmatchIndex(body, -1, func(flat []int32) bool { return true }) // 预热池块
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		re.StepAllStringSubmatchIndex(st, body, -1, func(flat []int32) bool { return true })
+		re.StepAllStringSubmatchIndex(body, -1, func(flat []int32) bool { return true })
 	}
 }
 
@@ -148,9 +145,8 @@ func stepSizeName(kb int) string {
 
 func benchFindAllSubStep(re *Regexp, s string, n int) [][]int {
 	per := 2 * (re.NumSubexp() + 1)
-	var st MatchStep_t
 	var flat []int
-	re.StepAllStringSubmatchIndex(&st, s, n, func(b []int32) bool {
+	re.StepAllStringSubmatchIndex(s, n, func(b []int32) bool {
 		if flat == nil {
 			flat = make([]int, 0, len(b)) // 首批: 多数调用一批装完 ⇒ 一次精确分配
 		}
@@ -214,8 +210,8 @@ func BenchmarkFindAllSub_matAll_vs_step(b *testing.B) {
 // 与随后的 malloc(峰值是整张命中表的两份, 纯 RSS)在 step 这边根本不存在。
 // ⟹ 结论: 连"调用方必须物化"的复用底场景, Append 形态也没有存在理由 —— 它可以全量退役。
 
-func stepMaterializeReuse(re *Regexp, st *MatchStep_t, dst []int, s string) []int {
-	re.StepAllStringIndex(st, s, -1, func(flat []int32) bool {
+func stepMaterializeReuse(re *Regexp, dst []int, s string) []int {
+	re.StepAllStringIndex(s, -1, func(flat []int32) bool {
 		for _, v := range flat {
 			dst = append(dst, int(v))
 		}
@@ -241,13 +237,12 @@ func BenchmarkReuseBuf_append_vs_step(b *testing.B) {
 		})
 		b.Run("step/hits="+strconv.Itoa(hits), func(b *testing.B) {
 			b.ReportAllocs()
-			var st MatchStep_t
 			var buf []int
 			sink := 0
-			buf = stepMaterializeReuse(benchRe, &st, buf[:0], body) // 预热两块底
+			buf = stepMaterializeReuse(benchRe, buf[:0], body) // 预热两块底
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				buf = stepMaterializeReuse(benchRe, &st, buf[:0], body)
+				buf = stepMaterializeReuse(benchRe, buf[:0], body)
 				sink += len(buf)
 			}
 			_ = sink

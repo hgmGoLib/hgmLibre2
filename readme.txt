@@ -59,6 +59,25 @@
       传 buf[:0] 复用缓冲 ⇒ 稳态零分配。匹配集合/顺序/空匹配语义与 FindAllStringIndex 逐处相同
       (同一段 C 循环), 只回填 group0; 要子组用 FindAllStringSubmatchIndex。
       详见 README.md#appendallstringindexflat。
+    - StepAllStringSubmatchIndex(s, n, batchFn) / StepAllStringIndex(s, n, batchFn) (match_step.go):
+      全匹配的【sqlite3_step 式】形态 —— C 侧一次填一批命中进一块固定批缓冲交给 batchFn, Go 侧
+      取走这批再 step 下一批, 内存里【从来没有全部命中信息】。零 Go 堆分配 (缓冲是库内 sync.Pool
+      借的, 用完就还), 而且【无命中的调用也一分钱不花】。
+        per := 2*(re.NumSubexp()+1)                    // Index 版恒为 2
+        re.StepAllStringSubmatchIndex(body, -1, func(flat []int32) bool {
+            for k := 0; k+per <= len(flat); k += per {
+                loc := flat[k:k+per]                   // 布局与 FindAllStringSubmatchIndex 的单行逐字相同
+                _ = loc                                //   未参与的组是 -1,-1
+            }
+            return true                                // 返 false = 提前停, 剩下的正文不再扫
+        })
+      🔴 flat 只在【本次回调内】有效: 下一批就地覆写同一块内存, 而且本次调用一返回这块就还回池子
+         了。要留存自己 copy (存 int 下标而不是切片)。
+      🔴 用它还是用 FindAll*, 看的是【要不要那张表】, 不是哪个新:
+         · 拿到命中顺序过一遍就丢 (累加/改写/当场判断) ⇒ Step。
+         · 要一张能来回走、能 append/过滤/交叉引用、要 len() 当门的表 ⇒ FindAll*。拿 Step 去物化
+           实测是净亏 (Go append 阶梯累计收敛到 5N: 2 万处命中 1.45MB/4 笔 → 5.70MB/26 笔, CPU +17%)。
+      匹配集合/顺序/空匹配去重推进与 FindAll* 逐处相同 (同一段 C 循环), 对拍门见 match_step_test.go。
     - ReplaceAllStringFunc_ctx_t (NewReplaceAllStringFunc_ctx / AppendReplaceAllStringFunc):
       ReplaceAllStringFunc 的【复用已有分配】变体 —— 结果追加进调用方自己的 []byte 底,
       匹配位置表挂 ctx 上, 两块都跨调用复用 ⇒ 稳态零分配 (逐段反复替换的热路径用这个)。

@@ -15,7 +15,7 @@ import (
 func TestStepCAlloc_SurvivesGC(t *testing.T) {
 	re := MustCompile(`(\w+)=(\w+)`)
 	body := stepBenchNHits(500)
-	want := collectA(re, body, -1, re.NumSubexp()+1)
+	want := collectMain(re, body, -1, re.NumSubexp()+1)
 
 	var got []int32
 	batch := 0

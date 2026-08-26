@@ -32,19 +32,30 @@
 //   p=4/20   A 3399ns/0B · B 3585ns/0B · E 3668ns/0B · D 4174ns/3840B/20 笔
 // ⟹ 名次在所有命中率上都一样: A < B < E < D。
 //
-// ══ 所以定案 ══════════════════════════════════════════════════════════════════════
-// · 调用方本来就有个能挂工作区的对象 ⇒ 用 A (现行 MatchStep_t)。零开销, 没有理由换。
-// · 调用方【没有】这种对象、又不想为它把工作区一路串下去 ⇒ 用 E (库内 sync.Pool):
-//   9.5ns/次 · 零分配 · 不用动一行 C · 契约不变 (切片失效只是数据变旧)。
+// ══ 定案 (第一版: 留 A + 按情况用 E) ══════════════════════════════════════════════
+// · 调用方本来就有个能挂工作区的对象 ⇒ 用 A。零开销。
+// · 没有这种对象 ⇒ 用 E (库内 sync.Pool): 9.5ns/次 · 零分配 · 不用动一行 C · 契约不变。
 //   B 比 E 再快约 5%, 但要付: 动 C 代码 · 每条提前返回路径都得记得 free (batchFn panic 就漏) ·
 //   而且契约从"读到旧数据"降级成"use-after-free"—— 同样是 []int32, 类型上分辨不出来。
 //   这 5% 换不来这三样。
-// · 每次调用现 make 一块 (D) 是四个里最差的一个, 该消灭 —— 见下面"发现"。
+// · 每次调用现 make 一块 (D) 是四个里最差的一个, 该消灭。
 //
-// 🔴 发现 (2026-08-26 这次量出来的真问题): asc 里 12 个 step 调用点中有 6 个是函数内的
-//    var st hgmLibre2.MatchStep_t —— 它们【就是变体 D】, 每次调用白付 192B + 一笔分配,
-//    miss 路径上比 A 慢 43%。这 6 个才是该动的地方 (3 个有现成的 per-call 上下文对象可挂 ⇒ 转 A;
-//    另外 3 个没有 ⇒ 转 E)。提案没被采纳, 但它把这个坑照出来了。
+// ══ 复审 (同日 · 现行) ════════════════════════════════════════════════════════════
+// A 被整个下线, E 升为主线 —— MatchStep_t 与工作区参数一并删除。理由是上面那份表【单位不对】:
+// A 领先 E 的那 11.6ns/次, 是在"正文只有几十到几百字节"的基准里量出来的; 生产里一份 body 是
+// 240KB 起步, 光 RE2 扫一遍就是几十微秒, 一次 Get/Put 占 万分之一都不到 —— 这个领先在真实
+// 尺度上【量不出来】。而 A 换来的代价是实打实的:
+//   · 调用方得自己找地方安置工作区, 没地方的就写成 var st (=变体 D, 四个里最差的那个) ——
+//     第一版落地当天 12 个调用点里就有 6 个这么写, 说明这不是"用错了", 是这个 API 的默认答案;
+//   · batchFn 里再起一条 step 扫描会与外层共用同一块 st, 就地互相覆写 (静默错结果), 而池化之后
+//     各借各的, 这条坑直接消失;
+//   · 每个持有工作区的壳都要多一个字段 + 一段"跟着谁借还"的注释。
+// 一句话: 那 11.6ns 只在基准里存在, 而那三样代价在每个调用点上都存在。
+//
+// 🔴 顺带记下 D 有多毒 (第一版落地当天量出来的真问题): 函数内 var st 每次调用白付 192B + 一笔
+//    分配【命不命中都付】, miss 路径上比 A 慢 43%。asc 8.2MB 档 FindAll→Step 换完之后
+//    Go 分配 920.4M → 922.7M(字节反而涨), 就是这个。判据见 match_step_test.go 的
+//    TestStepAllString_MissZeroAlloc。
 package hgmLibre2
 
 import (
@@ -95,8 +106,8 @@ func BenchmarkX_goMake(b *testing.B) {
 func BenchmarkX_syncPoolRoundtrip(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		st := stepPool.Get().(*MatchStep_t)
-		stepPool.Put(st)
+		p := stepBufPool.Get().(*[]int32)
+		stepBufPool.Put(p)
 	}
 }
 
@@ -114,15 +125,6 @@ func BenchmarkX_stepVariants(b *testing.B) {
 	}
 
 	run := func(name string, re *Regexp, body string) {
-		b.Run(name+"/A_callerWS", func(b *testing.B) {
-			b.ReportAllocs()
-			var st MatchStep_t
-			re.StepAllStringSubmatchIndex(&st, body, -1, eat)
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				re.StepAllStringSubmatchIndex(&st, body, -1, eat)
-			}
-		})
 		b.Run(name+"/B_cMalloc", func(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
@@ -137,12 +139,12 @@ func BenchmarkX_stepVariants(b *testing.B) {
 				re.StepAllStringSubmatchIndexGoLocal(body, -1, eat)
 			}
 		})
-		b.Run(name+"/E_syncPool", func(b *testing.B) {
+		b.Run(name+"/main_pool", func(b *testing.B) {
 			b.ReportAllocs()
-			re.StepAllStringSubmatchIndexPool(body, -1, eat)
+			re.StepAllStringSubmatchIndex(body, -1, eat)
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				re.StepAllStringSubmatchIndexPool(body, -1, eat)
+				re.StepAllStringSubmatchIndex(body, -1, eat)
 			}
 		})
 	}
@@ -158,15 +160,6 @@ func BenchmarkX_stepVariants(b *testing.B) {
 func BenchmarkX_stepVariantsParallel(b *testing.B) {
 	body := stepBenchNHits(50)
 	eat := func(f []int32) bool { return true }
-	b.Run("A_callerWS", func(b *testing.B) {
-		b.ReportAllocs()
-		b.RunParallel(func(pb *testing.PB) {
-			var st MatchStep_t // 每 goroutine 一个 —— A 形态在并发下的真实样子
-			for pb.Next() {
-				benchRe.StepAllStringSubmatchIndex(&st, body, -1, eat)
-			}
-		})
-	})
 	b.Run("B_cMalloc", func(b *testing.B) {
 		b.ReportAllocs()
 		b.RunParallel(func(pb *testing.PB) {
@@ -175,11 +168,11 @@ func BenchmarkX_stepVariantsParallel(b *testing.B) {
 			}
 		})
 	})
-	b.Run("E_syncPool", func(b *testing.B) {
+	b.Run("main_pool", func(b *testing.B) {
 		b.ReportAllocs()
 		b.RunParallel(func(pb *testing.PB) {
 			for pb.Next() {
-				benchRe.StepAllStringSubmatchIndexPool(body, -1, eat)
+				benchRe.StepAllStringSubmatchIndex(body, -1, eat)
 			}
 		})
 	})
@@ -211,16 +204,6 @@ func BenchmarkX_ruleTable(b *testing.B) {
 		}
 		name := "p=" + strconv.Itoa(hitN) + "/" + strconv.Itoa(len(tbl))
 		eat := func(f []int32) bool { return true }
-		b.Run(name+"/A_callerWS", func(b *testing.B) {
-			b.ReportAllocs()
-			var st MatchStep_t
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				for _, re := range tbl {
-					re.StepAllStringSubmatchIndex(&st, body, -1, eat)
-				}
-			}
-		})
 		b.Run(name+"/B_cMalloc", func(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
@@ -239,12 +222,12 @@ func BenchmarkX_ruleTable(b *testing.B) {
 				}
 			}
 		})
-		b.Run(name+"/E_syncPool", func(b *testing.B) {
+		b.Run(name+"/main_pool", func(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				for _, re := range tbl {
-					re.StepAllStringSubmatchIndexPool(body, -1, eat)
+					re.StepAllStringSubmatchIndex(body, -1, eat)
 				}
 			}
 		})

@@ -3,7 +3,7 @@
 // 照 find_all_flat_test.go 那四条办, 另加两条 step 形态特有的:
 //   ① 与本库 FindAllStringSubmatchIndex 逐处逐组对拍 (含未参与组的 -1,-1);
 //   ② 与 stdlib regexp 对拍 (空匹配 / (?m)^$ / 嵌套组 / n 截断);
-//   ③ 缓冲复用不串味 (同一 MatchStep_t 跨 re / 跨正文反复用);
+//   ③ 池里那块批缓冲反复借还不串味 (连着跨 re / 跨正文调, per 每次都不一样);
 //   ④ 稳态零分配 (testing.AllocsPerRun);
 //   ⑤ 🔴 强制切在批边界上 (batch=1/2/3): 跨批携带的 pos/prevEnd 是整件事里唯一会静默出错的
 //      地方, 批一大就一次装完, 这条路径永远测不到;
@@ -45,10 +45,11 @@ var stepInputs = []string{
 }
 
 // stepCollectSub 用 step 收集全部命中, 物化成 [][]int (布局与 FindAllStringSubmatchIndex 相同)。
-func stepCollectSub(re *Regexp, st *MatchStep_t, s string, n int) [][]int {
+// batch>0 走 stepAll 的写死批容量入口 (把批边界切在指定处数上); batch=0 = 生产口径。
+func stepCollectSub(re *Regexp, batch int, s string, n int) [][]int {
 	per := 2 * (re.NumSubexp() + 1)
 	var got [][]int
-	re.StepAllStringSubmatchIndex(st, s, n, func(flat []int32) bool {
+	re.stepAll(s, n, re.NumSubexp()+1, batch, func(flat []int32) bool {
 		if len(flat)%per != 0 {
 			panic("flat 长度不是 per 的整数倍")
 		}
@@ -88,12 +89,8 @@ func TestStepAllStringSubmatchIndex_VsFindAll(t *testing.T) {
 		re := MustCompile(pat)
 		for _, s := range stepInputs {
 			want := re.FindAllStringSubmatchIndex(s, -1)
-			for _, batch := range []int{1, 2, 3, 0} { // 0 = 默认策略 (首批 8, 满了长到 128)
-				st := &MatchStep_t{}
-				if batch > 0 {
-					st = newMatchStepFixed(batch)
-				}
-				got := stepCollectSub(re, st, s, -1)
+			for _, batch := range []int{1, 2, 3, 0} { // 0 = 生产口径 (一批 stepBufInts/per 处)
+				got := stepCollectSub(re, batch, s, -1)
 				if !eqLocs(want, got) {
 					t.Fatalf("pat=%q s=%q batch=%d:\n want %v\n got  %v", pat, s, batch, want, got)
 				}
@@ -111,11 +108,7 @@ func TestStepAllStringSubmatchIndex_VsStdlib(t *testing.T) {
 		for _, s := range stepInputs {
 			want := std.FindAllStringSubmatchIndex(s, -1)
 			for _, batch := range []int{1, 2, 3, 0} {
-				st := &MatchStep_t{}
-				if batch > 0 {
-					st = newMatchStepFixed(batch)
-				}
-				got := stepCollectSub(re, st, s, -1)
+				got := stepCollectSub(re, batch, s, -1)
 				if !eqLocs(want, got) {
 					t.Fatalf("stdlib pat=%q s=%q batch=%d:\n want %v\n got  %v", pat, s, batch, want, got)
 				}
@@ -134,11 +127,7 @@ func TestStepAllStringSubmatchIndex_NTrunc(t *testing.T) {
 			for _, n := range []int{0, 1, 2, 3, 5, 100, -1} {
 				want := std.FindAllStringSubmatchIndex(s, n)
 				for _, batch := range []int{1, 2, 0} {
-					st := &MatchStep_t{}
-					if batch > 0 {
-						st = newMatchStepFixed(batch)
-					}
-					got := stepCollectSub(re, st, s, n)
+					got := stepCollectSub(re, batch, s, n)
 					if !eqLocs(want, got) {
 						t.Fatalf("n=%d pat=%q s=%q batch=%d:\n want %v\n got  %v", n, pat, s, batch, want, got)
 					}
@@ -156,12 +145,8 @@ func TestStepAllStringIndex_VsFindAll(t *testing.T) {
 		for _, s := range stepInputs {
 			want := std.FindAllStringIndex(s, -1)
 			for _, batch := range []int{1, 2, 3, 0} {
-				st := &MatchStep_t{}
-				if batch > 0 {
-					st = newMatchStepFixed(batch)
-				}
 				var got [][]int
-				re.StepAllStringIndex(st, s, -1, func(flat []int32) bool {
+				re.stepAll(s, -1, 1, batch, func(flat []int32) bool {
 					for k := 0; k+2 <= len(flat); k += 2 {
 						got = append(got, []int{int(flat[k]), int(flat[k+1])})
 					}
@@ -189,13 +174,12 @@ func TestStepAllStringIndex_VsFindAll(t *testing.T) {
 // TestStepAllString_Miss 条⑥ miss 路径: 一次都不调 batchFn。
 func TestStepAllString_Miss(t *testing.T) {
 	re := MustCompile(`zzz+`)
-	st := &MatchStep_t{}
 	calls := 0
-	re.StepAllStringSubmatchIndex(st, "abcabcabc", -1, func(flat []int32) bool { calls++; return false })
+	re.StepAllStringSubmatchIndex("abcabcabc", -1, func(flat []int32) bool { calls++; return false })
 	if calls != 0 {
 		t.Fatalf("无匹配却调了 batchFn %d 次", calls)
 	}
-	re.StepAllStringIndex(st, "abcabcabc", -1, func(flat []int32) bool { calls++; return false })
+	re.StepAllStringIndex("abcabcabc", -1, func(flat []int32) bool { calls++; return false })
 	if calls != 0 {
 		t.Fatalf("无匹配却调了 batchFn %d 次 (Index)", calls)
 	}
@@ -205,9 +189,8 @@ func TestStepAllString_Miss(t *testing.T) {
 func TestStepAllString_EarlyStop(t *testing.T) {
 	re := MustCompile(`a`)
 	s := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" // 32 处, 批容量 2 ⇒ 至少 16 批
-	st := newMatchStepFixed(2)
 	calls, seen := 0, 0
-	re.StepAllStringSubmatchIndex(st, s, -1, func(flat []int32) bool {
+	re.stepAll(s, -1, 1, 2, func(flat []int32) bool {
 		calls++
 		seen += len(flat) / 2
 		return calls < 3 // 第 3 批返回 false
@@ -220,16 +203,15 @@ func TestStepAllString_EarlyStop(t *testing.T) {
 	}
 }
 
-// TestStepAllString_ReuseNoBleed 条③ 复用不串味: 同一个 MatchStep_t 跨 re (per 不同) 跨正文
-// 反复用, 每次结果都要与一次性 API 相同。
+// TestStepAllString_ReuseNoBleed 条③ 借还不串味: 连着跨 re (per 不同) 跨正文调, 每块都是从池子里
+// 借来的旧块 (上一次调用刚还回去、里面还留着上一次的命中下标), 每次结果都要与一次性 API 相同。
 func TestStepAllString_ReuseNoBleed(t *testing.T) {
-	st := &MatchStep_t{} // 一个工作区打全场
 	for round := 0; round < 3; round++ {
 		for _, pat := range stepPatterns {
 			re := MustCompile(pat)
 			for _, s := range stepInputs {
 				want := re.FindAllStringSubmatchIndex(s, -1)
-				got := stepCollectSub(re, st, s, -1)
+				got := stepCollectSub(re, 0, s, -1)
 				if !eqLocs(want, got) {
 					t.Fatalf("round=%d pat=%q s=%q:\n want %v\n got  %v", round, pat, s, want, got)
 				}
@@ -238,22 +220,23 @@ func TestStepAllString_ReuseNoBleed(t *testing.T) {
 	}
 }
 
-// TestStepAllString_SteadyZeroAlloc 条④ 稳态零分配: 缓冲长到位之后, 再调不得有任何 Go 堆分配。
+// TestStepAllString_SteadyZeroAlloc 条④ 零分配 —— 而且【第一次调用就零】: 批缓冲是从库内池子借的,
+// 不是调用方现开的。第一版那套"调用方持有工作区"做不到这一条 (进 C 之前必须先 make 一块,
+// 命不命中都付), 换池子的全部理由就在这。
 func TestStepAllString_SteadyZeroAlloc(t *testing.T) {
 	re := MustCompile(`(\w+)=(\w+)`)
 	s := ""
 	for i := 0; i < 200; i++ {
 		s += "key=val "
 	}
-	st := &MatchStep_t{}
 	var sink int
 	run := func() {
-		re.StepAllStringSubmatchIndex(st, s, -1, func(flat []int32) bool {
+		re.StepAllStringSubmatchIndex(s, -1, func(flat []int32) bool {
 			sink += len(flat)
 			return true
 		})
 	}
-	run() // 预热: 让缓冲长到大批
+	run() // 让池子里先有一块 (第一块的 make 是一辈子一次, 不算稳态)
 	if got := testing.AllocsPerRun(50, run); got != 0 {
 		t.Fatalf("稳态每次调用分配 %v 笔, 期望 0", got)
 	}
@@ -262,26 +245,56 @@ func TestStepAllString_SteadyZeroAlloc(t *testing.T) {
 	}
 }
 
-// TestStepAllString_BufferGrowth 批容量增长策略: 首批 stepBatchFirst 处, 被填满之后长到
-// stepBatchMatches 处, 之后不再变; miss 的调用不该把缓冲撑大。
-func TestStepAllString_BufferGrowth(t *testing.T) {
-	re := MustCompile(`a`) // per = 2
-	st := &MatchStep_t{}
-	re.StepAllStringSubmatchIndex(st, "bbbb", -1, func(flat []int32) bool { return true }) // miss
-	if cap(st.buf) != stepBatchFirst*2 {
-		t.Fatalf("miss 之后缓冲 = %d int32, 期望首批 %d", cap(st.buf), stepBatchFirst*2)
+// TestStepAllString_MissZeroAlloc 🔴 miss 路径也必须零分配。
+// 这一条是为一个真踩过的坑立的判据: 老形状每次调用无条件先 make 一块 ~200B 的首批缓冲,
+// 【命不命中都付】, 而扫描型负载 (一张规则表挨个打同一份正文) 绝大多数调用是 miss ⟹ 换 step
+// 之后 Go 分配字节数反而涨 (asc 8.2MB 档 920.4M → 922.7M)。池化之后这条路一分钱不花。
+func TestStepAllString_MissZeroAlloc(t *testing.T) {
+	re := MustCompile(`(zzz)=(qqq)`) // per=6, 扫不到
+	s := ""
+	for i := 0; i < 200; i++ {
+		s += "key=val "
 	}
-	few := "a b a" // 2 处, 装不满首批
-	re.StepAllStringSubmatchIndex(st, few, -1, func(flat []int32) bool { return true })
-	if cap(st.buf) != stepBatchFirst*2 {
-		t.Fatalf("少量命中之后缓冲 = %d int32, 期望仍是首批 %d", cap(st.buf), stepBatchFirst*2)
+	run := func() {
+		re.StepAllStringSubmatchIndex(s, -1, func(flat []int32) bool { return true })
 	}
-	many := ""
-	for i := 0; i < 50; i++ { // 50 处 > stepBatchFirst, 必定填满首批
-		many += "a"
+	run()
+	if got := testing.AllocsPerRun(50, run); got != 0 {
+		t.Fatalf("miss 路径每次调用分配 %v 笔, 期望 0", got)
 	}
-	re.StepAllStringSubmatchIndex(st, many, -1, func(flat []int32) bool { return true })
-	if cap(st.buf) != stepBatchMatches*2 {
-		t.Fatalf("多命中之后缓冲 = %d int32, 期望长到大批 %d", cap(st.buf), stepBatchMatches*2)
+}
+
+// TestStepAllString_BufSize 批容量按 int32 数定死: 一块恒是 stepBufInts 个 int32, 一批装
+// stepBufInts/per 处 —— 与命中数、正文长度都无关, 也不再有"首批小、装满长大"那套两段式。
+func TestStepAllString_BufSize(t *testing.T) {
+	p := stepBufPool.Get().(*[]int32)
+	if len(*p) != stepBufInts || cap(*p) != stepBufInts {
+		t.Fatalf("池块 = %d/%d int32, 期望恒为 %d", len(*p), cap(*p), stepBufInts)
+	}
+	stepBufPool.Put(p)
+
+	// per=2 (无子组) ⟹ 一批 stepBufInts/2 处。喂 2 批多 5 处的命中 ⟹ 必然分成 3 批。
+	perBatch := stepBufInts / 2
+	hits := perBatch*2 + 5
+	re := MustCompile(`a`)
+	s := ""
+	for i := 0; i < hits; i++ {
+		s += "a"
+	}
+	batches, seen := 0, 0
+	re.StepAllStringIndex(s, -1, func(flat []int32) bool {
+		batches++
+		n := len(flat) / 2
+		if n > perBatch {
+			t.Fatalf("一批给了 %d 处, 超过 %d", n, perBatch)
+		}
+		seen += n
+		return true
+	})
+	if seen != hits {
+		t.Fatalf("收到 %d 处, 期望 %d", seen, hits)
+	}
+	if batches != 3 {
+		t.Fatalf("分了 %d 批, 期望 3 (一批 %d 处)", batches, perBatch)
 	}
 }

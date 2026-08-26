@@ -1,4 +1,4 @@
-// zexp_step_alloc_test.go — B/D/E 三个变体与现行 A 的逐处对拍 (先证明它们等价, 再谈快慢)。
+// zexp_step_alloc_test.go — 落选变体 B/D 与主线 (库内池) 的逐处对拍 (先证明它们等价, 再谈快慢)。
 package hgmLibre2
 
 import (
@@ -6,14 +6,14 @@ import (
 	"testing"
 )
 
-func collectA(re *Regexp, s string, n int, nmatch int) []int32 {
-	var st MatchStep_t
+// collectMain 用主线 API 收全部命中 —— 对拍的基准边。
+func collectMain(re *Regexp, s string, n int, nmatch int) []int32 {
 	var got []int32
 	fn := func(f []int32) bool { got = append(got, f...); return true }
 	if nmatch == 1 {
-		re.StepAllStringIndex(&st, s, n, fn)
+		re.StepAllStringIndex(s, n, fn)
 	} else {
-		re.StepAllStringSubmatchIndex(&st, s, n, fn)
+		re.StepAllStringSubmatchIndex(s, n, fn)
 	}
 	return got
 }
@@ -30,7 +30,7 @@ func TestStepAllocVariants_Equiv(t *testing.T) {
 		re := MustCompile(c.pat)
 		for _, nmatch := range []int{1, re.NumSubexp() + 1} {
 			for _, n := range []int{-1, 3, 0, 1} {
-				want := collectA(re, c.body, n, nmatch)
+				want := collectMain(re, c.body, n, nmatch)
 
 				var gotB []int32
 				fnB := func(f []int32) bool { gotB = append(gotB, f...); return true }
@@ -41,17 +41,6 @@ func TestStepAllocVariants_Equiv(t *testing.T) {
 				}
 				if !reflect.DeepEqual(want, gotB) {
 					t.Fatalf("B(CAlloc) 不等价 pat=%q n=%d nmatch=%d\nwant=%v\ngot =%v", c.pat, n, nmatch, want, gotB)
-				}
-
-				var gotE []int32
-				fnE := func(f []int32) bool { gotE = append(gotE, f...); return true }
-				if nmatch == 1 {
-					re.StepAllStringIndexPool(c.body, n, fnE)
-				} else {
-					re.StepAllStringSubmatchIndexPool(c.body, n, fnE)
-				}
-				if !reflect.DeepEqual(want, gotE) {
-					t.Fatalf("E(Pool) 不等价 pat=%q n=%d nmatch=%d", c.pat, n, nmatch)
 				}
 
 				if nmatch != 1 {
@@ -66,12 +55,12 @@ func TestStepAllocVariants_Equiv(t *testing.T) {
 	}
 }
 
-// 跨批 (含换大批那一跳: 命中数 > stepBatchFirst) 是 B 唯一会静默出错的地方 —— 换大批要 free 旧的、
-// 重新 malloc, 游标还得接得上。用一份 500 处命中的正文压这条路。
+// 跨批是 B 唯一会静默出错的地方 —— 每批之后游标 (pos/prevEnd) 得接得上, C 缓冲还得留到扫完。
+// 用一份 500 处命中的正文压这条路 (一批 stepBufInts/6=42 处 ⟹ 必然跨十几批)。
 func TestStepAllocVariants_CrossBatch(t *testing.T) {
 	re := MustCompile(`(\w+)=(\w+)`)
 	body := stepBenchNHits(500)
-	want := collectA(re, body, -1, re.NumSubexp()+1)
+	want := collectMain(re, body, -1, re.NumSubexp()+1)
 	if len(want) != 500*6 {
 		t.Fatalf("语料不对: %d", len(want))
 	}
@@ -79,11 +68,6 @@ func TestStepAllocVariants_CrossBatch(t *testing.T) {
 	re.StepAllStringSubmatchIndexCAlloc(body, -1, func(f []int32) bool { gotB = append(gotB, f...); return true })
 	if !reflect.DeepEqual(want, gotB) {
 		t.Fatalf("B(CAlloc) 跨批不等价: len want=%d got=%d", len(want), len(gotB))
-	}
-	var gotE []int32
-	re.StepAllStringSubmatchIndexPool(body, -1, func(f []int32) bool { gotE = append(gotE, f...); return true })
-	if !reflect.DeepEqual(want, gotE) {
-		t.Fatalf("E(Pool) 跨批不等价")
 	}
 	var gotD []int32
 	re.StepAllStringSubmatchIndexGoLocal(body, -1, func(f []int32) bool { gotD = append(gotD, f...); return true })
@@ -99,7 +83,7 @@ func TestStepAllocVariants_EarlyStop(t *testing.T) {
 	body := stepBenchNHits(500)
 	cnt := 0
 	re.StepAllStringSubmatchIndexCAlloc(body, -1, func(f []int32) bool { cnt += len(f) / 6; return false })
-	if cnt == 0 || cnt > stepBatchFirst {
-		t.Fatalf("提前停应当只收到第一批(≤%d 处), 实收 %d", stepBatchFirst, cnt)
+	if cnt == 0 || cnt > stepBufInts/6 {
+		t.Fatalf("提前停应当只收到第一批(≤%d 处), 实收 %d", stepBufInts/6, cnt)
 	}
 }
