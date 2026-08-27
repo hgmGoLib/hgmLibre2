@@ -9,8 +9,8 @@
 // 🔴 所以这组入口的存在理由只有一条: 让"从 pos 接着找"这件事不必切片。pos 是【原串上的
 //    偏移】, 整串照样喂给 RE2。
 //
-// 谁在用: MatchScanner 的 B 路 (matchscan.go 的 MatchScanMode_t) —— 它要"起点 >= 游标的
-// 最左匹配", 正是这个形状。
+// 谁在用: ① MatchScanner 的 B 路 (matchscan.go 的 MatchScanMode_t) —— 它要"起点 >= 游标的
+// 最左匹配", 正是这个形状。② 拿到整段区间之后回头补捕获组偏移的调用方 (下面那个 Submatch 版)。
 package hgmLibre2
 
 /*
@@ -59,4 +59,22 @@ func (ctx *FindStringIndex_ctx_t) FindStringIndexFrom(re *Regexp, s string, pos 
 	ctx.ret[0] = int(cbuf[0])
 	ctx.ret[1] = int(cbuf[1])
 	return ctx.ret[:]
+}
+
+// FindStringSubmatchIndexFrom 是 FindStringIndexFrom 的【带捕获组】版: 同样"起点 >= pos 的
+// 最左匹配", 但连子组偏移一起回填 (布局同 FindStringSubmatchIndex: 2*(numSubexp+1) 个,
+// 没参与匹配的组是 -1)。无匹配返回 nil。
+//
+// 🔴 它存在的理由与本文件头那段一字不差, 只是换个消费点: 调用方已经从别处 (比如
+//    MatchScanner) 拿到了某一处匹配的【整段区间】, 现在还想要这一段里某个捕获组的位置。
+//    没有这个入口的话只能 re.FindStringSubmatchIndex(s[lo:]) —— 那一刀切完, ^ 和 \b 在
+//    偏移 0 看到的是假邻居, 捕获组偏移会偏; 而捕获组偏移的下游往往是脱敏切片。
+//
+// 非锚定: 从 pos 起头找不到就往后找, 所以调用方拿到 m 之后【必须自己核对 m[0] 是不是就是
+// 那个 pos】—— 想问的是"这一处的子组", 不是"这之后随便哪一处的子组"。
+func (re *Regexp) FindStringSubmatchIndexFrom(s string, pos int) []int {
+	if pos < 0 || pos > len(s) {
+		return nil
+	}
+	return re.findFrom(s, pos)
 }
