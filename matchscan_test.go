@@ -72,7 +72,7 @@ func scanAll(t *testing.T, set *RegexpSet, text string) map[int32][]int32 {
 	}
 	defer ms.Close()
 	var all []SetMatch
-	all, unres, err := ms.AppendAllMatches(nil, text)
+	unres, err := ms.Scan(text, func(batch []SetMatch) { all = append(all, batch...) })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,7 +274,7 @@ func TestMatchScanEmptyCapableFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ms.Close()
-	if _, unres, err := ms.AppendAllMatches(nil, "--aa--bb--"); err != nil {
+	if unres, err := ms.Scan("--aa--bb--", func([]SetMatch) {}); err != nil {
 		t.Fatal(err)
 	} else if len(unres) != 1 || unres[0] != 0 {
 		t.Fatalf("要 [0] (a* 走老路), 得到 %v", unres)

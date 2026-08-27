@@ -164,7 +164,7 @@ as `regexp.Compile` (RE2's default Perl mode), *not* leftmost-longest — e.g.
   see [FindAllIndex](#findallindex-the-raw-end-point-runs) below
 - `RegexpSet.NewMatchScanner` (`MatchScanner`, `SetMatch`, `Scan`, `SetModes`,
   `MatchScanMode_t`, `Hit`,
-  `HitIDs`, `AppendAllMatches`, `Close`) — *not* in stdlib; the finished form of the
+  `HitIDs`, `Close`) — *not* in stdlib; the finished form of the
   above: one pass giving the hit table **and** de-duplicated match spans, replacing
   `Match` + one `FindAllStringIndex` per hit pattern;
   see [Where a set matched](#where-a-set-matched-matchscanner) below
@@ -531,14 +531,31 @@ ids := ms.HitIDs()                // the same hit table Set.Match would have ret
 // ms.Hit(i) is the O(1) form of the same answer
 ```
 
-**What it buys.** On a real 155-pattern table over a 6.4 MB body (47 patterns
-hitting, steady state, 64 MB budget) the whole leg drops from **369.3 ms**
-(`Match` + per-pattern `FindAll`) to **24.6 ms** — **15.0×** — and Go-heap
-allocation from 4.0 MB / 2252 objects to ~0 / 146. By input size on that corpus:
-≤ 8 KB break-even (1.0×), 32 KB 3.1×, 512 KB 6.1×, 2 MB 14×. The worst case
-measured is **0.94×** (6% slower): a synthetic string with a hit every 38 bytes,
-where nearly every byte is inside a match and the two cgo crossings per hit have
-nothing to amortise against.
+**What it buys.** Two measurements, on **different tables and corpora** — do not
+compare them across.
+
+On a production-shaped set (90 patterns, 52 of them wanting spans, 7.03 MB), with all
+three modes measured in the same run:
+
+| mode | whole leg | vs. the old path |
+|---|---|---|
+| old path (`Match`, then `FindAll` over the whole body per hit pattern) | 78.2 ms | 1.00× |
+| **`span`** (default, leftmost-longest) | 43.8 ms | **1.79×** |
+| **`spanFast`** | 24.6 ms | **3.18×** |
+| gate only (everything `boolOnly`) | 21.9 ms | 3.57× |
+
+All three hand back the identical 10 956 spans here, because every pattern in that
+table is anchored at both ends.
+
+On a real 155-pattern table over a 6.4 MB body (47 patterns hitting, steady state,
+64 MB budget) the whole leg drops from **369.3 ms** (`Match` + per-pattern `FindAll`)
+to **24.6 ms** — **15.0×** — and Go-heap allocation from 4.0 MB / 2252 objects to
+~0 / 146. By input size on that corpus: ≤ 8 KB break-even (1.0×), 32 KB 3.1×,
+512 KB 6.1×, 2 MB 14×. The worst case measured is **0.94×** (6% slower): a synthetic
+string with a hit every 38 bytes, where nearly every byte is inside a match and the
+two cgo crossings per hit have nothing to amortise against.
+🔴 That second set of numbers was taken on the **`spanFast`** path, before the default
+path existed; the default mode costs ~1.6× `spanFast` per hit.
 
 Rules that matter, all pinned by tests (`matchscan_test.go`, `spanscan_*_test.go`):
 
@@ -590,6 +607,9 @@ silently at scan time.
 
 #### What `Scan` guarantees
 
+Long-form, in Chinese, with the fuzz recipe for promoting a pattern to `spanFast`:
+[`doc/MatchScanner的leftmost-longest保证.md`](doc/MatchScanner%E7%9A%84leftmost-longest%E4%BF%9D%E8%AF%81.md).
+
 In the default mode (`MatchScanMode_span`) the spans handed to you satisfy:
 
 1. `text[Lo:Hi]` is a **real** match of that pattern;
@@ -640,6 +660,10 @@ neither. The differences are real matches with a different left edge or length, 
 matters if you feed the span into a checksum (an ID or IBAN check digit will simply
 fail) or use it to mask bytes (a few plaintext bytes survive).
 
+How to earn the right to hang a pattern here — the fuzz recipe, the four things that
+otherwise make it vacuously green, and what it found on a real 56-pattern table — is
+in [`doc/MatchScanner的leftmost-longest保证.md`](doc/MatchScanner%E7%9A%84leftmost-longest%E4%BF%9D%E8%AF%81.md).
+
 **Anchoring removes this entirely.** Wrapping a variable pattern in word boundaries —
 `\b(?:…)\b` — pins the start, so "which start to pick" never arises: in the same
 120 000-span comparison the 60 differing spans of the bare patterns became **0**. The
@@ -659,10 +683,14 @@ spans were already handed out, so patching only the tail would silently lose spa
 Indices you set to `boolOnly` are never listed — those are your choice, not a
 library limitation. The slice is overwritten by the next `Scan`.
 
-`(*MatchScanner).AppendAllMatches(dst, text)` is the convenience form that appends
-everything into one slice and drops the unresolved patterns for you. It is for tests
-and measurement — its memory tracks input length (~0.037 MB per MB of input on the
-table above), which is the thing `Scan`'s batching exists to avoid.
+🔴 There is deliberately **no** "give me one array at the end" entry point
+(`AppendAllMatches` was removed on 2026-08-27). Such a convenience form always creeps
+from tests and measurement into production, and its `dst` is a ratchet buffer that
+tracks input length (~0.037 MB per MB of input on the table above) — exactly what the
+batched interface exists to avoid. Callers who want an array append one line inside
+their own `Scan` callback, where the cost is visible to whoever wrote it; they are
+then responsible for dropping what they already received for the `unresolved`
+indices.
 
 #### `FindAllIndex`: the raw end-point runs
 

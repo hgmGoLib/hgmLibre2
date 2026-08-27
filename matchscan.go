@@ -1,5 +1,9 @@
 // matchscan.go —— 一遍扫正文, 边扫边【一批一批】交出各条 pattern 的不重复命中区间。
 //
+// 🔴 一句话: 【默认档已经保证 leftmost-longest】, 除非调用方自己挂了 spanFast 又挂错了。
+//    怎么用 · 这句保证怎么兑现的 · 怎么用 fuzz 把更多条拉进 spanFast 快档:
+//    doc/MatchScanner的leftmost-longest保证.md。
+//
 // ── 它替掉的是哪段路 ────────────────────────────────────────────────────────
 // 调用方今天的写法是"两段式": 先 Set.Match 扫一遍拿到"哪几条命中"(一张 bool 表), 然后为了知道
 // 【命中在哪】, 把这几条各自的 Regexp 拿出来对整篇正文再跑一遍 FindAllStringIndex。命中 k 条
@@ -121,6 +125,9 @@
 // ── 路 A 给的是"第三种口径" (挂 spanFast 之前必须读完这一节) ─────────────────
 //
 // 下面整节讲的都是【路 A】。默认档走 B, 没有这些坑 —— 代价是上一节那 1.6x / 2.00x。
+// 🔴 挂 spanFast 要的那份凭据怎么跑 (语料必须从 pattern 自己的 AST 生成再交叉构造; 对拍要拿
+//    Longest() 当 oracle; 对拍自己先要有一道"已知反例必须红"的自检门), 见
+//    doc/MatchScanner的leftmost-longest保证.md 第 5 节 —— 少一件就是空转绿。
 //
 //	定长档 (min == max)      与 FindAllStringIndex 【逐字节相同】, 而且是可以论证的:
 //	                         右端 e 的起点只能是 e-min (唯一), 所以"起点随右端单调"必然成立;
@@ -167,7 +174,7 @@
 //    (曾经有过一道 PatternLeftmostLongestSafe 静态闸, 想把"最长 ≠ 贪心"的 pattern 挡在
 //     门外。2026-08-25 删掉了: 它只查 OpAlternate, 而 ? * + {m,n} 同样是长度不齐的交替,
 //     把口子堵严的话它就退化成 min == max 本身 —— 也就是变长快路整个清空。既然它兑现不了
-//     "等于 FindAll"这个承诺, 就不该拿 8 倍的钱去买: 真表上闸装着 1.82×, 拆掉 15.01×。)
+//     "等于 FindAll"这个承诺, 就不该拿 8 倍的钱去买: 真表上闸装着 1.82×, 拆掉 15.03×。)
 //
 // unresolved 里的那几条 (单条对象编不出来 / 游程乱序 / DFA 预算不够) 请调用方照老路对它跑
 // FindAll —— 库这边宁可退回去也不给一个"像是对的"答案。
@@ -520,39 +527,12 @@ func (m *MatchScanner) Hit(i int) bool {
 	return i >= 0 && i < len(m.hit) && m.hit[i]
 }
 
-// 🔴 待删除 (2026-08-26) —— 用 Scan 自己收。
-//
-// 理由: 本库【故意不提供】"把命中索引一次性物化成数组"的对外接口。有这么一个便利版在,
-// 它就一定会从量具/对拍爬进生产路径 (dst 是一块 ∝ 命中数的 ratchet 缓冲, 正是分批接口要躲开的
-// 那个东西), 而且下面那行"生产路径别用"的注释拦不住任何人。要一次性数组的调用方自己在
-// Scan 的回调里 append 一行就有了 —— 那一行写在调用方自己家里, 谁写谁看得见代价。
-// 库内 matchscan_test.go 的两处用法一并改成在回调里自己收。
-//
-// AppendAllMatches 是"全要, 而且一次性给我个数组"的便利版 (量具 / 对拍用): 扫一遍, 把每一批
-// 都 append 起来, 最后把 unresolved 那几条已经收到的剔掉。
-// 🔴 生产路径别用: 内存跟着正文长度走 (真表 0.037MB/MB), 正是 Scan 的分批接口要躲开的东西。
-func (m *MatchScanner) AppendAllMatches(dst []SetMatch, text string) (out []SetMatch, unresolved []int32, err error) {
-	base := len(dst)
-	unresolved, err = m.Scan(text, func(ms []SetMatch) { dst = append(dst, ms...) })
-	if err != nil {
-		return dst[:base], nil, err
-	}
-	if len(unresolved) == 0 {
-		return dst, nil, nil
-	}
-	// 作废那几条可能已经交出去过几处, 全剔掉 —— 调用方对它们要走老路, 留着就是重复。
-	drop := make([]bool, len(m.per))
-	for _, id := range unresolved {
-		drop[id] = true
-	}
-	keep := dst[:base]
-	for _, sm := range dst[base:] {
-		if !drop[sm.Index] {
-			keep = append(keep, sm)
-		}
-	}
-	return keep, unresolved, nil
-}
+// 🔴 本库【故意不提供】"把命中区间一次性物化成一个数组"的对外接口 (2026-08-27 删掉了
+// AppendAllMatches)。有这么一个便利版在, 它就一定会从量具/对拍爬进生产路径 —— dst 是一块
+// ∝ 命中数的 ratchet 缓冲, 正是分批接口要躲开的那个东西 (真表 0.037MB/MB, 200MB 的 body
+// 就是每个并发扫描 7.4MB 常驻), 而一行"生产路径别用"的注释拦不住任何人。
+// 要一次性数组的调用方自己在 Scan 的回调里 append 一行就有了 —— 那一行写在调用方自己家里,
+// 谁写谁看得见代价。unresolved 那几条已经交出去的处数要自己剔掉再走老路 (见 Scan 的说明)。
 
 // errClosedMatchScanner 单独提出来, 免得每次构造一遍 error。
 var errClosedMatchScanner = errors.New("re2native: match scanner closed")
