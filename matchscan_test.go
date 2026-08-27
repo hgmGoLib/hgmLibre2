@@ -316,7 +316,7 @@ func TestMatchScanBoolOnly(t *testing.T) {
 // 逐字节等于 stdlib 的 re.Longest().FindAllStringIndex。
 //
 // 语料就是 matchscan.go 文件头列的那几个已知反例 —— 它们正是路 A 岔开的地方。测试同时把
-// 同一批 pattern 用 spanUnsafeCursor (路 A) 再跑一遍并数出岔开了几条: 这一数不是为了钉住
+// 同一批 pattern 用 spanFast (路 A) 再跑一遍并数出岔开了几条: 这一数不是为了钉住
 // A 的答案 (那是"第三种口径", 本来就不该被钉), 是为了证明【这几条语料真的有牙齿】——
 // 要是哪天 A 也全对了, 说明选的反例失效了, 该换一批。
 func TestMatchScanSpanIsLongest(t *testing.T) {
@@ -341,7 +341,7 @@ func TestMatchScanSpanIsLongest(t *testing.T) {
 		for _, loc := range want.FindAllStringIndex(c.text, -1) {
 			flat = append(flat, int32(loc[0]), int32(loc[1]))
 		}
-		for _, mode := range []MatchScanMode_t{MatchScanMode_span, MatchScanMode_spanUnsafeCursor} {
+		for _, mode := range []MatchScanMode_t{MatchScanMode_span, MatchScanMode_spanFast} {
 			ms, err := set.NewMatchScanner()
 			if err != nil {
 				t.Fatal(err)

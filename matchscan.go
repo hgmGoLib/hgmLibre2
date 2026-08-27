@@ -43,8 +43,10 @@
 //	                                 在哪 —— 那几条不该为它花补端点的钱。
 //	MatchScanMode_span               要区间。【零值 = 默认档】。库自动分档 (下一节),
 //	                                 对外保证 leftmost-longest。
-//	MatchScanMode_spanUnsafeCursor   要区间, 但强制走路 A (便宜, 口径是第三种)。
-//	                                 举证责任在调用方, 见 SetModes 那段红字。
+//	MatchScanMode_spanFast           要区间, 快, 【不保证】leftmost-longest。自动分档把某条
+//	                                 判成变长而落到路 B、性能又确实亏了的时候, 调用方可以自己
+//	                                 拿 fuzz 把"这条走路 A 也是 leftmost-longest"跑出来, 跑出来
+//	                                 了就挂这一档 —— 挂上之后它既快, 又确实是 leftmost-longest。
 //
 // 🔴 三态而不是"两张 mask"(要不要位置 × 走哪条路), 是因为 want=false 且 pathB=true 是个
 //    无意义组合 —— 两张 mask 早晚打架, 一张三态的表打不起来。
@@ -116,7 +118,7 @@
 //    "谁能活"要等消费点把校验位跑完才知道 —— 库这层两样都不知道。真语料上被 ≥2 条 pattern
 //    盖住的字节占已盖住字节的 55.6%, 同一字节最多被 8 条盖, 所以这是常态不是边角。
 //
-// ── 路 A 给的是"第三种口径" (选 spanUnsafeCursor 之前必须读完这一节) ─────────
+// ── 路 A 给的是"第三种口径" (挂 spanFast 之前必须读完这一节) ─────────────────
 //
 // 下面整节讲的都是【路 A】。默认档走 B, 没有这些坑 —— 代价是上一节那 1.6x / 2.00x。
 //
@@ -259,12 +261,21 @@ const MatchScanMode_span MatchScanMode_t = ""
 //    它们的端点补全 (真花钱的那步), 不只是内存。
 const MatchScanMode_boolOnly MatchScanMode_t = "boolOnly"
 
-// MatchScanMode_spanUnsafeCursor 要区间, 但【强制走路 A】(游标启发式)。比默认档便宜, 代价是
-// 它给的是文件头说的【第三种口径】—— 只在"起点随右端单调"时才等于 leftmost-longest。
+// MatchScanMode_spanFast 要区间, 快, 【不保证】leftmost-longest —— 它强制走路 A (游标启发式),
+// 而路 A 给的是文件头说的第三种口径: 只在"起点随右端单调"时才等于 leftmost-longest。
+// 🔴 不保证【不等于】"不是": 12 万处对账里 119972 处与 Longest 相同, 岔开的是 28 处。
+//    每一处也都是真匹配 (①), 同一条内部照样不重叠升序 (②)。少的只有③那一条。
 //
-// 🔴 名字里带 Unsafe 是认真的: 选它 = 调用方自己承担"这条 pattern 没有歧义"的举证责任
-//    (静态可论证, 或者拿对拍 + 真语料钉住)。举证不了就别选, 默认档的保证是无条件的。
-const MatchScanMode_spanUnsafeCursor MatchScanMode_t = "spanUnsafeCursor"
+// 这一档是给【自动分档判错了】的那种情况留的出口: 库这边只按 min/max 分, 判成变长就一律
+// 落到路 B (每处 1.6x, 走空档另加, 上限 2.00x)。可是"变长"不等于"有歧义" —— 两头带 \b 的
+// 变长条实测岔开【0 处】。这种条落在 B 上是白掏钱。
+//
+// 🔴 挂之前先把凭据跑出来, 别凭感觉: 拿这条 pattern 自己 fuzz 一遍 (随机正文 × 两档对拍),
+//    数出岔开 0 处再挂。跑出来了就挂 —— 挂上之后它既是快的那条路, 又确实是 leftmost-longest。
+//    跑不出 0 就别挂, 默认档的保证是无条件的; 岔开那几处【是真匹配但边界偏了】, 拿去过
+//    校验位 (身份证 · IBAN mod-97 · Luhn) 会失败, 整条真命中被调用方自己毙掉 = 无声漏报。
+//    asc/engine/sd_body_gate_span_cross_test.go 是一份现成的写法。
+const MatchScanMode_spanFast MatchScanMode_t = "spanFast"
 
 // SetModes 声明每条 pattern 要什么 (下标即 pattern 下标, 长度不足的按零值 = 默认档)。
 // 传 nil = 全默认档。调用方那边这是【静态】信息, 建集的时候就知道, 热路径上不该每遍改。
@@ -397,7 +408,7 @@ func (m *MatchScanner) feed(i int, lo, hi int32) {
 		p.fixed = minL == maxL && maxL >= 0
 		// 分档就这一句: 定长恒走减法 (两条路在定长上是同一个答案, 见文件头那一节),
 		// 变长看档位 —— 默认档走 B (保 leftmost-longest), 显式降级的走 A。
-		p.pathB = !p.fixed && m.modeOf(i) != MatchScanMode_spanUnsafeCursor
+		p.pathB = !p.fixed && m.modeOf(i) != MatchScanMode_spanFast
 		switch {
 		case p.fixed:
 			// 定长: 起点唯一 (e-minL), 一句减法, 不进正则引擎。什么对象都不用建。
@@ -411,7 +422,7 @@ func (m *MatchScanner) feed(i int, lo, hi int32) {
 			}
 		default:
 			// 路 A: 起点靠这一条自己的反向对象锚定回推。给出来的口径是第三种 ——
-			// 见文件头那一节, 选了 spanUnsafeCursor 的调用方自己举证。
+			// 见文件头那一节, 选了 spanFast 的调用方自己举证。
 			if p.rev = m.set.reverseOne(i); p.rev == nil {
 				m.markBad(i)
 				return

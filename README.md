@@ -569,7 +569,7 @@ a short slice take the zero value; `nil` = all default):
 |---|---|
 | `MatchScanMode_span` (zero value) | give me spans. The library picks the strategy per pattern and guarantees **leftmost-longest**. |
 | `MatchScanMode_boolOnly` | I only need "did it hit". No span is ever closed, no endpoint recovered. |
-| `MatchScanMode_spanUnsafeCursor` | give me spans, but force the cheap cursor path. Its semantics are the third kind described below — **you** carry the burden of proof that this pattern is unambiguous. |
+| `MatchScanMode_spanFast` | give me spans, fast, with **no** leftmost-longest guarantee. Forces the cheap cursor path. This is the escape hatch for when the automatic tiering is too coarse: it splits on `min`/`max` only, but "variable-length" is not the same as "ambiguous" — anchored variable patterns measured **0** divergences. Fuzz that one pattern first (random texts, both modes, count divergences); if the count is 0, hang it here and you get both the fast path *and* leftmost-longest. |
 
 `boolOnly` is the one that pays: patterns left out of span work still appear in the
 hit table, they just never pay for endpoint recovery, which is the expensive half.
@@ -612,10 +612,10 @@ How the endpoint is recovered, per pattern:
 |---|---|---|
 | `min == max` (fixed length) | any | `Lo = Hi - min`, one subtraction, the regex engine is never entered. Both paths agree here, so the mode does not apply. |
 | variable | `span` (default) | forward unanchored search from `max(cursor, Hi-maxLen)` for the leftmost start, then an anchored longest end. This *is* the definition of leftmost-longest, so it holds for any pattern shape. Costs ~1.6× path A per hit, plus walking the gaps for patterns with no length bound (bounded by one extra pass over the text). |
-| variable | `spanUnsafeCursor` | one anchored look-back from `Hi` using a reverse object built for **that one pattern**, bounded by the cursor. Cost is independent of text length — that is the whole reason it exists. Semantics: the third kind, below. |
+| variable | `spanFast` | one anchored look-back from `Hi` using a reverse object built for **that one pattern**, bounded by the cursor. Cost is independent of text length — that is the whole reason it exists. Semantics: the third kind, below — equal to leftmost-longest in 119 972 of 120 000 measured spans, but not guaranteed. |
 | — | — | patterns whose single-pattern object will not compile are reported in `unresolved`. |
 
-#### `spanUnsafeCursor`: the third semantics
+#### `spanFast`: the third semantics (read this before hanging a pattern here)
 
 For the fixed-length tier the equality is provable, not merely measured: an end `e`
 has exactly one possible start `e-min`, so starts are monotone in ends and "greedy
