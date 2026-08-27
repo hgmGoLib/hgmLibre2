@@ -213,10 +213,6 @@ func TestMatchScanReverse_Modes(t *testing.T) {
 	if err := ms.SetModes([]MatchScanMode_t{MatchScanMode_span, MatchScanMode_span, MatchScanMode_span}); err == nil {
 		t.Fatal("x* 配 span 该当场报错")
 	}
-	// spanFast 在反向这一侧不存在。
-	if err := ms.SetModes([]MatchScanMode_t{MatchScanMode_spanFast}); err == nil {
-		t.Fatal("反向配 spanFast 该当场报错")
-	}
 	// boolOnly: 进命中表, 但一处区间都不收口。
 	if err := ms.SetModes([]MatchScanMode_t{MatchScanMode_span, MatchScanMode_boolOnly, MatchScanMode_boolOnly}); err != nil {
 		t.Fatal(err)

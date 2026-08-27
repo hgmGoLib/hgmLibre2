@@ -319,63 +319,10 @@ func TestMatchScanBoolOnly(t *testing.T) {
 	}
 }
 
-// TestMatchScanSpanIsLongest —— 默认档 (MatchScanMode_span, 走路 B) 的那条【无条件保证】:
-// 逐字节等于 stdlib 的 re.Longest().FindAllStringIndex。
-//
-// 语料就是 matchscan.go 文件头列的那几个已知反例 —— 它们正是路 A 岔开的地方。测试同时把
-// 同一批 pattern 用 spanFast (路 A) 再跑一遍并数出岔开了几条: 这一数不是为了钉住
-// A 的答案 (那是"第三种口径", 本来就不该被钉), 是为了证明【这几条语料真的有牙齿】——
-// 要是哪天 A 也全对了, 说明选的反例失效了, 该换一批。
-func TestMatchScanSpanIsLongest(t *testing.T) {
-	cases := []struct{ pat, text string }{
-		{`abc|b`, "abc"},                       // 文件头那个最小反例
-		{`x{1,3}[a-c]?(?:ab|cd)?`, "xab"},      // 12 万处对账里差出来的三条
-		{`(?:ab)?[bc]{1,2}`, "axbabbyxx"},      //
-		{`(?:ab)*b{1,3}`, "yaxyabbbb"},         //
-		{`a|ab`, "abab"},                       // 贪心 ≠ 最长 的最小例
-		{`[a-f]{2,6}`, "beefcafebabe"},         // 变长但无歧义: 两条路都该对
-		{`\b[A-Z][12]\d{8}\b`, "x A123456780"}, // 定长: 档位对它不生效
-	}
-	divergedA := 0
-	for _, c := range cases {
-		set, err := NewRegexpSet([]string{c.pat})
-		if err != nil {
-			t.Fatalf("%q: %v", c.pat, err)
-		}
-		want := regexp.MustCompile(c.pat)
-		want.Longest()
-		var flat []int32
-		for _, loc := range want.FindAllStringIndex(c.text, -1) {
-			flat = append(flat, int32(loc[0]), int32(loc[1]))
-		}
-		for _, mode := range []MatchScanMode_t{MatchScanMode_span, MatchScanMode_spanFast} {
-			ms, _, err := set.NewMatchScanner()
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := ms.SetModes([]MatchScanMode_t{mode}); err != nil {
-				t.Fatal(err)
-			}
-			byPat := scanByPat(t, ms, c.text)
-			ms.Close()
-			got := byPat[0]
-			same := fmt.Sprint(got) == fmt.Sprint(flat)
-			if mode == MatchScanMode_span {
-				if !same {
-					t.Errorf("%q 撞 %q: 默认档给 %v, Longest 给 %v", c.pat, c.text, got, flat)
-				}
-				continue
-			}
-			if !same {
-				divergedA++
-				t.Logf("(预期内) %q 撞 %q: 路 A 给 %v, Longest 给 %v", c.pat, c.text, got, flat)
-			}
-		}
-	}
-	if divergedA == 0 {
-		t.Errorf("一条都没岔开 —— 这批反例已经失效, 换一批, 否则这个测试是空的")
-	}
-}
+// 🔴 这里曾经有一个 TestMatchScanSpanIsLongest: 同一批已知反例上, 默认档对 Longest()、
+//    spanFast 那一档数岔开几条。2026-08-28 spanFast 整档删了, 而它对默认档那一半连语料
+//    带判据都被 matchscan_viable_test.go 的 TestMatchScanViableIsLongest 整个盖住 (那边
+//    的例子还多两条), 所以这里不再留一份。
 
 // TestMatchScanSetModesRejectsEmptyCapable —— 能匹配空串的 pattern 想要区间, SetModes 当场
 // 报错 (不是等到扫描时静默退回老路); 配成 boolOnly 则放行。

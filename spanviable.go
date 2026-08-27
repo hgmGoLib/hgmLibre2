@@ -12,8 +12,9 @@
 //      \b(?:ab cd ef|cd)\b 撞 "ab cd ef": 门给的最小右端是 "cd" 那一处的右端 (偏移 5),
 //      只种 accept 只能回推到 3 ("cd" 的左端); 而真正的 leftmost 起点是 0 ——
 //      text[0:5) = "ab cd" 【不是】匹配, 但它是可行前缀 (再补 " ef" 就成了)。
-//    种全部状态才看得见 0 这个候选。这就是路 A (spanFast) 那条"第三种口径"的病根,
-//    也是 MatchScanner2 拿它换严格 leftmost-longest 的地方。
+//    种全部状态才看得见 0 这个候选。2026-08-28 之前 MatchScanner 有一档 spanFast 走的正是
+//    "只种 accept"那条路 (老的"路 A"), 上面这个例子就是它那个"第三种口径"的病根;
+//    整档删了, 现在 MatchScanner 补起点【只走本函数这一条路】, 换来的就是严格 leftmost-longest。
 //
 // 🔴 为什么"种全部状态"就等于可行前缀 (证明): 反向 set 的程序 R 认的是 reverse(L)。
 //    这一趟从 e 往左吃字节, 吃进去的串正好是 reverse(text[s,e)); 种子是 R 的【全部活状态】,

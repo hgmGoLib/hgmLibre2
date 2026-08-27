@@ -164,7 +164,7 @@ as `regexp.Compile` (RE2's default Perl mode), *not* leftmost-longest — e.g.
   see [FindAllIndex](#findallindex-the-raw-end-point-runs) below
 - `RegexpSet.NewMatchScanner` (`MatchScanner`, `SetMatch`, `Scan`, `SetModes`,
   `MatchScanMode_t`, `Hit`,
-  `HitIDs`, `Close`) — *not* in stdlib; the finished form of the
+  `HitIDs`, `Stats`, `MatchScanStats_t`, `Close`) — *not* in stdlib; the finished form of the
   above: one pass giving the hit table **and** de-duplicated match spans, replacing
   `Match` + one `FindAllStringIndex` per hit pattern;
   see [Where a set matched](#where-a-set-matched-matchscanner) below
@@ -179,8 +179,8 @@ as `regexp.Compile` (RE2's default Perl mode), *not* leftmost-longest — e.g.
   input length; see [ResolveSpan](#resolvespan-complete-one-end-point-into-a-span) below
 - `PatternLenRange` / `RegexpSet.PatternLenRange` / `PatLenUnbounded` — *not* in stdlib;
   the byte-length range a pattern can match; see [PatternLenRange](#patternlenrange) below
-- `RegexpSet.ReverseOneStats` — *not* in stdlib; how much the lazily built per-pattern
-  reverse objects (used to recover left edges) cost in states and bytes
+- `RegexpSet.ViableOneStats` — *not* in stdlib; how much the lazily built per-pattern
+  reverse sets (used to recover left edges) cost in states and bytes
 - `CompileLongest` / `CompileLongestMaxMem` / `MustCompileLongest` — *not* in stdlib as
   constructors (the stdlib spelling is the `re.Longest()` mutator); compile one pattern
   under **leftmost-longest (POSIX)** semantics instead of the default leftmost-first.
@@ -553,6 +553,11 @@ err = ms.Scan(body, func(batch []hgmLibre2.SetMatch) {
 })                                // err != nil ⟹ the whole pass is void; redo it with FindAll
 ids := ms.HitIDs()                // the same hit table Set.Match would have returned
 // ms.Hit(i) is the O(1) form of the same answer
+st := ms.Stats()                  // Walks / Cands / Tries / Emits for that pass
+// st.Tries/st.Walks is the number to watch: 1.00 means the first candidate start was
+// always the answer. Measured 1.00 on every production table. The first three counters
+// cover variable-length patterns only (fixed-length ones never look back); Emits counts
+// every span, so Tries/Emits is NOT "tries per look-back".
 ```
 
 **What it buys.** Two measurements, on **different tables and corpora** — do not
@@ -565,7 +570,7 @@ three modes measured in the same run:
 |---|---|---|
 | old path (`Match`, then `FindAll` over the whole body per hit pattern) | 78.2 ms | 1.00× |
 | **`span`** (default, leftmost-longest) | 43.8 ms | **1.79×** |
-| **`spanFast`** | 24.6 ms | **3.18×** |
+| **`spanFast`** (removed 2026-08-28) | 24.6 ms | **3.18×** |
 | gate only (everything `boolOnly`) | 21.9 ms | 3.57× |
 
 All three hand back the identical 10 956 spans here, because every pattern in that
@@ -578,8 +583,10 @@ to **24.6 ms** — **15.0×** — and Go-heap allocation from 4.0 MB / 2252 obje
 512 KB 6.1×, 2 MB 14×. The worst case measured is **0.94×** (6% slower): a synthetic
 string with a hit every 38 bytes, where nearly every byte is inside a match and the
 two cgo crossings per hit have nothing to amortise against.
-🔴 That second set of numbers was taken on the **`spanFast`** path, before the default
-path existed; the default mode costs ~1.6× `spanFast` per hit.
+🔴 Both sets of numbers predate the 2026-08-28 path change; they answer a different
+question — *how much better is this layer than not having it* (versus the old "gate `Match`
+plus one `FindAll` per hit pattern") — and that ratio only improved. Post-change numbers are
+in `doc/补起点换路的实测账_20260828.txt`.
 
 Rules that matter, all pinned by tests (`matchscan_test.go`, `spanscan_*_test.go`):
 
@@ -603,14 +610,19 @@ Rules that matter, all pinned by tests (`matchscan_test.go`, `spanscan_*_test.go
 
 #### `SetModes`: what each pattern needs
 
-`ms.SetModes(modes)` declares, per pattern index, one of three things (indices beyond
+`ms.SetModes(modes)` declares, per pattern index, one of two things (indices beyond
 a short slice take the zero value; `nil` = all default):
 
 | mode | what it means |
 |---|---|
-| `MatchScanMode_span` (zero value) | give me spans. The library picks the strategy per pattern and guarantees **leftmost-longest**. |
+| `MatchScanMode_span` (zero value) | give me spans. **Leftmost-longest, unconditionally** — no pattern shape escapes it. |
 | `MatchScanMode_boolOnly` | I only need "did it hit". No span is ever closed, no endpoint recovered. |
-| `MatchScanMode_spanFast` | give me spans, fast, with **no** leftmost-longest guarantee. Forces the cheap cursor path. This is the escape hatch for when the automatic tiering is too coarse: it splits on `min`/`max` only, but "variable-length" is not the same as "ambiguous" — anchored variable patterns measured **0** divergences. Fuzz that one pattern first (random texts, both modes, count divergences); if the count is 0, hang it here and you get both the fast path *and* leftmost-longest. |
+
+🔴 Until 2026-08-28 there was a third mode, `MatchScanMode_spanFast`, forcing a cheap
+cursor path that did **not** guarantee leftmost-longest and required the caller to fuzz
+out a per-pattern clearance first. It is **gone**. The path that replaced it is both
+strictly leftmost-longest *and* cheaper than `spanFast` was, so the trade it offered no
+longer exists — see *How the three paths became one* below.
 
 `boolOnly` is the one that pays: patterns left out of span work still appear in the
 hit table, they just never pay for endpoint recovery, which is the expensive half.
@@ -631,7 +643,7 @@ silently at scan time.
 
 #### What `Scan` guarantees
 
-Long-form, in Chinese, with the fuzz recipe for promoting a pattern to `spanFast`:
+Long-form, in Chinese:
 [`doc/MatchScanner的leftmost-longest保证.md`](doc/MatchScanner%E7%9A%84leftmost-longest%E4%BF%9D%E8%AF%81.md).
 
 In the default mode (`MatchScanMode_span`) the spans handed to you satisfy:
@@ -655,8 +667,7 @@ How the endpoint is recovered, per pattern:
 | pattern shape | mode | how |
 |---|---|---|
 | `min == max` (fixed length) | any | `Lo = Hi - min`, one subtraction, the regex engine is never entered. Both paths agree here, so the mode does not apply. |
-| variable | `span` (default) | **one** forward unanchored search from `max(cursor, Hi-maxLen)`, using the **longest-mode** single-pattern object for that pattern, which yields the whole leftmost-longest span in a single call. This *is* the definition of leftmost-longest, so it holds for any pattern shape. Cost: walking the gaps for patterns with no length bound (bounded by one extra pass over the text). |
-| variable | `spanFast` | **two** calls, both independent of text length: an anchored look-back from `Hi` using the reverse object built for **that one pattern** (bounded by the cursor), then an anchored longest end from that start. That independence is the whole reason it exists. Semantics: the third kind, below — equal to leftmost-longest in 119 972 of 120 000 measured spans, but not guaranteed. |
+| variable | `span` (default) | **two steps.** ① A reverse pass from the end `e` with **every live state seeded**, walking left until the machine dies, collecting *all* viable-prefix starts in `[cursor, e)` (`RegexpSetReverse.ViableStarts`, on a reverse set holding **just that one pattern**). ② Try those candidates **in ascending order** with an anchored longest forward search; the first one that verifies is the answer. Ascending ⟹ leftmost; longest-mode ⟹ longest end. Strictly leftmost-longest for any pattern shape, and **no `maxLen` is needed** — the look-back's lower bound is wherever the reverse machine died. Cost: the look-back windows are pairwise **disjoint** (bounded by one extra pass over the text) plus however many false candidates get verified — measured `1.00` tries per look-back on every production table. |
 | — | — | if the single-pattern object will not compile, `maxMem` is too small and `Scan` fails the whole pass. |
 
 **One rule governs all of it (2026-08-27): the pass over the text uses the set; every
@@ -667,19 +678,19 @@ the set.** Three reasons:
    OnePass/BitState/NFA. The set's anchored resolve is a `kManyMatch` DFA **and
    nothing else** — upstream included (`re2_set.cc:216`: `dfa_failed` ⟹ `return
    false`) — so "the DFA gave up" there can only fail the whole pass. After the
-   change only `spanFast`'s first call (the reverse look-back) can still hit that,
-   because RE2 itself has no other way to find a match's left edge.
+   change only the reverse look-back can still hit that, because RE2 itself has no
+   other way to find a match's left edge.
 2. Endpoint traffic no longer churns the big shared DFA cache of the whole table.
 3. Smaller states: a single pattern does not carry `kManyMatch`'s per-state id list.
 
-The answers are byte-for-byte unchanged — `TestMatchScanPathsSameAsSetRoute` replays
-the old set-based route (using the set entry points, which are all still there) over
-300 AST-generated corpora per path, 54 000 spans, zero differences. Cost, measured
-old-vs-new in one binary (`BenchmarkMatchScanOldVsNew`, 64 KB corpus, `benchPats`):
-dense hits 968 µs → 618 µs for `span` and 614 µs → 447 µs for `spanFast`; sparse and
-zero-hit corpora are unchanged (their time is all in walking the gaps).
+The answers were byte-for-byte unchanged (`TestMatchScanPathsSameAsSetRoute`: 300
+AST-generated corpora per path, 54 000 spans, zero differences), and dense-hit corpora
+got 27–36% cheaper. 🔴 That test was removed on 2026-08-28 along with the two paths it
+replayed; the same AST-generated corpus is now pinned in `matchscan_astfuzz_test.go`
+against stdlib's `Longest()`, which is a harder oracle than a replica of our own old
+code.
 
-#### `spanFast`: the third semantics (read this before hanging a pattern here)
+#### How the three paths became one (2026-08-28)
 
 For the fixed-length tier the equality is provable, not merely measured: an end `e`
 has exactly one possible start `e-min`, so starts are monotone in ends and "greedy
@@ -687,34 +698,59 @@ leftmost non-overlapping" is precisely what the cursor produces. It is cross-che
 against `FindAllStringIndex` on 60 000 random fixed-length patterns
 (`TestMatchScanStrictVsFindAll`).
 
-The variable-length tier *on this path* is **neither** leftmost-first (`FindAll`) **nor**
-leftmost-longest (`Longest()`), and cannot be: this scan yields the *set of end
+For the variable-length tier the pairing has to be **rebuilt** on the Go side, and
+*how* you rebuild it decides what semantics you get. This scan yields the *set of end
 offsets*, with no start/end pairing and no priority information in it — RE2's
 greediness lives in the NFA instruction priority order, which `kManyMatch` (the only
-mode that reports *all* ends) discards. The pairing is rebuilt on the Go side with a
-left-to-right cursor, which guarantees exactly three things:
+mode that reports *all* ends) discards. Until 2026-08-28 three rebuilds coexisted:
 
-1. `text[Lo:Hi]` is a **real** match of that pattern;
-2. spans of one pattern are non-overlapping and ascending by `Lo`;
-3. no region that contains a match is silently skipped.
+| | how | semantics | expensive because |
+|---|---|---|---|
+| **path A** (`spanFast`) | reverse machine seeded with **accept only** → one start, then an anchored longest end | **a third kind** — neither leftmost-first nor leftmost-longest | two calls per hit, look-back windows **overlap** |
+| **path B** (old default) | one forward **unanchored** longest search from `max(cursor, e-maxLen)` | leftmost-longest | patterns with no length bound must **walk the gaps** (up to 2.00× the text) |
+| **path D2** (separate type `MatchScanner2`) | what the table above now describes | leftmost-longest | verifying false candidates (never happens on real tables) |
 
-Measured over 120 000 spans (3000 random variable-length patterns × 40 texts), the
-result equals `FindAll` in 119 940 cases and `Longest` in 119 972; 28 agree with
-neither. The differences are real matches with a different left edge or length, which
-matters if you feed the span into a checksum (an ID or IBAN check digit will simply
-fail) or use it to mask bytes (a few plaintext bytes survive).
+Path A's defect is structural: seeding accept only sees the starts where a match ends
+*exactly* at `e`. `\b(?:ab cd ef|cd)\b` against `"ab cd ef"` — the smallest end the set
+reports is the one for `"cd"` (offset 5), so the look-back can only reach 3, while the
+real leftmost start is 0 (`text[0:5)="ab cd"` is *not* a match, but it **is** a viable
+prefix: append `" ef"` and it becomes one). Only seeding every live state sees that
+candidate, which is exactly what step ① above does.
 
-How to earn the right to hang a pattern here — the fuzz recipe, the four things that
-otherwise make it vacuously green, and what it found on a real 56-pattern table — is
-in [`doc/MatchScanner的leftmost-longest保证.md`](doc/MatchScanner%E7%9A%84leftmost-longest%E4%BF%9D%E8%AF%81.md).
+**The evidence for collapsing them** — 11 corpora at the 100 MB scale (console build
+output · eight credential-dense generators · asc source + manuals + endpoint ELF · a real
+local Claude history) × 9 **production** gate tables = 99 cells. Raw reports in
+`doc/补起点换路的实测账_20260828.txt`.
 
-**Anchoring removes this entirely.** Wrapping a variable pattern in word boundaries —
-`\b(?:…)\b` — pins the start, so "which start to pick" never arises: in the same
-120 000-span comparison the 60 differing spans of the bare patterns became **0**. The
-rule of thumb: fixed-length patterns are always safe to slice with; variable-length
-patterns are safe when both ends are anchored (`\b`, `^`, `$`, a fixed delimiter);
-unanchored variable patterns should be treated as "something is around here" and
-re-checked with the pattern itself.
+- **Semantics.** Compared span by span, after sorting into a canonical `(pattern, Lo, Hi)`
+  order: D2 vs path B — **zero** differences across **161.9 million** spans. D2 vs path A —
+  **37** differences, all in the source/manual/ELF corpus, and every one of them is path A
+  **truncating the left edge**: a UAE Emirates ID came out `1985-1234567-1` where the real
+  answer is `784-1985-1234567-1`; a prompt-injection marker came out `<SYS>` where the real
+  answer is `<<SYS>>`. 🔴 That is precisely the failure mode this document keeps warning
+  about — feed a shifted span to a check digit (mod-10 / Luhn / mod-97) and it fails, so the
+  consumer discards a real hit and you get a **silent miss**. Switching paths did not just
+  save time; it **fixed 37 wrong boundaries on real text**.
+  🔴 Do **not** compare in emission order: the guarantees only cover ordering *within* one
+  pattern, so a stream comparison measures "different permutation", not "different spans"
+  (it flagged all 85 000 spans of an 8 MB corpus as mismatched; sorted, zero differed).
+- **Cost.** Summed over each gate chain, D2 was the fastest in all 11 — `0.48–0.91×` path A,
+  `0.6–1.0×` path B — and `Tries/Walks` was `1.00` in all 99 cells.
+- **Memory.** D2 needs a per-pattern *reverse set* (`vp1`); path A needed a per-pattern
+  *reverse object* (`rev1`). Same order of magnitude: on the largest table (158 patterns,
+  89 of them actually asked for a position) 9.6 MB vs 7.6 MB. Against path B it is a **net
+  add**, since B built no reverse object at all. Measure it with `ViableOneStats()`.
+
+Removed along with the two paths: `MatchScanMode_spanFast`, the guard rejecting it in
+`MatchScannerReverse.SetModes`, the `MatchScanner2` type, `RegexpSet.reverseOne` /
+`ReverseOneStats` / `rev1`, and the tests that existed only to compare paths.
+
+**Anchoring used to remove path A's problem entirely** — wrapping a variable pattern in
+word boundaries (`\b(?:…)\b`) pins the start, so "which start to pick" never arose: in a
+120 000-span comparison the 60 differing spans of the bare patterns became **0**. That is
+now a property of the patterns rather than a requirement on the caller: fixed-length spans
+were always safe to slice with, and variable-length spans are too, since they are strictly
+leftmost-longest.
 
 #### "I could not give you everything": exactly two ways to say it
 
@@ -734,8 +770,19 @@ appear in the hit table — or run them the old way. Asking for spans on one mak
 `boolOnly`, since you were already told at construction.
 
 `Scan`'s `err` has three causes, all of them "`maxMem` is too small": the underlying
-`FindAllIndex` pass failed; the single-pattern object needed to fill in the other end
-would not compile; the anchored resolve gave up. A fourth, "runs did not arrive
+`FindAllIndex` pass failed; one of the two single-pattern objects needed to fill in the
+other end would not compile; the reverse look-back gave up.
+
+🔴 "The reverse set would not compile" is deliberately **not** given a fallback. Measured
+byte-exactly on 2026-08-28: of 590 production patterns only **16** cost more in reverse
+than forward (all open-ended `{n,}` shapes, in one table), at a maximum ratio of **1.021×**.
+For "the forward set compiles but the reverse single-pattern set does not" to actually
+happen, the set must hold essentially **one** pattern *and* `maxMem` must land inside a
+2%-wide band above that pattern's own threshold — for the worst pattern found (a three-part
+JWT) that band is **74 bytes** wide: forward 3580, reverse 3654. On a table with several
+patterns the forward set costs orders of magnitude more, so the window cannot exist.
+Reaching this branch only ever means the caller misconfigured `maxMem` — which should be
+reported, not silently papered over by quietly switching implementations. A fourth, "runs did not arrive
 monotonically in scan order", is a **broken invariant inside this library** — a bug,
 reported through the same `err` rather than swallowed.
 
@@ -914,7 +961,7 @@ the `1 + k` passes `MatchScanner` exists to collapse.
 
 **Reverse is the easier direction, not the harder one.** A forward DFA pass reports
 match **ends**, so the start has to be guessed back on the Go side — that guess is
-what the whole `spanFast` "third semantics" discussion above is about. A reverse pass
+what the two-step recovery described above is about. A reverse pass
 reports match **starts**, and leftmost/rightmost-longest is *defined* on starts. So
 there is no guess here:
 
@@ -922,7 +969,7 @@ there is no guess here:
 - forward **single-pattern** `FindStringIndexAtWithin(from: start, bound: cursor)` →
   the **longest** end that does not cross the cursor.
 
-Hence no path A/B split, no `spanFast` mode (passing it is an error), and no `maxL`
+Hence no candidate-collection step at all, and no `maxLen`
 window. Each span costs exactly one anchored search — proportional to the length of
 that match, not to the length of the input. (That call used to go through a
 one-pattern *set*; since 2026-08-27 it uses the pattern's own single-pattern
@@ -945,7 +992,7 @@ still goes into the same fixed 12 KB buffer.
 pattern's own `regexp/syntax` AST (random bytes never produce real matches — that is a
 vacuously green test) and checks against an exhaustive rightmost-longest oracle written
 against stdlib alone. The first five patterns in that list are exactly the
-counterexamples that break the forward `spanFast` path (`abc|b`, `a|ab`,
+counterexamples that broke the forward `spanFast` path removed in 2026-08-28 (`abc|b`, `a|ab`,
 `x{1,3}[a-c]?(?:ab|cd)?`, `(?:ab)?[bc]{1,2}`, `(?:ab)*b{1,3}`); reverse diverges on
 none of them, because there is no guess to get wrong. The oracle carries its own
 self-check: `ab|b` against `"aab"` must produce different answers under the two rules,
@@ -1013,7 +1060,7 @@ the arena pinned at its 254 MB ceiling and still flushing. Measure
 the left edge of a hit you already found, use `ResolveSpanWithin`, whose cost is
 independent of input length. `MatchScanner` does exactly this internally — a lazily
 built **one-pattern** reverse set per pattern that ever needs a left edge, never used
-to scan text (see `ReverseOneStats` for what those cost: 32 patterns, 973 states,
+to scan text (see `ViableOneStats` for what those cost: 32 patterns, 973 states,
 2.0 MB on that table).
 
 **Direction is a per-pattern decision, not a global switch.** The mirror shape

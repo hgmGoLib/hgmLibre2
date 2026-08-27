@@ -1,7 +1,7 @@
 // matchscan.go —— 一遍扫正文, 边扫边【一批一批】交出各条 pattern 的不重复命中区间。
 //
-// 🔴 一句话: 【默认档已经保证 leftmost-longest】, 除非调用方自己挂了 spanFast 又挂错了。
-//    怎么用 · 这句保证怎么兑现的 · 怎么用 fuzz 把更多条拉进 spanFast 快档:
+// 🔴 一句话: 【口径无条件是 leftmost-longest】, 没有旋钮, 没有"快而不准"的档。
+//    这句保证怎么兑现的 · 对拍要拿哪个当 oracle:
 //    doc/MatchScanner的leftmost-longest保证.md。
 //
 // 🔴 镜像那一半在 matchscan_reverse.go: RegexpSetReverse.NewMatchScanner —— 从末尾往前扫,
@@ -18,11 +18,12 @@
 // 缓存, 6.4MB 上实测 Match 18.5ms / 收游程 18.4ms)。MatchScanner 就是把 FindAllIndex 给的
 // 右端补成完整区间 —— 它整个就是【搭在 FindAllIndex 上面的一层】, 自己不碰 native。
 //
-//	SetModes(modes)            【每条要什么】三态: 只要 bool / 要区间(默认, 自动分档) /
-//	                           要区间但强制走便宜那条路。全文见下一节。
+//	SetModes(modes)            【每条要什么】两态: 只要 bool / 要区间 (默认)。全文见下一节。
 //	Scan(text, batchFn)        一遍全文。命中表 (HitIDs / Hit, 与 Set.Match 同解) 边扫边填,
 //	                           命中区间【边扫边收口、攒够一批就交出去】。
 //	                           只返回 err: 要么全给, 要么整遍不算数 —— 见下面那一节。
+//	Stats()                    上一遍的账 (回看了几次 · 收到几个候选 · 验了几次 · 吐了几处)。
+//	                           变长条的钱全在"验了几个假候选"上, 没这几个数就看不见它。
 //
 // 🔴 一批一批交出去是【内存】上的要求, 不是风格。底下 FindAllIndex 本来就是 sqlite3_step
 //    式的: 一批 4096 条游程 (48KB) 装满就挂起、交给 Go、取走再进去接着扫, 缓冲循环复用,
@@ -49,15 +50,9 @@
 //	NewMatchScanner 的 unsupported   走不了区间这条路的那几条 pattern (当下只有一个原因:
 //	                                 能匹配空串)。【与正文无关】, 建工作区那一刻就定死,
 //	                                 想写回归测试就写 —— 扔一条 a* 进去必然报出它。
-//	Scan 的 err                      这一遍不算数, 整篇走老路 FindAll。三种来由都是
-//	                                 maxMem 配小了 (底下那遍 FindAllIndex 失败 / 单条对象
-//	                                 编不出来 / 路 A 的反向锚定解析放弃), 另有一种"游程乱序"
-//	                                 是本库的 bug。
-//
-// 🔴 2026-08-27 之后, 补端点这一步【只剩路 A 的第一趟】还会出 "DFA 放弃" 这种 err:
-//    另外两处 (路 B 的那一趟 · 路 A 的第二趟) 都改走单条对象的 RE2::Match 了, 那条路上
-//    DFA 放弃了还能退到 OnePass/BitState/NFA, 不会把"算不出来"冒出来。路 A 的第一趟是
-//    反向锚定, RE2 自己也只有 DFA 一条路 (它内部求匹配左端就是这么干的), 所以那一处留着。
+//	Scan 的 err                      这一遍不算数, 整篇走老路 FindAll。来由都是 maxMem 配小了
+//	                                 (底下那遍 FindAllIndex 失败 / 补端点要的单条对象编不出来 /
+//	                                 反向回推那一趟 DFA 放弃), 另有一种"游程乱序"是本库的 bug。
 //
 // 🔴 为什么不做成"部分成功": 一个调用方【造不出来】的错误码, 不该出现在返回值里。它逼出
 //    的是这么一条链 —— 调用方必须写兜底 → 兜底跑不到 → 跑不到就没法测 → 没法测的代码基本
@@ -67,35 +62,25 @@
 //    放弃 0 次 —— 墙底下则是 NewRegexpSetMaxMem 当场干净报错。所以这条分支本来就该是
 //    "整遍失败"这种粗粒度的交代, 而不是一套调用方永远验不了的补偿逻辑。
 //
-// ── 三态旋钮 (SetModes): 每条 pattern 要什么 ─────────────────────────────────
+// 🔴 "补端点要的单条对象编不出来"这一条同理【不兜底】: 2026-08-28 逐字节量过 —— 590 条
+//    生产 pattern 里, "反向单条 set 比正向单条贵"的只有 16 条 (全在 cred_defillage_join_gate
+//    那张表, 全是 {n,} 开放尾巴), 最大倍率 1.021×。要让"正向 set 编得出来而反向单条编不
+//    出来"真的发生, set 里得只装【一条】pattern 且 maxMem 恰好卡进那条 pattern 阈值往上
+//    2% 的带子里 (实测那条 JWT 三段式: 正向 3580 字节 / 反向 3654 字节, 窗口 74 字节)。
+//    多条的表上正向 set 本身就贵出几个量级, 这个窗口从结构上不存在。能走到这里只说明
+//    调用方 maxMem 配错了 —— 那就该报错让他调大, 静默换一条实现只会把配置错误藏起来。
+//
+// ── 两态旋钮 (SetModes): 每条 pattern 要什么 ─────────────────────────────────
 //
 //	MatchScanMode_boolOnly           只要"命中没命中"。一处区间都不收口、一次端点都不补。
 //	                                 门上很多位只当 bool 用 (某某类内容在不在), 从来没人问它
 //	                                 在哪 —— 那几条不该为它花补端点的钱。
-//	MatchScanMode_span               要区间。【零值 = 默认档】。库自动分档 (下一节),
-//	                                 对外保证 leftmost-longest。
-//	MatchScanMode_spanFast           要区间, 快, 【不保证】leftmost-longest。自动分档把某条
-//	                                 判成变长而落到路 B、性能又确实亏了的时候, 调用方可以自己
-//	                                 拿 fuzz 把"这条走路 A 也是 leftmost-longest"跑出来, 跑出来
-//	                                 了就挂这一档 —— 挂上之后它既快, 又确实是 leftmost-longest。
+//	MatchScanMode_span               要区间。【零值 = 默认档】, 无条件 leftmost-longest。
 //
-// 🔴 三态而不是"两张 mask"(要不要位置 × 走哪条路), 是因为 want=false 且 pathB=true 是个
-//    无意义组合 —— 两张 mask 早晚打架, 一张三态的表打不起来。
-//
-// ── 对外那条保证, 逐字读 ─────────────────────────────────────────────────────
-//
-// 默认档 (MatchScanMode_span) 交出来的区间:
-//   ① text[Lo:Hi] 是这条 pattern 的一个真匹配;
-//   ② 【同一条 pattern】吐的区间互不相交, 按 Lo 升序;
-//   ③ 口径是 leftmost-longest (= stdlib 的 re.Longest().FindAllStringIndex)。
-//
-// 三处容易读错的地方:
-//   🔴 ② 只管【单条】。两条 pattern 在同一片正文上照样重叠 —— 那不是重复, 是两个问题各要
-//      一个答案 (下面那段"只在同一条 pattern 内部去重"讲的就是这件事)。
-//   🔴 ③ 【不是】"与 FindAllStringIndex 相同"。stdlib 默认的 FindAll 是 leftmost-first
-//      (贪心), 两者在"同一起点上贪心先撞到的比最长的短"时给不同的右端。要对拍就拿
-//      Longest() 那个去对, 拿默认那个对会是【假红】。
-//   🔴 能匹配空串的 pattern 只能配 boolOnly, SetModes 当场报错 —— 不是运行时静默退化。
+// 🔴 2026-08-28 之前这里是【三态】: 多一个 MatchScanMode_spanFast, 强制走那条便宜但
+//    【不保证】leftmost-longest 的"路 A"(游标启发式), 挂之前要调用方自己拿 fuzz 跑一份
+//    "这一条走 A 也不岔"的凭据。整档删掉了 —— 换上来的这条路 (下面那节) 既是严格口径,
+//    价钱又比 A 还便宜, 那一档就没有存在理由了, 留着只会让人以为还有便宜可占。
 //
 // ── 端点怎么补: 一遍 set 扫完, 之后【全走单条对象】────────────────────────────
 //
@@ -108,43 +93,55 @@
 //    ② 补端点的流量不再冲刷整表那份大 DFA 缓存 (真表 155 条那份), 两边互不干扰。
 //    ③ 状态更小: 单条不必背 kManyMatch 每个状态那张 id 表。
 //
-//	定长 (min == max)  Lo = Hi - min。【不进正则引擎】, 一句减法, 一趟都不用。两条路在定长
-//	                   上必然同解 (起点唯一), 所以定长恒走这句, 档位对它不生效。
+//	定长 (min == max)  Lo = Hi - min。【不进正则引擎】, 一句减法, 一趟都不用。起点唯一,
+//	                   所以它跟下面那条变长路必然同解。
 //
-//	路 B (默认档)      【一趟】: 从 max(cur, Hi-maxL) 起做一次正向非锚定搜索, 直接拿到
-//	                   leftmost-longest 的整段区间。用的是这一条自己那条【longest 口径】的
-//	                   正向 Regexp (RegexpSet.forwardOne → Regexp.FindStringIndexFrom,
-//	                   整串 + startpos, 不切片 ⟹ \b / ^ / $ 看到的是真实邻字节)。
-//	                   🔴 之所以是一趟而不是两趟: longest 与贪心【选同一个起点】, 只在终点
-//	                      上分歧 —— 所以把口径换成 longest, 起点和终点就在同一次搜索里
-//	                      一起给了, 不必再跑第二趟去重取最长终点。
-//	                   代价: 无上界的条目要走完空隙 —— 各轮窗口两两不交且递增, 累加封顶
-//	                   = 多扫一遍正文 (2.00x)。
-//
-//	路 A (降级档)      【两趟】: ① 反向单条 (RegexpSet.reverseOne → RegexpReverse.
-//	                   ResolveSpanWithin) 从 Hi 往左锚定推一次, 给最靠左的那个起点;
-//	                   ② 正向单条 (forwardOne → Regexp.FindStringIndexAtWithin) 锚定在那个
-//	                   起点上取最长右端。两趟的代价都 = 这处命中有多长 / 回看多远,
-//	                   与正文长度【无关】—— 这是它比 B 便宜的全部原因。
-//	                   给的口径见下面"第三种口径"那一节。
+//	变长 (min < max)   【两步】:
+//	                   ① 反向 · 种全部状态 · 从右端 e 往左走到死 —— 把起点落在 [cur, e) 里的
+//	                      【全部可行前缀起点】一次收齐 (spanviable.go 的 ViableStarts,
+//	                      走的是 RegexpSet.viableOne 那条"反向 · 只装这一条的 set")。
+//	                   ② 候选【从小到大】逐个拿正向单条 longest 锚定去验 (forwardOne →
+//	                      Regexp.FindStringIndexAtWithin), 第一个验过的就是答案。
+//	                   为什么这就是 leftmost-longest, 见下一节那两条证明。
 //
 //	要的那个单条对象编译不出来 = maxMem 配小了, Scan 整遍报错 (见上面那一节)。
 //
 // 🔴 反向必须是【一条一个】。整表建一个反向 set 是死路: set 里状态数是相乘的
 //    (doc/状态数为什么会相乘.txt), 155 条的反向表在 6.4MB 正文上实测 65 秒 / arena 顶满 254MB
 //    还在 flush, 而正向同一张表 18ms 零 flush。一条一个就没有这个乘法; 而且这些反向对象
-//    【从不用来扫正文】, 只做锚定解析 —— 起点只有一个, 那套 `.*?` 前缀引起的状态爆炸机制
+//    【从不用来扫正文】, 只做锚定回推 —— 起点只有一个, 那套 `.*?` 前缀引起的状态爆炸机制
 //    从根上就不存在。再加上惰性: 只有真被问到的那几条才会被建出来。
 //
-// 🔴 老账 (2026-08-27 之前): 路 B 是"贪心单条定起点 + 整表 set.ResolveSpan 重取终点"两趟,
-//    路 A 是"一条一个的反向 set + 整表 set.ResolveSpan"两趟 —— 两条路的第二趟都回 set。
-//    换掉之后【答案一字不差】(TestMatchScanPathsSameAsSetRoute: 两条路各 300 轮 AST 生成的
-//    语料, 共对账 5.4 万处区间, 与旧的 set 路子逐字节相同), 价钱 (64KB 语料 · benchPats):
-//      命中密集 (most)  路 B 968µs → 618µs (-36%) · 路 A 614µs → 447µs (-27%)
-//      命中稀疏 (few)   两条路都是持平 (差价在噪声里, 那一档的时间全在走空隙上)
-//      零命中  (zero)   持平 (根本不补端点)
-//    对照跑在同一个二进制里: BenchmarkMatchScanOldVsNew, 旧那套是照着旧实现另写的一份
-//    (msOldScanner), 用的是【没删的】那几个 set 入口。
+// ── 为什么这条路是对的 (两条, 都要) ─────────────────────────────────────────
+//
+// ① 候选集不漏。设真答案是 [s, E) 且 s ∈ [cur, e)。E 是一个匹配右端且 E > s >= cur,
+//    而 e 是【> cur 的最小右端】⟹ E >= e ⟹ text[s, e) 是 text[s, E) 的前缀 ⟹ 它是
+//    一个可行前缀 ⟹ s 一定在 ViableStarts 给的候选里。∎
+//    升序试 ⟹ 第一个通过的必然是 leftmost; 而 fwd 是 longest 口径编的, 锚定在 s 上给的
+//    就是最长右端 ⟹ 严格 leftmost-longest。
+//
+// ② 一个都没验过 ⟹ [cur, e) 里根本没有起点 ⟹ 游标可以直接推到 e (对①取逆否)。
+//    所以"全军覆没"这一支不是放弃, 是【证明了这一段是空的】。
+//
+// 顺带一条: 验过的那个候选 s 给出的右端 E 必然 >= e (E 是右端且 E > cur ⟹ E >= e),
+// 所以游标每次都真的越过 e —— 各轮的回看窗口 [cur, e] 两两不交且递增, 反向那一趟的
+// 累加封顶 = 多扫一遍正文。这正是它比老路便宜的地方: 老的"路 A"每处命中固定两趟且窗口
+// 【相交】, 老的默认档"路 B"没有上界的条目要走完空隙。
+//
+// ── 对外那条保证, 逐字读 ─────────────────────────────────────────────────────
+//
+// 交出来的区间:
+//   ① text[Lo:Hi] 是这条 pattern 的一个真匹配;
+//   ② 【同一条 pattern】吐的区间互不相交, 按 Lo 升序;
+//   ③ 口径是 leftmost-longest (= stdlib 的 re.Longest().FindAllStringIndex)。
+//
+// 三处容易读错的地方:
+//   🔴 ② 只管【单条】。两条 pattern 在同一片正文上照样重叠 —— 那不是重复, 是两个问题各要
+//      一个答案 (下面那段"只在同一条 pattern 内部去重"讲的就是这件事)。
+//   🔴 ③ 【不是】"与 FindAllStringIndex 相同"。stdlib 默认的 FindAll 是 leftmost-first
+//      (贪心), 两者在"同一起点上贪心先撞到的比最长的短"时给不同的右端。要对拍就拿
+//      Longest() 那个去对, 拿默认那个对会是【假红】。
+//   🔴 能匹配空串的 pattern 只能配 boolOnly, SetModes 当场报错 —— 不是运行时静默退化。
 //
 // ── 重复: 每条 pattern 一个游标, 一次左到右推进 ──────────────────────────────
 // 变长 pattern 在一片正文上会在每个可收的位置各报一个右端 (\p{Han}{2,4} 撞 "张三李四王五"
@@ -154,13 +151,6 @@
 //   ③ 从这个起点取最长右端吐出去, cur 推到它。
 // 🔴 ② 的窗口掐在 cur 上是【正确性】不是省钱: 不掐的话上例 Hi=18 会回推到 6, 与刚吐出去的
 //    [0,12) 相交而被丢掉, "王五"就无声无息漏了。掐上之后回推到 12, 吐 [12,18)。
-//
-// 🔴 这套推进【只有在起点随右端单调不减时】才等于 FindAll。反例: abc|b 撞 "abc" 的右端是
-//    2 和 3 —— 右端 2 回推到起点 1 ("b"), 当场吐 [1,2) 把 cur 推到 2, 右端 3 那个真正的
-//    [0,3)="abc" 就因为起点 0 < cur 被永远跳过, 【无声漏掉】。
-//    造出这种非单调的是"一条更短的分支结在另一条更长分支【内部】"—— 交替 (abc|b) 会,
-//    而 ? * + {m,n}(min≠max) 也都是【长度不齐的交替】: (?:ab)? 就是 ab| 。所以这件事
-//    在整个变长档上是常态, 不是某几条 pattern 的毛病。
 //
 // 🔴 【只在同一条 pattern 内部去重, 跨 pattern 一概不合并】。两条 pattern 在同一片正文上各自
 //    命中不是重复, 是两个问题各要一个答案 (带空格的和不带空格的两条 pattern, 下游正是靠
@@ -172,60 +162,41 @@
 //    "谁能活"要等消费点把校验位跑完才知道 —— 库这层两样都不知道。真语料上被 ≥2 条 pattern
 //    盖住的字节占已盖住字节的 55.6%, 同一字节最多被 8 条盖, 所以这是常态不是边角。
 //
-// ── 路 A 给的是"第三种口径" (挂 spanFast 之前必须读完这一节) ─────────────────
+// ── 老账: 这条路是怎么换上来的 (2026-08-28) ─────────────────────────────────
 //
-// 下面整节讲的都是【路 A】。默认档走 B, 没有这些坑 —— 代价见上一节那笔账
-// (benchPats/64KB: 命中密集档 B 是 A 的 1.38x, 命中稀疏档 2.94x, 差价几乎全在"走空隙"上)。
-// 🔴 挂 spanFast 要的那份凭据怎么跑 (语料必须从 pattern 自己的 AST 生成再交叉构造; 对拍要拿
-//    Longest() 当 oracle; 对拍自己先要有一道"已知反例必须红"的自检门), 见
-//    doc/MatchScanner的leftmost-longest保证.md 第 5 节 —— 少一件就是空转绿。
+// 在这之前补端点有三条路并存, 默认档 B + 一个旋钮 A, 外加一个用来比价的独立类型
+// MatchScanner2 (路 D2)。现在只剩 D2 这一条, A/B 与 MatchScanner2 这个类型一起删了。
 //
-//	定长档 (min == max)      与 FindAllStringIndex 【逐字节相同】, 而且是可以论证的:
-//	                         右端 e 的起点只能是 e-min (唯一), 所以"起点随右端单调"必然成立;
-//	                         长度也唯一, 不存在"取最长还是取贪心先撞上的"之分。剩下的就是
-//	                         "从左往右贪心取不相交", 那正是 FindAll 的规则。
-//	                         回归钉在 TestMatchScanStrictVsFindAll + 6 万条随机定长 pattern 对拍。
+//	路 A (旧 spanFast)  反向【只种 accept】回推一个起点 + 正向锚定取最长右端。两趟, 窗口
+//	                    【相交】。给的是"第三种口径"—— 既不是 leftmost-first 也不是
+//	                    leftmost-longest: \b(?:ab cd ef|cd)\b 撞 "ab cd ef" 时门给的最小右端
+//	                    是 "cd" 那处, 只种 accept 就只回推得到 "cd" 的左端, 真正的最左起点 0
+//	                    根本不在候选里。这是它的病根, 也正是本路"种全部状态"要解掉的那件事。
+//	路 B (旧默认档)     从 max(cur, e-maxL) 起做一次正向【非锚定】longest 搜索。一趟, 口径严,
+//	                    贵在【没有上界的条目要走完空隙】(maxL < 0 时下界塌回游标)。
 //
-//	变长档 (min < max)       【第三种口径】(路 A 才有), 既不是 leftmost-first (贪心 / FindAll), 也不是
-//	                         leftmost-longest (POSIX / re.Longest())。只保证三条:
-//	                         ① text[Lo:Hi] 是这条 pattern 的一个【真匹配】
-//	                         ② 同一条吐的区间互不相交、按 Lo 升序
-//	                         ③ 有匹配的地方一定吐点什么 (不整段静默)
+// 换掉的凭据 (2026-08-28, 全部在 100MB 量级的真语料 × 9 张生产真门表上跑; 11 份语料 =
+// console 前端产物 + 凭据二次方八腿 + asc源码/说明书/端点ELF 混合 + 本机 claude 真历史):
+//	口径   11 份语料 × 9 张门 = 99 格, 逐区间按 (条, Lo, Hi) 排序对拍。
+//	       与路 B 【一处不差】—— 合计对账 1.619 亿处区间, 差 0 处。这是"敢把默认档换掉"
+//	       的全部凭据。
+//	       与路 A 差 【37 处】, 全在那份 asc源码/说明书/ELF 的混合语料上, 而且每一处都是
+//	       路 A 把左端截短了 —— 例如阿联酋身份证 A 给 "1985-1234567-1" 而真答案是
+//	       "784-1985-1234567-1", 提示注入标记 A 给 "<SYS>" 而真答案是 "<<SYS>>"。
+//	       🔴 这正是文件里一直警告的那种伤: 区间偏了, 拿去过校验位 (mod-10 / Luhn /
+//	          mod-97) 会失败, 整条真命中被下游自己毙掉 = 无声漏报。所以这次换路不只是
+//	          省钱, 是【真的在真语料上修掉了 37 处错边界】。
+//	价钱   11 条门链合计, 本路【每一条都是最快的】。相对路 A 0.48~0.91×, 相对路 B 视语料
+//	       0.6~1.0×。"试/看"(每次回看正向锚定验了几次) 在 99 格里【全是 1.00】——
+//	       升序第一个候选就是答案, 人造反例 a|[ab]+c 那种 2× 退化在真表上不发生。
+//	内存   本路的常驻是"反向单条 set"(vp1), 路 A 是"反向单条"(rev1), 同一个量级:
+//	       最大的那张 158 条表上 89 条被真问到位置, vp1 9.6MB vs rev1 7.6MB (1.26×)。
+//	       相对路 B 是【净增】—— B 只要正向单条, 一条反向都不建。这一笔是这次换路的
+//	       全部代价, 量它用 (*RegexpSet).ViableOneStats()。
 //
-// 🔴 为什么必然是第三种, 而不是"选一个模式就行"—— 这一遍扫描给的是【右端集合】
-//    {e | 存在某个 s 使 text[s:e] 匹配}, 里面【没有】(起点,终点) 的配对信息, 也【没有】
-//    优先序: RE2 的贪心就活在 NFA 指令的优先序里 (re2_dfa.cc:1197 kFirstMatch 撞到 Match
-//    就 break, 把后面低优先级的线程整段截掉), 而 kLongestMatch 干脆把每段 std::sort 掉
-//    (:1272), kManyMatch 连 Mark 都没有、整串 sort (:1289) —— 我们要"所有右端"就只能用
-//    kManyMatch, 而它正是把优先序扔得最干净的那个。一遍搜索本来也只吐【一个】右端
-//    (want_earliest_match 第一处就 return :2562, 否则跑完取 lastmatch :2631)。
-//    所以"拿到全部右端"和"贪心/最长"是互斥的, 配对只能在 Go 这侧用游标启发式【重建】,
-//    重建出来的就是上面那第三种。
-//
-//    实测 (随机撒 3000 条变长 pattern × 40 段正文 = 12 万处对账):
-//      与 FindAll(贪心) 相同  119940 / 120000
-//      与 Longest(最长) 相同  119972 / 120000
-//      两个都不是                 28 / 120000
-//    差的那些长这样:
-//      x{1,3}[a-c]?(?:ab|cd)?  撞 "xab"        本路 [0,3)="xab"   FindAll [0,2)="xa"
-//      (?:ab)?[bc]{1,2}        撞 "axbabbyxx"  本路 [4,6)="bb"    FindAll [3,6)="abb"
-//      (?:ab)*b{1,3}           撞 "yaxyabbbb"  本路 [5,8)+[8,9)   FindAll [4,9)="abbbb"
-//
-// 🔴 差出来的段【是真匹配, 但比 FindAll 那一处长/短/偏】, 两个真后果:
-//    ① 少盖的字节 —— 调用方按这个区间脱敏, 那几个字节的明文原样留在输出里。
-//    ② 边界偏了 —— text[Lo:Hi] 拿去过校验位 (身份证 · IBAN mod-97 · Luhn) 会失败,
-//       整条真命中被调用方自己毙掉 = 无声漏报, 比"没检测到"更难查。
-//
-// 🔴 路 A 这件事【两头 \b 一锚就没了】: word boundary 把起点钉死, 回看窗口里合法起点只剩一个,
-//    "挑哪个"根本不发生。量过 (各 12 万处对账): 裸 pattern 与 FindAll 不同 60 处 (少盖 30
-//    字节 · 多盖 17 字节 · 处数变了 16 处), 换成 \b(?:…)\b 之后【0 处】。
-//    所以规矩是: 变长条【两头有锚点】(\b · ^ · $ · 固定分隔符) 才可以拿位置去切片再判;
-//    没有锚点的变长条, 位置只当"这附近有东西"的定位用。定长档 (min == max) 永远可以。
-//
-//    (曾经有过一道 PatternLeftmostLongestSafe 静态闸, 想把"最长 ≠ 贪心"的 pattern 挡在
-//     门外。2026-08-25 删掉了: 它只查 OpAlternate, 而 ? * + {m,n} 同样是长度不齐的交替,
-//     把口子堵严的话它就退化成 min == max 本身 —— 也就是变长快路整个清空。既然它兑现不了
-//     "等于 FindAll"这个承诺, 就不该拿 8 倍的钱去买: 真表上闸装着 1.82×, 拆掉 15.03×。)
+// 更早那一笔 (2026-08-27): 两条老路的第二趟原先都回整表 set.ResolveSpan, 换成单条对象之后
+// 答案一字不差而价钱降了 27~36% (TestMatchScanPathsSameAsSetRoute)。那次换的是"回不回 set",
+// 这次换的是"起点怎么找回来", 是两件事。
 //
 // Scan 报了 err 就整篇走老路 FindAll —— 库这边宁可退回去也不给一个"像是对的"答案。
 // 老路要是想从某个偏移接着扫, 【别切片】: (*Regexp).FindStringIndexFrom(text, pos) 参数是
@@ -270,27 +241,48 @@ type MatchScanner struct {
 	out  []SetMatch
 	outN int
 	fn   func([]SetMatch)
-	// findCtx 是 B 路那一步"从游标起找最左匹配"的复用 scratch (稳态零分配)。
+	// findCtx 是"锚定在候选起点上取最长右端"那一步的复用 scratch (稳态零分配)。
 	findCtx *FindStringIndex_ctx_t
+	// cands 是候选起点缓冲 (native 直接往里写, 降序)。跨 pattern 复用, 只在一个右端的
+	// 处理期间有意义。不够就翻倍, 翻上去就留着。
+	cands []int32
+	st    MatchScanStats_t
+}
+
+// matchScanCandBuf 是候选起点缓冲的起始长度。不够会翻倍重来一趟 —— 真表上一个右端的候选
+// 通常是个位数, 这个数只是为了让"翻倍"基本不发生。
+const matchScanCandBuf = 64
+
+// MatchScanStats_t 是一遍 Scan 的账。加它是因为变长条的钱全在"验了几个假候选"上,
+// 而那一笔从外面一个字都看不见 —— 没有这几个数就没法判断某张表的形状适不适合这条路。
+//
+// 🔴 前三个【只统计变长条】: 定长条走 e-minL 那句减法, 一次回看都不做, 不进这三个分母。
+//    Emits 不一样, 它数的是【全部】吐出去的区间 (定长的也算) —— 所以要看"平均验了几次"
+//    得用 Tries/Walks, 拿 Tries/Emits 会被定长条稀释成假象。
+type MatchScanStats_t struct {
+	Walks int64 // 反向走了几趟 (= 处理了几个"没被游标盖住的"右端)
+	Cands int64 // 这些趟一共给出多少候选起点
+	Tries int64 // 一共拿正向锚定验了几次 (<= Cands; 命中即停)
+	Emits int64 // 交出去几处区间 (含定长条)
 }
 
 // msPat_t 是每条 pattern 的推进状态。cur 就是那把游标。
 //
-// 🔴 分档所需的那几件事 (spanable · fixed · minL · maxL · pathB) 全是【与正文无关】的,
-//    所以一律在 NewMatchScanner / SetModes 里算完, Scan 里一件都不算 —— 这正是"没有
-//    unresolved"的前提: 一条 pattern 能不能走这条路, 建工作区那一刻就有答案。
+// 🔴 分档所需的那两件事 (spanable · fixed) 全是【与正文无关】的, 所以一律在
+//    NewMatchScanner 里算完, Scan 里一件都不算 —— 这正是"没有 unresolved"的前提:
+//    一条 pattern 能不能走这条路, 建工作区那一刻就有答案。
+//
+// 🔴 这里【没有 maxL】。老的路 B 靠它把回看窗口的下界抬起来 (没上界就塌回游标, 白扫一段),
+//    而这条路的下界是【反向那一趟自己走到死的地方】—— 动态的, 不需要 maxL 兜底。
+//    这正是它比路 B 便宜的全部原因。
 type msPat_t struct {
 	spanable bool // 能不能收口成区间 (false = 能匹配空串, 只能当 bool 用)
-	fixed    bool
-	pathB    bool
+	fixed    bool // 定长: 起点唯一, 一句减法, 不进正则引擎
 	minL     int32
-	maxL     int32             // PatternLenRange 的上界; <0 = 无上界 (窗口退化成"从游标起")
-	rev      *RegexpReverse // 路 A 用: 这一条自己那条【反向】正则, 锚定回推起点, 惰性建
-	fwd      *Regexp        // 这一条自己那条【正向 · longest】正则, 惰性建。
-	//                         路 B 用它一趟拿整段区间; 路 A 用它从推出来的起点取最长右端。
+	vp       *RegexpSetReverse // 反向 · 只装这一条的 set: 种全部状态回推【全部候选起点】, 惰性建
+	fwd      *Regexp           // 正向 · longest 单条: 锚定在候选上验, 顺手给最长右端, 惰性建
 	cur      int32             // 已吐出去的最右字节
 	lastLo   int32             // 上一条游程的左端, 用来确认升序
-	done     bool              // 从游标起整篇再没有匹配了 —— 本遍这一条到此为止
 }
 
 // NewMatchScanner 开一个工作区。热路径上建一次长期留着, 别每次扫描新建。
@@ -318,6 +310,7 @@ func (s *RegexpSet) NewMatchScanner() (m *MatchScanner, unsupported []int32, err
 		hit:     make([]bool, s.size),
 		out:     make([]SetMatch, matchScanBatch),
 		findCtx: NewFindStringIndex_ctx(),
+		cands:   make([]int32, matchScanCandBuf),
 	}
 	for i := 0; i < s.size; i++ {
 		p := &m.per[i]
@@ -327,19 +320,18 @@ func (s *RegexpSet) NewMatchScanner() (m *MatchScanner, unsupported []int32, err
 			continue // spanable 留 false: 之后一律当 bool 用
 		}
 		p.spanable = true
-		p.minL, p.maxL = int32(minL), int32(maxL)
+		p.minL = int32(minL)
 		p.fixed = minL == maxL && maxL >= 0
-		p.pathB = !p.fixed // 默认档 = 路 B; SetModes 里按档位再拧一遍
 	}
 	return m, unsupported, nil
 }
 
-// MatchScanMode_t 是【每条 pattern 要什么】。三态, 零值 = 默认档 (要区间, 自动分档)。
-// 全文见文件头"三态旋钮"那一节。
+// MatchScanMode_t 是【每条 pattern 要什么】。两态, 零值 = 默认档 (要区间)。
+// 全文见文件头"两态旋钮"那一节。
 type MatchScanMode_t string
 
-// MatchScanMode_span 要区间, 由库【自动分档】, 保证 leftmost-longest (定长走减法, 变长走
-// 路 B)。零值就是它 —— mask 里没显式写的那几条都是这一档。
+// MatchScanMode_span 要区间, 无条件 leftmost-longest (定长走减法, 变长走"回推候选 + 升序验",
+// 两者必然同解)。零值就是它 —— mask 里没显式写的那几条都是这一档。
 const MatchScanMode_span MatchScanMode_t = ""
 
 // MatchScanMode_boolOnly 只要"命中没命中", 一处区间都不收口、一次端点都不补。
@@ -348,23 +340,6 @@ const MatchScanMode_span MatchScanMode_t = ""
 // 🔴 这是最值钱的一档: 真表上 57% 的游程来自两条只当 bool 用的宽 pattern, 这一挡挡掉的是
 //    它们的端点补全 (真花钱的那步), 不只是内存。
 const MatchScanMode_boolOnly MatchScanMode_t = "boolOnly"
-
-// MatchScanMode_spanFast 要区间, 快, 【不保证】leftmost-longest —— 它强制走路 A (游标启发式),
-// 而路 A 给的是文件头说的第三种口径: 只在"起点随右端单调"时才等于 leftmost-longest。
-// 🔴 不保证【不等于】"不是": 12 万处对账里 119972 处与 Longest 相同, 岔开的是 28 处。
-//    每一处也都是真匹配 (①), 同一条内部照样不重叠升序 (②)。少的只有③那一条。
-//
-// 这一档是给【自动分档判错了】的那种情况留的出口: 库这边只按 min/max 分, 判成变长就一律
-// 落到路 B。B 每处命中只要一趟 (比 A 的两趟还少), 贵就贵在【无上界的条目要走完空隙】——
-// 实测 (benchPats/64KB) 命中密集时 B 是 A 的 1.38x, 命中稀疏时 2.94x, 差价几乎全在这上面。
-// 可是"变长"不等于"有歧义" —— 两头带 \b 的变长条实测岔开【0 处】。这种条落在 B 上是白掏钱。
-//
-// 🔴 挂之前先把凭据跑出来, 别凭感觉: 拿这条 pattern 自己 fuzz 一遍 (随机正文 × 两档对拍),
-//    数出岔开 0 处再挂。跑出来了就挂 —— 挂上之后它既是快的那条路, 又确实是 leftmost-longest。
-//    跑不出 0 就别挂, 默认档的保证是无条件的; 岔开那几处【是真匹配但边界偏了】, 拿去过
-//    校验位 (身份证 · IBAN mod-97 · Luhn) 会失败, 整条真命中被调用方自己毙掉 = 无声漏报。
-//    asc/engine/sd_body_gate_span_cross_test.go 是一份现成的写法。
-const MatchScanMode_spanFast MatchScanMode_t = "spanFast"
 
 // SetModes 声明每条 pattern 要什么 (下标即 pattern 下标, 长度不足的按零值 = 默认档)。
 // 传 nil = 全默认档。调用方那边这是【静态】信息, 建集的时候就知道, 热路径上不该每遍改。
@@ -382,11 +357,6 @@ func (m *MatchScanner) SetModes(modes []MatchScanMode_t) error {
 		}
 	}
 	m.mode = modes
-	// 档位定了才知道变长条走哪条路 —— 这里一次算完, Scan 里不再判。
-	for i := range m.per {
-		p := &m.per[i]
-		p.pathB = p.spanable && !p.fixed && m.modeOf(i) != MatchScanMode_spanFast
-	}
 	return nil
 }
 
@@ -397,6 +367,9 @@ func (m *MatchScanner) modeOf(i int) MatchScanMode_t {
 	}
 	return m.mode[i]
 }
+
+// Stats 返回上一次 Scan 的账 (见 MatchScanStats_t)。
+func (m *MatchScanner) Stats() MatchScanStats_t { return m.st }
 
 // Close 释放底层的 FindAllIndex 工作区。可重复调。
 func (m *MatchScanner) Close() {
@@ -430,7 +403,7 @@ func (m *MatchScanner) Scan(text string, batchFn func(ms []SetMatch)) error {
 	}
 	for _, id := range m.hits {
 		p := &m.per[id]
-		p.cur, p.lastLo, p.done = 0, 0, false
+		p.cur, p.lastLo = 0, 0
 		m.hit[id] = false
 	}
 	m.hits = m.hits[:0]
@@ -438,6 +411,7 @@ func (m *MatchScanner) Scan(text string, batchFn func(ms []SetMatch)) error {
 	m.text = text
 	m.fn = batchFn
 	m.outN = 0
+	m.st = MatchScanStats_t{}
 	err := m.set.FindAllIndex(text, m.alloc, func(runs []RegexpSet_FindAllIndex_Run_t) {
 		for k := range runs {
 			r := &runs[k]
@@ -476,6 +450,7 @@ func (m *MatchScanner) Scan(text string, batchFn func(ms []SetMatch)) error {
 func (m *MatchScanner) emit(i int, lo, hi int32) {
 	m.out[m.outN] = SetMatch{Index: int32(i), Lo: lo, Hi: hi}
 	m.outN++
+	m.st.Emits++
 	if m.outN == len(m.out) {
 		m.fn(m.out)
 		m.outN = 0
@@ -491,18 +466,19 @@ func (m *MatchScanner) fail(err error) {
 	}
 }
 
-// failCompile: 补端点要的那个单条对象编不出来。与正文无关, 是 maxMem 配小了。
-func (m *MatchScanner) failCompile(i int) {
+// failCompile: 补端点要的那个单条对象编不出来 (what 说的是哪一个)。与正文无关, 是 maxMem
+// 配小了。🔴 这里【不兜底、不换一条实现】, 理由见文件头那段 74 字节窗口的账。
+func (m *MatchScanner) failCompile(i int, what string) {
 	m.fail(errors.New("re2native: match scanner pattern " + strconv.Itoa(i) +
-		" 补端点要的单条对象编不出来 (maxMem 配小了); 用 NewRegexpSetMaxMem 把 maxMem 调大" +
+		" 补端点要的" + what + "编不出来 (maxMem 配小了); 用 NewRegexpSetMaxMem 把 maxMem 调大" +
 		"; pattern=" + m.set.pats[i]))
 }
 
-// failResolve: 路 A 第一趟的反向锚定解析 DFA 放弃了。同样是 maxMem 的事 —— 这一层不猜、
-// 不静默跳过。🔴 只有这一处会走到: 另外两趟走的是单条 RE2::Match, 那条路有 NFA 兜底。
+// failResolve: 反向回推那一趟 DFA 放弃了。同样是 maxMem 的事 —— 这一层不猜、不静默跳过。
+// 🔴 只有这一处会走到: 正向锚定那一趟走的是单条 RE2::Match, 那条路有 NFA 兜底。
 func (m *MatchScanner) failResolve(i int, err error) {
 	m.fail(errors.New("re2native: match scanner pattern " + strconv.Itoa(i) +
-		" 锚定解析失败: " + err.Error() + "; pattern=" + m.set.pats[i]))
+		" 可行前缀回推失败: " + err.Error() + "; pattern=" + m.set.pats[i]))
 }
 
 // failRunOrder: 同一条 pattern 的游程不是升序了。推进的前提没了 ⟹ 再往下走就是错答案。
@@ -520,23 +496,20 @@ func (m *MatchScanner) feed(i int, lo, hi int32) {
 	if m.scanErr != nil {
 		return // 这一遍已经不算数了, 后面一律空转
 	}
-	// 分档 (定长 / 路 A / 路 B) 早在 NewMatchScanner + SetModes 里算完了, 这里只把那条路
-	// 要的对象补建出来 —— 惰性: 没被真问到位置的 pattern 一个对象都不占。
+	// 分档 (定长 / 变长) 早在 NewMatchScanner 里算完了, 这里只把变长那条路要的两个对象
+	// 补建出来 —— 惰性: 没被真问到位置的 pattern 一个对象都不占。
 	// 🔴 建出来的一律是【这一条 pattern 自己的单条对象】, 不是 set。扫正文那一遍之后,
-	//    补端点的每一趟都不再回 set —— 理由见 regexpset.go 里 rev1/fwd1 那段。
+	//    补端点的每一趟都不再回 set —— 理由见 regexpset.go 里 fwd1/vp1 那段。
 	if !p.fixed {
-		// 定长不用建任何对象 (起点唯一, 一句减法)。其余两条路都要正向那条 longest 正则:
-		// 路 B 拿它一趟出整段区间, 路 A 拿它从推出来的起点取最长右端。
 		if p.fwd == nil {
 			if p.fwd = m.set.forwardOne(i); p.fwd == nil {
-				m.failCompile(i)
+				m.failCompile(i, "【正向单条】")
 				return
 			}
 		}
-		if !p.pathB && p.rev == nil {
-			// 路 A 另加一条【反向】正则: 从右端锚定往左推那个起点。
-			if p.rev = m.set.reverseOne(i); p.rev == nil {
-				m.failCompile(i)
+		if p.vp == nil {
+			if p.vp = m.set.viableOne(i); p.vp == nil {
+				m.failCompile(i, "【反向单条 set】")
 				return
 			}
 		}
@@ -562,56 +535,52 @@ func (m *MatchScanner) feed(i int, lo, hi int32) {
 			p.cur = e
 			continue
 		}
-		if p.pathB {
-			if p.done {
-				return // 从游标起整篇已无匹配, 后面的右端不必再看
-			}
-			// 窗口下界 from: 要找的是"起点 >= cur 的最左匹配"[s,E)。E 是一个右端且 E > s >= cur,
-			// 而 e 是 > cur 的最小右端 ⟹ E >= e; 又 E - s <= maxL ⟹ s >= e - maxL。
-			// 同时 s >= cur。故 s >= max(cur, e-maxL)。∎ 从这里起搜不会漏掉答案。
-			from := p.cur
-			if p.maxL >= 0 {
-				if w := e - p.maxL; w > from {
-					from = w
-				}
-			}
-			// 🔴 这一趟【既定起点又定终点】: p.fwd 是 longest 口径编的 (forwardOne),
-			//    所以它给的就是 leftmost-longest 的整段区间 —— 不必再为终点跑第二趟。
-			//    (换成贪心口径就得两趟: 贪心与 longest 选同一个起点, 只在终点上分歧。)
-			loc := m.findCtx.FindStringIndexFrom(p.fwd, m.text, int(from))
-			if loc == nil {
-				// 从 from 起没有匹配 ⟹ 从任何 >= from 的位置起也没有 (后面的 from 只增不减)。
-				p.done = true
-				return
-			}
-			start, end := int32(loc[0]), int32(loc[1])
-			m.emit(i, start, end)
-			p.cur = end
-			continue
-		}
-		// 第二趟: 反向单条, 锚定在右端 e 往左推, 拿最靠左的那个起点。
-		// 🔴 bound = cur: 回看【绝不越过游标】。是正确性不是省钱, 见文件头 ②。
-		// 顺带它把回看代价钉成"离游标多远", 与正文长度无关。
-		start, ok, err := p.rev.ResolveSpanWithin(m.text, e, p.cur)
+		// ① 反向 · 种全部状态 · 回看不越过游标: 把 [cur, e) 里全部候选起点一次收齐。
+		//    🔴 bound = cur 是【正确性】不是省钱: 越过游标推出来的起点会与刚吐出去的
+		//       那一处相交, 那一处就得整个丢掉 = 无声漏报。
+		n, err := p.vp.ViableStarts(m.text, e, p.cur, 0, m.cands)
 		if err != nil {
-			// DFA 放弃 (预算不够) —— 不是"没有匹配"。这一层不猜、不静默跳过, 整遍报错。
 			m.failResolve(i, err)
 			return
 		}
-		if !ok {
-			continue
-		}
-		// 第三趟: 正向单条, 锚定在这个起点上取【最长】右端 —— 变长 pattern 在同一起点上有
-		// 一串长度都成立, 取最短就是把命中截断, 下游拿去做定长校验会把真命中判成假。
-		// p.fwd 是 longest 口径编的, 所以"锚定在 start"这一句给的就是最长的那个右端。
-		end := e
-		if loc := m.findCtx.FindStringIndexAtWithin(p.fwd, m.text, int(start), len(m.text)); loc != nil {
-			if pos := int32(loc[1]); pos > end {
-				end = pos
+		if n > len(m.cands) {
+			// 缓冲不够 —— 里面写下的是最大的那几个 (恰好最没用的), 整批作废, 换大的重来。
+			m.cands = make([]int32, n*2) // 翻倍留余量: 下一个右端多半也是这个量级
+			n, err = p.vp.ViableStarts(m.text, e, p.cur, 0, m.cands)
+			if err != nil {
+				m.failResolve(i, err)
+				return
+			}
+			if n > len(m.cands) {
+				m.fail(errors.New("re2native: match scanner pattern " + strconv.Itoa(i) +
+					" 候选缓冲扩容后仍然不够 —— 这是【本库的 bug】; pattern=" + m.set.pats[i]))
+				return
 			}
 		}
-		m.emit(i, start, end)
-		p.cur = end
+		m.st.Walks++
+		m.st.Cands += int64(n)
+		// ② 候选【从小到大】逐个验。缓冲是降序的, 所以倒着走 —— 第一个验过的就是 leftmost,
+		//    而 p.fwd 是 longest 口径编的, 它给的右端就是最长的那个 ⟹ 严格 leftmost-longest。
+		//    验不过说明这条"可行前缀"只是张空头支票 (能被某个后缀补成匹配, 但正文里跟着的
+		//    不是那个后缀), 试下一个。
+		got := false
+		for k := n - 1; k >= 0; k-- {
+			st := m.cands[k]
+			m.st.Tries++
+			loc := m.findCtx.FindStringIndexAtWithin(p.fwd, m.text, int(st), len(m.text))
+			if loc == nil {
+				continue
+			}
+			end := int32(loc[1])
+			m.emit(i, st, end)
+			p.cur = end
+			got = true
+			break
+		}
+		if !got {
+			// 一个都没验过 ⟹ [cur, e) 里根本没有起点 (证明见文件头 ②), 游标直接推到 e。
+			p.cur = e
+		}
 	}
 }
 

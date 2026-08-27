@@ -17,20 +17,21 @@
 //
 // ── 反向【更好】做, 不是更难做 ──────────────────────────────────────────────
 //
-// 正向那一遍 DFA 交出来的是匹配的【右端】, 起点得在 Go 这侧猜回去 —— matchscan.go 里那一整节
-// "第三种口径"讲的就是这件事的代价。反向交出来的是【左端】= 起点, 而 leftmost/rightmost-longest
-// 这个口径本来就定义在起点上, 所以这一层【没有】"猜"这一步:
+// 正向那一遍 DFA 交出来的是匹配的【右端】, 起点得在 Go 这侧【回推】—— matchscan.go 里那一节
+// "端点怎么补"讲的就是这件事的代价 (反向种全部状态收候选 + 升序逐个正向锚定验)。
+// 反向交出来的是【左端】= 起点, 而 leftmost/rightmost-longest 这个口径本来就定义在起点上,
+// 所以这一层连那一步都没有:
 //
 //	反向 set FindAllIndex                                  → 匹配左端, 按扫描方向 (从右往左) 单调
 //	正向【单条】FindStringIndexAtWithin(from=左端, bound=游标) → 【最长】右端, 且绝不越过游标
 //
-// 于是: 没有路 A / 路 B 之分, 没有 spanFast 这一档, 也不需要 maxL 窗口。每处命中恒等于
-// "一趟锚定搜索", 代价 = 这处命中有多长, 与正文长度无关。
+// 于是: 没有"收候选再逐个验"这一步, 也不需要 maxL 窗口。每处命中恒等于"一趟锚定搜索",
+// 代价 = 这处命中有多长, 与正文长度无关。
 //
 // 🔴 补右端那一趟走的是【这一条 pattern 自己的单条对象】(longest 口径编的), 不是"一条
 //    pattern 的 set" (2026-08-27 换掉的)。理由与正向那侧一字不差: 单条走 RE2::Match 那条
 //    带 NFA 回退的完整路 · 状态更小 · 不去冲刷整表那份 DFA 缓存。见 regexpset.go 的
-//    rev1/fwd1 那段。
+//    fwd1/vp1 那段。
 //
 // ── 为什么"从右往左"仍然一个字节都不用攒 ─────────────────────────────────────
 //
@@ -145,14 +146,14 @@ func (r *RegexpSetReverse) NewMatchScanner() (m *MatchScannerReverse, unsupporte
 }
 
 // SetModes 声明每条 pattern 要什么 (下标即 pattern 下标, 长度不足的按零值 = 默认档)。
-// 传 nil = 全默认档。与正向那个同解, 但只认两档:
+// 传 nil = 全默认档。与正向那个逐字同解, 两档:
 //
 //	MatchScanMode_span      要区间 (零值 · 默认)。口径 rightmost-longest, 无条件。
 //	MatchScanMode_boolOnly  只要"命中没命中", 一处区间都不收口、一次端点都不补。
 //
-// 🔴 MatchScanMode_spanFast 在这一侧【当场报错】, 不是静默忽略: 反向只有一条路, 而那条路
-//    本来就是最便宜的那条 (每处命中 = 一次锚定解析), 口径也是有保证的。正向那边 spanFast
-//    换来的那点便宜, 在这边不存在, 一个"看起来还能再快一档"的名字只会让人以为自己漏配了。
+// 🔴 2026-08-28 之前正向那侧多一个 MatchScanMode_spanFast, 这一侧【当场报错】把它挡掉。
+//    那一档整个删了 (见 matchscan.go 头注), 于是这里也不再有那道闸 —— 两侧的档位从此
+//    是同一套两态, 不必再解释"为什么这边少一档"。
 //
 // 🔴 能匹配空串的 pattern (PatternLenRange 的 min <= 0) 只允许配 boolOnly, 否则这里当场报错
 //    而不是运行时静默退回老路 —— 理由同正向: 每个位置都是一处零长命中, 游标压不住。
@@ -160,11 +161,6 @@ func (m *MatchScannerReverse) SetModes(modes []MatchScanMode_t) error {
 	for i := 0; i < len(modes) && i < len(m.per); i++ {
 		if modes[i] == MatchScanMode_boolOnly {
 			continue
-		}
-		if modes[i] == MatchScanMode_spanFast {
-			return errors.New("re2native: reverse match scanner pattern " + strconv.Itoa(i) +
-				" 配了 MatchScanMode_spanFast; 反向只有一条路且它就是最便宜的那条, 没有这一档" +
-				"; pattern=" + m.set.s.pats[i])
 		}
 		if !m.per[i].spanable {
 			return errors.New("re2native: reverse match scanner pattern " + strconv.Itoa(i) +
