@@ -258,9 +258,13 @@
         unres, _ := ms.Scan(body, func(ms []SetMatch) {   // ← 唯一一遍全文, 结果【一批一批】来
             for _, m := range ms { … m.Index / m.Lo / m.Hi … }   // text[Lo:Hi] 是第 Index 条的真匹配
         })                                  // 之后 Hit(i)/HitIDs() 就是门那张 bool 表
-        // unres 里的那几条这次拿不到 (反向/正向单条对象编不出来 / 游程乱序 / DFA 预算不够)
-        //   → 把本遍已经收到的这几条【全丢掉】, 照老路 re.FindAllStringIndex
-        //   (作废可能发生在已经交出去几处之后; 配了 boolOnly 的【不】算作废, 一处都不会来)
+        // unres 里的那几条这次【没能全给你】(能匹配空串 / 单条对象编不出来 / 游程乱序 /
+        //   DFA 预算不够), 每条是 {Index, Reason, ResumeFrom}。
+        //   🔴 已经交出去的那些【不作废】: 它们是验过的真匹配, 且完整覆盖到 ResumeFrom,
+        //      调用方只要对这几条从 ResumeFrom 起补后半截 —— 用
+        //      re.FindStringIndexFrom(body, ResumeFrom) 反复推进, 【别切片】(切了 \b/^/$
+        //      看到的就是假邻居)。四种原因里只有 DFA 预算不够那一种断点不是 0。
+        //   (配了 boolOnly 的【不】算作废, 一处都不会来)
         // 🔴 交给回调的切片是内部缓冲本身, 下一批原地覆写; 各条 pattern 的结果【交错】着来
         //    (同一条内部按 Lo 升序), 想按条归拢是调用方一句 append 的事
       🔴 库【故意不给】"一次性物化成数组"的接口 (AppendAllMatches 2026-08-27 删了)。要数组的
@@ -294,7 +298,8 @@
                            不挑 pattern 形状。整串 + startpos, 不切片 ⟹ \b / ^ / $ 看到的
                            是真实邻字节。代价: 每处比 spanFast 贵约 1.6x, 无上界的条目还要
                            走完空隙 (各轮窗口两两不交且递增, 累加封顶 = 多扫一遍正文, 2.00x)。
-        补不出来的         进 unresolved, 请调用方照老路 —— 宁可退回去也不给"像是对的"答案。
+        补不出来的         进 unresolved (带断点), 请调用方从断点起照老路补 —— 宁可退回去
+                           也不给"像是对的"答案。
 
       ── spanFast: 什么时候才该挂 ──────────────────────────────────────────────
       它强制走【游标启发式】那条路: 从右端往左锚定回推一次拿最靠左的起点, 代价与正文长度无关
@@ -312,6 +317,30 @@
       🔴 挂之前先把凭据跑出来, 别凭感觉: 拿这条 pattern 自己 fuzz 一遍 (随机正文 × 两档对拍),
          数出岔开 0 处再挂。跑出来了就挂 —— 挂上之后它既是快的那条路, 又确实是 leftmost-longest。
          怎么写这个 fuzz、判据是什么、真实产品上拉进来了多少条: doc/MatchScanner的leftmost-longest保证.md。
+
+      ── unresolved: "没能全给你"是一份带断点的交代, 不是"前面白干了" ──────────
+      Scan 返回 []MatchScanUnresolved{Index, Reason, ResumeFrom}。四种 Reason:
+        emptyMatch  这条能匹配空串 (min <= 0)。在它的【第一条游程】上就判掉, 一处都没交出去。
+        compile     补端点要的那个"只有这一条"的单条对象编不出来 (maxMem 太小 / 编译失败)。
+                    同上, 也是初始化那一下。
+                    🔴 这两类只跟 pattern 有关、跟正文无关 ⟹ 出现一次就是每一遍都出现,
+                       该在建集那一步挑掉 (SetModes 已经把 emptyMatch 那类挡在建工作区)。
+        dfaBudget   锚定解析时 DFA 放弃 (arena 撞到 maxMem)。【只有这一种】能发生在已经交出去
+                    几处之后。
+        runOrder    游程不按扫描方向单调 —— native 侧不变量崩了, 本不该发生。
+      🔴 就算是 dfaBudget, 已交付的每一处也都是被锚定解析验过的真匹配, 而且【完整覆盖到
+         ResumeFrom 为止】。所以交代的形状是"给你一个断点", 不是"全废":
+           正向: 已交付覆盖 [0, ResumeFrom), 从 ResumeFrom 往后补;
+           反向: 已交付覆盖 [ResumeFrom, len(text)), 从 ResumeFrom 往前补。
+         emptyMatch / compile / runOrder 三类的断点就是整篇 (正向 0 · 反向 len(text)),
+         与"全部重来"逐字同解。
+      🔴 补的时候【别切片】: text[ResumeFrom:] 会让 \b / ^ / $ 看到假邻居。用
+         (*Regexp).FindStringIndexFrom(text, pos) —— 参数是原串偏移, 整串照样喂给 RE2。
+      🔴 dfaBudget 实测很难打到: 锚定解析用的是【小 DFA】(起点只有一个, 不是扫全文那个),
+         真表 pattern 上 8KB maxMem 都不放弃。调用方图省事整条重跑也对, 只是没省到。
+      (旧版这里返回的是光秃秃的 []int32, 配的话是"要把这一条本遍收到的全丢掉"—— 那句对四种
+       原因里只有一种成立, 另外三种是被连坐的, 而就算那一种也只需要丢断点之后那一截。
+       全文见 matchscan_unresolved.go。)
 
       ── 内存: 这一层一个字节都不留 ────────────────────────────────────────────
       🔴 游标推进在回调里当场跑完, 收口出来的区间写进一块固定的 12KB 缓冲 (1024 处), 满了就

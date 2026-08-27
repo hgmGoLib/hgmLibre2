@@ -79,7 +79,7 @@ type MatchScannerReverse struct {
 	mode  []MatchScanMode_t // 每条要什么 (见 SetModes); nil = 全走默认档
 	hit   []bool
 	hits  []int32 // 上一遍命中过的下标 (= Set.Match 那张表), 去重且只含真命中
-	bad   []int32 // 本遍作废的下标, Scan 收尾时原样还给调用方
+	bad   []MatchScanUnresolved // 本遍作废的那几条, Scan 收尾时原样还给调用方
 	// out 是那块固定的输出缓冲 (长度恒为 matchScanBatch), outN 是已填几处。
 	out  []SetMatch
 	outN int
@@ -171,12 +171,13 @@ func (m *MatchScannerReverse) Close() {
 // 🔴 交给 batchFn 的切片是内部缓冲本身, 下一批原地覆写 —— 要留就 append 走。
 // 🔴 各条 pattern 的结果是【交错】着来的, 同一条 pattern 内部按 Lo 【降序】(不是升序)。
 //
-// unresolved 是这一遍里补不出右端的 pattern 下标 (能匹配空串 / 单条正向 set 编不出来 /
-// 游程乱序 / DFA 预算不够)。调用方要把本遍已收到的这几条的结果【全丢掉】, 改对它们跑一遍老路
-// —— 作废可能发生在已经交出去几处之后。切片下次 Scan 会被覆写。
+// unresolved 是这一遍里没能全给出来的那几条 (能匹配空串 / 单条正向 set 编不出来 / 游程乱序 /
+// DFA 预算不够), 每条带 Index · Reason · ResumeFrom。【已经交出去的那些不作废】: 反向的
+// 已交付部分覆盖 [ResumeFrom, len(text)), 调用方只要对这几条在 text[:ResumeFrom] 这一段上
+// 补一遍老路 (别切片 —— 用 bound 参数, \b / ^ / $ 才看得到真邻居)。切片下次 Scan 会被覆写。
 //
 // batchFn 传 nil 合法: 只要命中表 (等价于 RegexpSetReverse.Match), 一处区间都不收口。
-func (m *MatchScannerReverse) Scan(text string, batchFn func(ms []SetMatch)) (unresolved []int32, err error) {
+func (m *MatchScannerReverse) Scan(text string, batchFn func(ms []SetMatch)) (unresolved []MatchScanUnresolved, err error) {
 	if m.alloc == nil {
 		return nil, errClosedMatchScanner
 	}
@@ -233,9 +234,18 @@ func (m *MatchScannerReverse) emit(i int, lo, hi int32) {
 }
 
 // markBad 把第 i 条当场作废: 之后它的游程一律不看, 收尾时进 unresolved。
-func (m *MatchScannerReverse) markBad(i int) {
-	m.per[i].bad = true
-	m.bad = append(m.bad, int32(i))
+//
+// ResumeFrom 就是这一条的游标 —— 反向的已交付部分覆盖 [cur, len(text)), 缺的只有它左边
+// 那一截。只有 dfaBudget 能走到"已经交出去几处"的地步, 其余一律 len(text) = 整篇重来。
+// 见 matchscan_unresolved.go。
+func (m *MatchScannerReverse) markBad(i int, reason MatchScanUnresolvedReason_t) {
+	p := &m.per[i]
+	p.bad = true
+	from := int32(len(m.text))
+	if reason == MatchScanUnresolvedReason_dfaBudget {
+		from = p.cur
+	}
+	m.bad = append(m.bad, MatchScanUnresolved{Index: int32(i), ResumeFrom: from, Reason: reason})
 }
 
 // feed 把一条游程 [lo,hi] (都是【左端】偏移) 喂给第 i 条的游标, 当场推进并收口。
@@ -258,7 +268,7 @@ func (m *MatchScannerReverse) feed(i int, lo, hi int32) {
 		minL, maxL := m.set.s.PatternLenRange(i)
 		if minL <= 0 {
 			// 能匹配【空串】的 pattern 不走这条路: 每个位置都是一处零长命中, 游标压不住。
-			m.markBad(i)
+			m.markBad(i, MatchScanUnresolvedReason_emptyMatch)
 			return
 		}
 		p.minL = int32(minL)
@@ -268,13 +278,14 @@ func (m *MatchScannerReverse) feed(i int, lo, hi int32) {
 		if !p.fixed {
 			// 变长: 右端靠这一条自己那份【正向 set】锚定往右伸。定长不用建任何对象。
 			if p.fwd = m.set.s.forwardSetOne(i); p.fwd == nil {
-				m.markBad(i)
+				m.markBad(i, MatchScanUnresolvedReason_compile)
 				return
 			}
 		}
 	}
 	if hi > p.lastHi {
-		m.markBad(i) // 游程乱序 —— 反向流必须降序, 前提没了就宁可退回老路
+		// 游程乱序 —— 反向流必须降序, 前提没了就宁可退回老路。
+		m.markBad(i, MatchScanUnresolvedReason_runOrder)
 		return
 	}
 	p.lastHi = lo
@@ -299,8 +310,9 @@ func (m *MatchScannerReverse) feed(i int, lo, hi int32) {
 		//    下游拿去做定长校验会把真命中判成假 (见 spanresolve.go 那段红字)。
 		end, ok, err := p.fwd.ResolveSpanWithin(m.text, s, p.cur, 0)
 		if err != nil {
-			// DFA 放弃 (预算不够) —— 不是"没有匹配", 也不该把整遍扫描带崩。
-			m.markBad(i)
+			// DFA 放弃 (预算不够) —— 不是"没有匹配", 也不该把整遍扫描带崩, 更不该让
+			// 【已经交出去的那些】跟着作废: 报出游标当断点, 调用方从那儿往左补。
+			m.markBad(i, MatchScanUnresolvedReason_dfaBudget)
 			return
 		}
 		if !ok {

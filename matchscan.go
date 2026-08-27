@@ -22,7 +22,8 @@
 //	                           要区间但强制走便宜那条路。全文见下一节。
 //	Scan(text, batchFn)        一遍全文。命中表 (HitIDs / Hit, 与 Set.Match 同解) 边扫边填,
 //	                           命中区间【边扫边收口、攒够一批就交出去】。
-//	                           返回 unresolved: 这几条补不出来, 请调用方走老路。
+//	                           返回 unresolved: 这几条没能全给你, 每条带一个 ResumeFrom
+//	                           断点 —— 已交出去的部分是好的, 从断点往后补即可。
 //
 // 🔴 一批一批交出去是【内存】上的要求, 不是风格。底下 FindAllIndex 本来就是 sqlite3_step
 //    式的: 一批 4096 条游程 (48KB) 装满就挂起、交给 Go、取走再进去接着扫, 缓冲循环复用,
@@ -41,8 +42,14 @@
 //
 // 能边扫边收口是因为同一条 pattern 的游程【跨批次也是升序】的 (正向扫本来就从左往右走)。
 // 万一不是 (真出现了乱序), 那一条当场作废进 unresolved 让调用方走老路 —— 宁可退回去也不给
-// 错答案。🔴 作废可能发生在【已经交出去几处之后】(乱序 / DFA 中途放弃都是走到一半才知道),
-// 所以调用方对 unresolved 里的下标要把本遍已收到的结果【全丢掉】再走老路, 不能只补后半截。
+// 错答案。
+//
+// 🔴 作废【不会】让已经交出去的东西作废。作废确实可能发生在交出去几处之后 (DFA 中途放弃是
+//    走到一半才知道的), 但那一刻已交付的每一处都是被锚定解析验过的真匹配, 而且完整覆盖到
+//    游标为止 —— 所以 unresolved 里每一条带的是一个 ResumeFrom 断点, 调用方从断点往后补就行,
+//    不必把已收到的挑出来删掉。四种作废原因里只有 DFA 放弃这一种断点不是 0, 另外三种
+//    (能匹配空串 / 单条对象编不出来 / 游程乱序) 断点就是 0 = 整篇重来。全文见
+//    matchscan_unresolved.go。
 //
 // ── 三态旋钮 (SetModes): 每条 pattern 要什么 ─────────────────────────────────
 //
@@ -181,7 +188,9 @@
 //     "等于 FindAll"这个承诺, 就不该拿 8 倍的钱去买: 真表上闸装着 1.82×, 拆掉 15.03×。)
 //
 // unresolved 里的那几条 (单条对象编不出来 / 游程乱序 / DFA 预算不够) 请调用方照老路对它跑
-// FindAll —— 库这边宁可退回去也不给一个"像是对的"答案。
+// FindAll —— 库这边宁可退回去也不给一个"像是对的"答案。跑的时候【从这一条的 ResumeFrom 起】
+// 就够了, 而且别切片: (*Regexp).FindStringIndexFrom(text, pos) 参数是原串偏移, \b / ^ / $
+// 看到的还是真邻居 (见 find_from.go)。
 // 配了 boolOnly 的【不】进 unresolved: 那是调用方自己关掉的, 不是库补不出来。
 //
 // 生命周期同 FindAllIndex 的 alloc: 可复用工作区, 热路径上建一次留着,【不是并发安全的】。
@@ -214,7 +223,7 @@ type MatchScanner struct {
 	mode  []MatchScanMode_t // 每条要什么 (见 SetModes); nil = 全走默认档
 	hit   []bool
 	hits  []int32 // 上一遍命中过的下标 (= Set.Match 那张表), 去重且只含真命中
-	bad   []int32 // 本遍作废的下标, Scan 收尾时原样还给调用方
+	bad   []MatchScanUnresolved // 本遍作废的那几条, Scan 收尾时原样还给调用方
 	// out 是那块固定的输出缓冲 (长度恒为 matchScanBatch), outN 是已填几处。
 	// 满了就交给 fn 再从头填 —— 整个 Scan 期间这一层留下的就只有这 12KB。
 	out  []SetMatch
@@ -332,12 +341,13 @@ func (m *MatchScanner) Close() {
 // 🔴 交给 batchFn 的切片是内部缓冲本身, 下一批原地覆写 —— 要留就 append 走。
 // 🔴 各条 pattern 的结果是【交错】着来的 (同一条内部按 Lo 升序), 不按 pattern 分组。
 //
-// unresolved 是这一遍里补不出左端的 pattern 下标 (能匹配空串 / 反向编不出来 / 游程乱序 /
-// DFA 预算不够)。调用方要把本遍已收到的这几条的结果【全丢掉】, 改对它们跑一遍老路 FindAll
-// —— 作废可能发生在已经交出去几处之后。切片下次 Scan 会被覆写。
+// unresolved 是这一遍里没能全给出来的那几条 (能匹配空串 / 反向编不出来 / 游程乱序 / DFA
+// 预算不够), 每条带 Index · Reason · ResumeFrom。【已经交出去的那些不作废】: 它们是验过的
+// 真匹配且完整覆盖到 ResumeFrom, 调用方只要对这几条从 ResumeFrom 起补一遍老路 FindAll
+// (用 FindStringIndexFrom, 别切片)。切片下次 Scan 会被覆写。
 //
 // batchFn 传 nil 合法: 只要命中表 (等价于 Set.Match), 一处区间都不收口。
-func (m *MatchScanner) Scan(text string, batchFn func(ms []SetMatch)) (unresolved []int32, err error) {
+func (m *MatchScanner) Scan(text string, batchFn func(ms []SetMatch)) (unresolved []MatchScanUnresolved, err error) {
 	if m.alloc == nil {
 		return nil, errClosedMatchScanner
 	}
@@ -395,9 +405,18 @@ func (m *MatchScanner) emit(i int, lo, hi int32) {
 }
 
 // markBad 把第 i 条当场作废: 之后它的游程一律不看, 收尾时进 unresolved。
-func (m *MatchScanner) markBad(i int) {
-	m.per[i].bad = true
-	m.bad = append(m.bad, int32(i))
+//
+// ResumeFrom 就是这一条的游标 —— 已交付的那些完整覆盖 [0, cur), 缺的只有它之后那一截。
+// 只有 dfaBudget 能走到"已经交出去几处"的地步 (另外三类都是初始化那一下或不变量崩了),
+// 其余一律 0 = 整篇重来, 与旧契约同解。见 matchscan_unresolved.go。
+func (m *MatchScanner) markBad(i int, reason MatchScanUnresolvedReason_t) {
+	p := &m.per[i]
+	p.bad = true
+	from := int32(0)
+	if reason == MatchScanUnresolvedReason_dfaBudget {
+		from = p.cur
+	}
+	m.bad = append(m.bad, MatchScanUnresolved{Index: int32(i), ResumeFrom: from, Reason: reason})
 }
 
 // feed 把一条游程 [lo,hi] (都是右端偏移) 喂给第 i 条的游标, 当场推进并收口。
@@ -412,7 +431,7 @@ func (m *MatchScanner) feed(i int, lo, hi int32) {
 		if minL <= 0 {
 			// 能匹配【空串】的 pattern 不走这条路: 每个位置都是一处零长命中, 游标压不住,
 			// 吐出来的 text[Lo:Lo] 对下游也没有意义。这种交给老路。
-			m.markBad(i)
+			m.markBad(i, MatchScanUnresolvedReason_emptyMatch)
 			return
 		}
 		p.minL = int32(minL)
@@ -428,20 +447,21 @@ func (m *MatchScanner) feed(i int, lo, hi int32) {
 			// 🔴 反向对象一个都不建 —— 这正是 B 相对 A 省下的那一半。
 			p.maxL = int32(maxL) // maxL < 0 (无上界) 原样带下去, 窗口退化成"从游标起"
 			if p.fwd = m.set.forwardOne(i); p.fwd == nil {
-				m.markBad(i)
+				m.markBad(i, MatchScanUnresolvedReason_compile)
 				return
 			}
 		default:
 			// 路 A: 起点靠这一条自己的反向对象锚定回推。给出来的口径是第三种 ——
 			// 见文件头那一节, 选了 spanFast 的调用方自己举证。
 			if p.rev = m.set.reverseOne(i); p.rev == nil {
-				m.markBad(i)
+				m.markBad(i, MatchScanUnresolvedReason_compile)
 				return
 			}
 		}
 	}
 	if lo < p.lastLo {
-		m.markBad(i) // 游程乱序 —— 推进的前提没了, 宁可退回老路也不给错答案
+		// 游程乱序 —— 推进的前提没了, 宁可退回老路也不给错答案。
+		m.markBad(i, MatchScanUnresolvedReason_runOrder)
 		return
 	}
 	p.lastLo = lo
@@ -484,7 +504,7 @@ func (m *MatchScanner) feed(i int, lo, hi int32) {
 			// 所以终点这一下要重新取最长 (锚定, 代价 = 这处命中有多长)。
 			pos, ok, err := m.set.ResolveSpan(m.text, start, int32(i))
 			if err != nil {
-				m.markBad(i)
+				m.markBad(i, MatchScanUnresolvedReason_dfaBudget)
 				return
 			}
 			if ok && pos > end {
@@ -499,8 +519,9 @@ func (m *MatchScanner) feed(i int, lo, hi int32) {
 		start, ok, err := p.rev.ResolveSpanWithin(m.text, e, p.cur, 0)
 		if err != nil {
 			// DFA 放弃 (预算不够) —— 不是"没有匹配", 也不该把整遍扫描带崩。
-			// 这一条当场作废进 unresolved, 调用方照老路 FindAll。
-			m.markBad(i)
+			// 这一条当场作废进 unresolved, 但【已经交出去的那些是好的】: 报出游标当
+			// 断点, 调用方从那儿往后补就行 (见 matchscan_unresolved.go)。
+			m.markBad(i, MatchScanUnresolvedReason_dfaBudget)
 			return
 		}
 		if !ok {
@@ -511,7 +532,7 @@ func (m *MatchScanner) feed(i int, lo, hi int32) {
 		end := e
 		pos, ok, err := m.set.ResolveSpan(m.text, start, int32(i))
 		if err != nil {
-			m.markBad(i)
+			m.markBad(i, MatchScanUnresolvedReason_dfaBudget)
 			return
 		}
 		if ok && pos > end {
@@ -536,7 +557,8 @@ func (m *MatchScanner) Hit(i int) bool {
 // ∝ 命中数的 ratchet 缓冲, 正是分批接口要躲开的那个东西 (真表 0.037MB/MB, 200MB 的 body
 // 就是每个并发扫描 7.4MB 常驻), 而一行"生产路径别用"的注释拦不住任何人。
 // 要一次性数组的调用方自己在 Scan 的回调里 append 一行就有了 —— 那一行写在调用方自己家里,
-// 谁写谁看得见代价。unresolved 那几条已经交出去的处数要自己剔掉再走老路 (见 Scan 的说明)。
+// 谁写谁看得见代价。unresolved 那几条已经交出去的处数【留着就行】, 只补 ResumeFrom 之后的
+// 那一截 (见 Scan 的说明)。
 
 // errClosedMatchScanner 单独提出来, 免得每次构造一遍 error。
 var errClosedMatchScanner = errors.New("re2native: match scanner closed")

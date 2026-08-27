@@ -42,7 +42,8 @@ func TestPatternLenRangeTable(t *testing.T) {
 }
 
 // scanByPat 把一遍 Scan 的【分批】输出按 pattern 归拢成扁平 (lo,hi) 表, 并把 unresolved
-// 那几条已经收到的剔掉 (调用方对它们要走老路)。库这边【不归拢】—— 归拢就得攒, 正是分批接口
+// 那几条整条剔掉 —— 这是【对拍口径】: 那几条不参与和 FindAll 的逐位比对。生产上不必这么做,
+// 已交付的部分是好的, 只要从 u.ResumeFrom 起补后半截 (见 matchscan_unresolved.go)。库这边【不归拢】—— 归拢就得攒, 正是分批接口
 // 要躲开的 (见 matchscan.go 文件头); 归拢是调用方一句 append 的事, 这个函数就是那一句。
 func scanByPat(t *testing.T, ms *MatchScanner, text string) (map[int32][]int32, map[int32]bool) {
 	t.Helper()
@@ -56,9 +57,9 @@ func scanByPat(t *testing.T, ms *MatchScanner, text string) (map[int32][]int32, 
 		t.Fatal(err)
 	}
 	bad := map[int32]bool{}
-	for _, id := range unres {
-		bad[id] = true
-		delete(out, id)
+	for _, u := range unres {
+		bad[u.Index] = true
+		delete(out, u.Index) // 对拍用: 这几条整条不参与比对 (生产上只要补 u.ResumeFrom 之后那一截)
 	}
 	return out, bad
 }
@@ -276,8 +277,9 @@ func TestMatchScanEmptyCapableFallback(t *testing.T) {
 	defer ms.Close()
 	if unres, err := ms.Scan("--aa--bb--", func([]SetMatch) {}); err != nil {
 		t.Fatal(err)
-	} else if len(unres) != 1 || unres[0] != 0 {
-		t.Fatalf("要 [0] (a* 走老路), 得到 %v", unres)
+	} else if len(unres) != 1 || unres[0].Index != 0 ||
+		unres[0].Reason != MatchScanUnresolvedReason_emptyMatch || unres[0].ResumeFrom != 0 {
+		t.Fatalf("要 {0 emptyMatch 0} (a* 走老路 · 一处都没交出去 ⟹ 断点 0), 得到 %v", unres)
 	}
 }
 
@@ -390,5 +392,60 @@ func TestMatchScanSetModesRejectsEmptyCapable(t *testing.T) {
 	}
 	if err := ms.SetModes([]MatchScanMode_t{MatchScanMode_boolOnly, MatchScanMode_span}); err != nil {
 		t.Fatalf("配成 boolOnly 应当放行: %v", err)
+	}
+}
+
+// TestMatchScanUnresolvedResume —— 钉 unresolved 的【形状】: 一条一个 {Index, Reason, ResumeFrom},
+// 而且"没能全给你"不等于"前面交出去的白干了"。
+//
+// 这里能确定性造出来的只有 emptyMatch 一类 (dfaBudget 要让锚定解析撞 maxMem —— 那跑的是
+// 起点唯一的小 DFA, 拿真表形状的 pattern 试到 8KB maxMem 都不放弃, 造不出稳定的红)。
+// emptyMatch 这一类的判据正好是最强的那条: 它在【第一条游程】上就判掉, 所以同一遍里
+// 【别的 pattern】的结果必须一处不少地照常交出来 —— 旧契约那句"全丢掉"从来就不该连坐到这儿。
+func TestMatchScanUnresolvedResume(t *testing.T) {
+	set, err := NewRegexpSet([]string{`a*`, `\d{3}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ms, err := set.NewMatchScanner()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ms.Close()
+
+	text := "aa 123 aaa 456"
+	var got []SetMatch
+	unres, err := ms.Scan(text, func(b []SetMatch) { got = append(got, b...) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unres) != 1 {
+		t.Fatalf("要 1 条 unresolved (a* 能匹配空串), 得到 %+v", unres)
+	}
+	u := unres[0]
+	if u.Index != 0 || u.Reason != MatchScanUnresolvedReason_emptyMatch || u.ResumeFrom != 0 {
+		t.Fatalf("要 {Index:0 Reason:emptyMatch ResumeFrom:0}, 得到 %+v", u)
+	}
+	// 第 1 条 (\d{3}) 与它无关, 必须一处不少。
+	want := []SetMatch{{Index: 1, Lo: 3, Hi: 6}, {Index: 1, Lo: 11, Hi: 14}}
+	var only1 []SetMatch
+	for _, m := range got {
+		if m.Index == 1 {
+			only1 = append(only1, m)
+		}
+	}
+	if len(only1) != len(want) {
+		t.Fatalf("\\d{3} 要 %v, 得到 %v (unresolved 不该连坐别的 pattern)", want, only1)
+	}
+	for k := range want {
+		if only1[k] != want[k] {
+			t.Fatalf("\\d{3} 要 %v, 得到 %v", want, only1)
+		}
+	}
+	// 作废那一条一处都不该交出来 (它是初始化那一下判掉的)。
+	for _, m := range got {
+		if m.Index == 0 {
+			t.Fatalf("emptyMatch 那一条不该交出任何区间, 却给了 %+v", m)
+		}
 	}
 }

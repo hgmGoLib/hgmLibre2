@@ -677,14 +677,42 @@ patterns are safe when both ends are anchored (`\b`, `^`, `$`, a fixed delimiter
 unanchored variable patterns should be treated as "something is around here" and
 re-checked with the pattern itself.
 
-#### `unresolved`: the fall-back list
+#### `unresolved`: a fall-back list that comes with a resume point
 
-`Scan` returns the indices whose left edge could not be recovered this pass — the
-pattern can match the empty string, its reverse program would not compile, the runs
-arrived out of order, or the DFA gave up on budget. For those indices, **discard
-everything you already received in this pass** and run the old path
-(`re.FindAllStringIndex`) for them: a pattern can be invalidated after some of its
-spans were already handed out, so patching only the tail would silently lose spans.
+`Scan` returns a `[]MatchScanUnresolved` — one entry per pattern it could not fully
+serve this pass, each carrying `Index`, `Reason`, and `ResumeFrom`. Four reasons:
+
+| `Reason` | what happened | can it strand delivered spans? |
+| — | — | — |
+| `emptyMatch` | the pattern matches the empty string (`min <= 0`) | no — decided on its *first* run, before anything was emitted |
+| `compile` | the single-pattern object needed to fill in the other end would not compile | no — same, at init |
+| `dfaBudget` | the anchored resolve gave up (arena hit `maxMem`) | **yes** — this is the only one |
+| `runOrder` | runs did not arrive monotonically in scan order | shouldn't happen; native invariant broken |
+
+**What you already received is not garbage.** Even for `dfaBudget`, every span handed
+out for that pattern is a real match verified by an anchored resolve, and together
+they cover the input completely up to `ResumeFrom`. So the entry tells you where the
+delivered part stops rather than asking you to throw it away:
+
+* forward — delivered spans cover `[0, ResumeFrom)`; resume forward from there;
+* reverse — delivered spans cover `[ResumeFrom, len(text))`; resume backwards from there.
+
+For `emptyMatch` / `compile` / `runOrder`, `ResumeFrom` is simply the whole input
+(`0` forward, `len(text)` reverse), which is exactly the old "redo the lot".
+
+🔴 When you resume, **do not slice**. `text[ResumeFrom:]` makes `\b`, `^` and `$` see
+a fabricated neighbour byte. Use `(*Regexp).FindStringIndexFrom(text, pos)`, whose
+offsets are into the original string — RE2 still sees the whole text.
+
+The first two reasons depend only on the pattern, never on the input, so a pattern
+that hits them once hits them on every pass: sort those out when you build the set
+(`SetModes` already rejects the `emptyMatch` shape at workspace-construction time).
+`dfaBudget` is hard to provoke in practice — the anchored resolve runs the *small*
+DFA (one start position, not the whole-text scan), and on production-shaped patterns
+it does not give up even at an 8 KB `maxMem`. Redoing the whole pattern instead of
+resuming is therefore a perfectly reasonable caller-side simplification; it is
+bit-for-bit the same answer, just not as cheap.
+
 Indices you set to `boolOnly` are never listed — those are your choice, not a
 library limitation. The slice is overwritten by the next `Scan`.
 
@@ -693,9 +721,9 @@ library limitation. The slice is overwritten by the next `Scan`.
 from tests and measurement into production, and its `dst` is a ratchet buffer that
 tracks input length (~0.037 MB per MB of input on the table above) — exactly what the
 batched interface exists to avoid. Callers who want an array append one line inside
-their own `Scan` callback, where the cost is visible to whoever wrote it; they are
-then responsible for dropping what they already received for the `unresolved`
-indices.
+their own `Scan` callback, where the cost is visible to whoever wrote it; for the
+`unresolved` entries they keep what they already have and only fill in from
+`ResumeFrom`.
 
 #### `FindAllIndex`: the raw end-point runs
 

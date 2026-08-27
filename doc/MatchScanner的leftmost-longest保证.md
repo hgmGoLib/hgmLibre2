@@ -99,12 +99,42 @@ Lo = Hi - min
 
 ### (c) 补不出来的 —— 退回去, 不猜
 
-单条正向/反向对象编不出来、游程乱序、DFA 预算不够 ⟹ 那一条进 `unresolved`。
-调用方对这几条要**把本遍已经收到的全丢掉**再走老路 `re.FindAllStringIndex`
-(作废可能发生在已经交出去几处之后, 只补后半截会重复/漏)。
+单条正向/反向对象编不出来、能匹配空串、游程乱序、DFA 预算不够 ⟹ 那一条进 `unresolved`,
+一条一个 `MatchScanUnresolved{Index, Reason, ResumeFrom}`。
 配了 `boolOnly` 的**不**进 `unresolved` —— 那是调用方自己关掉的, 不是库补不出来。
 
 **宁可退回去也不给一个"像是对的"答案** —— 这是第三条腿, 也是前两条腿敢写成"保证"的前提。
+
+#### "退回去"退多少: 一个断点, 不是全废
+
+旧版这里返回的是光秃秃的 `[]int32`, 配的话是"把这一条本遍收到的**全丢掉**再走老路"。
+那句话说得太狠了 —— 四种原因里只有**一种**能发生在已经交出去几处之后:
+
+| `Reason` | 什么时候判掉 | 会不会连累已交付的 |
+|---|---|---|
+| `emptyMatch` | 这条的**第一条游程**上 (min <= 0) | 不会, 一处都还没交出去 |
+| `compile` | 同上, 初始化那一下 | 不会 |
+| `dfaBudget` | 锚定解析时 DFA 放弃 (arena 撞 maxMem) | **会 —— 只有这一种** |
+| `runOrder` | 游程不按扫描方向单调 | native 不变量崩了, 本不该发生 |
+
+而就算是 `dfaBudget`, "全丢掉"也是白丢的: 出事那一刻这一条已经交出去的每一处都被锚定解析
+验过 (①), 彼此不相交 (②), 而且**完整覆盖到游标为止**。缺的只有游标之后那一截。所以现在
+每条带一个断点:
+
+* 正向 —— 已交付覆盖 `[0, ResumeFrom)`, 从 `ResumeFrom` 往后补;
+* 反向 —— 已交付覆盖 `[ResumeFrom, len(text))`, 从 `ResumeFrom` 往前补。
+
+`emptyMatch` / `compile` / `runOrder` 三类的 `ResumeFrom` 就是整篇 (正向 `0` · 反向
+`len(text)`), 与旧的"全部重来"逐字同解。
+
+🔴 补的时候**别切片**: `text[ResumeFrom:]` 会让 `\b` / `^` / `$` 看到假邻居, 答案会错。
+用 `(*Regexp).FindStringIndexFrom(text, pos)` —— 参数是原串上的偏移, 整串照样喂给 RE2。
+
+前两类只跟 pattern 有关、跟正文无关, 出现一次就是每一遍都出现 ⟹ 该在建集那一步挑掉
+(`SetModes` 已经把 `emptyMatch` 那类挡在建工作区那一步, 当场报错而不是运行时静默退化)。
+`dfaBudget` 实际很难打到: 锚定解析跑的是**小 DFA**(起点只有一个, 不是扫全文那个), 拿真表
+形状的 pattern 试到 8KB `maxMem` 都不放弃。所以调用方图省事整条重跑也没错 —— 结果逐位相同,
+只是没省到。asc 那侧 (`engine/sd_body_gate_span.go`) 就是这么选的, 并且把理由写在了原地。
 
 ---
 
@@ -304,7 +334,8 @@ ASCP 的敏感数据门(`asc/engine/`)把整张规则表接到了 `MatchScanner`
 ## 8. 反向 MatchScanner: 同一件事的镜像, 口径是 rightmost-longest
 
 `RegexpSetReverse.NewMatchScanner()` 开出来的是 `*MatchScannerReverse`。方法名、回调形状、
-`unresolved` 的语义、那块固定 12KB 缓冲 —— 与正向那个**逐字相同**。只有两处不一样:
+`unresolved` 的语义 (含 `ResumeFrom` 断点, 见第 3 节 (c))、那块固定 12KB 缓冲 —— 与正向那个
+**逐字相同**。只有两处不一样:
 
 1. 交出来的区间按 `Lo` **降序**(正向是升序);
 2. 去重叠的口径是 **rightmost-longest**(正向是 leftmost-longest)。
