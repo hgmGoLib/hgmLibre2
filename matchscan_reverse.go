@@ -79,7 +79,8 @@ type MatchScannerReverse struct {
 	mode  []MatchScanMode_t // 每条要什么 (见 SetModes); nil = 全走默认档
 	hit   []bool
 	hits  []int32 // 上一遍命中过的下标 (= Set.Match 那张表), 去重且只含真命中
-	bad   []MatchScanUnresolved // 本遍作废的那几条, Scan 收尾时原样还给调用方
+	// scanErr 是本遍出的错 (回调里发现的, Scan 收尾时交出去)。与正向那个同解。
+	scanErr error
 	// out 是那块固定的输出缓冲 (长度恒为 matchScanBatch), outN 是已填几处。
 	out  []SetMatch
 	outN int
@@ -87,14 +88,17 @@ type MatchScannerReverse struct {
 }
 
 // msrPat_t 是每条 pattern 的推进状态。cur 是那把游标, 方向与正向相反。
+//
+// 🔴 spanable / fixed / minL 与正文无关, 一律在 NewMatchScanner 里算完 —— 与正向同解,
+//    理由见那边 msPat_t 上面那段。started 只管"本遍这一条的游标起没起", 不判任何东西。
 type msrPat_t struct {
-	inited bool
-	fixed  bool
-	bad    bool // 补不出右端 (能匹配空串 / 编不出单条正向 set / 游程乱序) → 调用方走老路
-	minL   int32
-	fwd    *RegexpSet // 这一条自己一条的【正向 set】, 惰性建; 拿它 ResolveSpanWithin 取最长右端
-	cur    int32      // 已吐出去那一处的【左端】: 新命中必须整个落在 [0, cur)
-	lastHi int32      // 上一条游程的右端, 用来确认降序
+	spanable bool // 能不能收口成区间 (false = 能匹配空串, 只能当 bool 用)
+	fixed    bool
+	started  bool  // 本遍这一条的游标已经置到正文末尾了
+	minL     int32
+	fwd      *RegexpSet // 这一条自己一条的【正向 set】, 惰性建; 拿它 ResolveSpanWithin 取最长右端
+	cur      int32      // 已吐出去那一处的【左端】: 新命中必须整个落在 [0, cur)
+	lastHi   int32      // 上一条游程的右端, 用来确认降序
 }
 
 // NewMatchScanner 开一个反向工作区。热路径上建一次长期留着, 别每次扫描新建。
@@ -102,18 +106,32 @@ type msrPat_t struct {
 // 🔴 反向 set 本身仍然该是【一条一个】或者至少是很小的一张表: set 里的状态数是相乘的
 //    (doc/状态数为什么会相乘.txt), 155 条的反向表在 6.4MB 正文上实测 65 秒 / arena 顶满
 //    254MB 还在 flush。这一层不改变那件事 —— 它只是把"扫出来的左端"补成完整区间。
-func (r *RegexpSetReverse) NewMatchScanner() (*MatchScannerReverse, error) {
+// unsupported 与正向那个同解: 走不了区间这条路的那几条下标 (当下只有"能匹配空串"一个原因)。
+// 建工作区那一刻就定死, 与正文无关 —— 这是"Scan 要么全给要么整遍报错"的前提。
+func (r *RegexpSetReverse) NewMatchScanner() (m *MatchScannerReverse, unsupported []int32, err error) {
 	alloc, err := r.NewFindAllIndexAlloc()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return &MatchScannerReverse{
+	m = &MatchScannerReverse{
 		set:   r,
 		alloc: alloc,
 		per:   make([]msrPat_t, r.s.size),
 		hit:   make([]bool, r.s.size),
 		out:   make([]SetMatch, matchScanBatch),
-	}, nil
+	}
+	for i := 0; i < r.s.size; i++ {
+		p := &m.per[i]
+		minL, maxL := r.s.PatternLenRange(i)
+		if minL <= 0 {
+			unsupported = append(unsupported, int32(i))
+			continue
+		}
+		p.spanable = true
+		p.minL = int32(minL)
+		p.fixed = minL == maxL && maxL >= 0
+	}
+	return m, unsupported, nil
 }
 
 // SetModes 声明每条 pattern 要什么 (下标即 pattern 下标, 长度不足的按零值 = 默认档)。
@@ -138,7 +156,7 @@ func (m *MatchScannerReverse) SetModes(modes []MatchScanMode_t) error {
 				" 配了 MatchScanMode_spanFast; 反向只有一条路且它就是最便宜的那条, 没有这一档" +
 				"; pattern=" + m.set.s.pats[i])
 		}
-		if minL, _ := m.set.s.PatternLenRange(i); minL <= 0 {
+		if !m.per[i].spanable {
 			return errors.New("re2native: reverse match scanner pattern " + strconv.Itoa(i) +
 				" 能匹配空串, 只能配 MatchScanMode_boolOnly; pattern=" + m.set.s.pats[i])
 		}
@@ -171,28 +189,28 @@ func (m *MatchScannerReverse) Close() {
 // 🔴 交给 batchFn 的切片是内部缓冲本身, 下一批原地覆写 —— 要留就 append 走。
 // 🔴 各条 pattern 的结果是【交错】着来的, 同一条 pattern 内部按 Lo 【降序】(不是升序)。
 //
-// unresolved 是这一遍里没能全给出来的那几条 (能匹配空串 / 单条正向 set 编不出来 / 游程乱序 /
-// DFA 预算不够), 每条带 Index · Reason · ResumeFrom。【已经交出去的那些不作废】: 反向的
-// 已交付部分覆盖 [ResumeFrom, len(text)), 调用方只要对这几条在 text[:ResumeFrom] 这一段上
-// 补一遍老路 (别切片 —— 用 bound 参数, \b / ^ / $ 才看得到真邻居)。切片下次 Scan 会被覆写。
+// 🔴 【要么全给, 要么整遍报错】, 与正向同解 —— 没有"这几条没给全, 你自己补"的中间态。
+//    err 的三种来由 (底下那遍 FindAllIndex 失败 / 单条正向 set 编不出来 / 锚定解析放弃)
+//    都是 maxMem 的事, 与正文无关; 另有"游程乱序"= 本库 bug, 也从这里交出来。
+//    能匹配空串的那几条不在这里出现: NewMatchScanner 建的时候就报过名单了。
 //
 // batchFn 传 nil 合法: 只要命中表 (等价于 RegexpSetReverse.Match), 一处区间都不收口。
-func (m *MatchScannerReverse) Scan(text string, batchFn func(ms []SetMatch)) (unresolved []MatchScanUnresolved, err error) {
+func (m *MatchScannerReverse) Scan(text string, batchFn func(ms []SetMatch)) error {
 	if m.alloc == nil {
-		return nil, errClosedMatchScanner
+		return errClosedMatchScanner
 	}
 	for _, id := range m.hits {
 		p := &m.per[id]
-		p.inited, p.fixed, p.bad = false, false, false
+		p.started = false
 		p.cur, p.lastHi = 0, 0
 		m.hit[id] = false
 	}
 	m.hits = m.hits[:0]
-	m.bad = m.bad[:0]
+	m.scanErr = nil
 	m.text = text
 	m.fn = batchFn
 	m.outN = 0
-	err = m.set.FindAllIndex(text, m.alloc, func(runs []RegexpSet_FindAllIndex_Run_t) {
+	err := m.set.FindAllIndex(text, m.alloc, func(runs []RegexpSet_FindAllIndex_Run_t) {
 		for k := range runs {
 			r := &runs[k]
 			i := int(r.ReIndex)
@@ -203,24 +221,27 @@ func (m *MatchScannerReverse) Scan(text string, batchFn func(ms []SetMatch)) (un
 				m.hit[i] = true
 				m.hits = append(m.hits, r.ReIndex)
 			}
-			if batchFn == nil || m.modeOf(i) == MatchScanMode_boolOnly {
+			if batchFn == nil || !m.per[i].spanable || m.modeOf(i) == MatchScanMode_boolOnly {
 				continue // 只当 bool 用的那几条: 到此为止, 一次端点都不补
 			}
 			m.feed(i, r.Lo, r.Hi)
 		}
 	})
+	m.text = ""
+	m.fn = nil
 	if err != nil {
-		m.text = ""
-		m.fn = nil
-		return nil, err
+		m.outN = 0
+		return err
+	}
+	if m.scanErr != nil {
+		m.outN = 0 // 这一遍不算数, 余下那不足一批的也不交
+		return m.scanErr
 	}
 	if m.outN > 0 && batchFn != nil {
 		batchFn(m.out[:m.outN])
 		m.outN = 0
 	}
-	m.text = ""
-	m.fn = nil
-	return m.bad, nil
+	return nil
 }
 
 // emit 把收口出来的一处区间写进那块固定缓冲, 满了就交出去。
@@ -233,19 +254,31 @@ func (m *MatchScannerReverse) emit(i int, lo, hi int32) {
 	}
 }
 
-// markBad 把第 i 条当场作废: 之后它的游程一律不看, 收尾时进 unresolved。
-//
-// ResumeFrom 就是这一条的游标 —— 反向的已交付部分覆盖 [cur, len(text)), 缺的只有它左边
-// 那一截。只有 dfaBudget 能走到"已经交出去几处"的地步, 其余一律 len(text) = 整篇重来。
-// 见 matchscan_unresolved.go。
-func (m *MatchScannerReverse) markBad(i int, reason MatchScanUnresolvedReason_t) {
-	p := &m.per[i]
-	p.bad = true
-	from := int32(len(m.text))
-	if reason == MatchScanUnresolvedReason_dfaBudget {
-		from = p.cur
+// fail / failCompile / failResolve / failRunOrder 与正向那四个逐字同解 (见 matchscan.go),
+// 只是文案上标出这是反向那一侧。收口跑在回调里 return 不出去, 记下来由 Scan 交出去。
+func (m *MatchScannerReverse) fail(err error) {
+	if m.scanErr == nil {
+		m.scanErr = err
 	}
-	m.bad = append(m.bad, MatchScanUnresolved{Index: int32(i), ResumeFrom: from, Reason: reason})
+}
+
+func (m *MatchScannerReverse) failCompile(i int) {
+	m.fail(errors.New("re2native: reverse match scanner pattern " + strconv.Itoa(i) +
+		" 补端点要的单条正向 set 编不出来 (maxMem 配小了); 把 maxMem 调大" +
+		"; pattern=" + m.set.s.pats[i]))
+}
+
+func (m *MatchScannerReverse) failResolve(i int, err error) {
+	m.fail(errors.New("re2native: reverse match scanner pattern " + strconv.Itoa(i) +
+		" 锚定解析失败: " + err.Error() + "; pattern=" + m.set.s.pats[i]))
+}
+
+// 🔴 反向流必须降序。不是降序 = 本库的不变量崩了, 不是调用方的用法问题。
+func (m *MatchScannerReverse) failRunOrder(i int, hi, last int32) {
+	m.fail(errors.New("re2native: reverse match scanner pattern " + strconv.Itoa(i) +
+		" 游程乱序 (hi=" + strconv.Itoa(int(hi)) + " > 上一条 " + strconv.Itoa(int(last)) +
+		") —— 这是【本库的 bug】, 不是调用方的用法问题, 请连 pattern 与正文一起报" +
+		"; pattern=" + m.set.s.pats[i]))
 }
 
 // feed 把一条游程 [lo,hi] (都是【左端】偏移) 喂给第 i 条的游标, 当场推进并收口。
@@ -260,32 +293,25 @@ func (m *MatchScannerReverse) markBad(i int, reason MatchScanUnresolvedReason_t)
 //    相交, 而 ② 承诺的是"同一条 pattern 内部互不相交"。
 func (m *MatchScannerReverse) feed(i int, lo, hi int32) {
 	p := &m.per[i]
-	if p.bad {
-		return
+	if m.scanErr != nil {
+		return // 这一遍已经不算数了, 后面一律空转
 	}
-	if !p.inited {
-		p.inited = true
-		minL, maxL := m.set.s.PatternLenRange(i)
-		if minL <= 0 {
-			// 能匹配【空串】的 pattern 不走这条路: 每个位置都是一处零长命中, 游标压不住。
-			m.markBad(i, MatchScanUnresolvedReason_emptyMatch)
-			return
-		}
-		p.minL = int32(minL)
-		p.fixed = minL == maxL && maxL >= 0
+	if !p.started {
+		p.started = true
 		p.cur = int32(len(m.text)) // 游标从正文【末尾】起, 往左退
 		p.lastHi = p.cur
-		if !p.fixed {
-			// 变长: 右端靠这一条自己那份【正向 set】锚定往右伸。定长不用建任何对象。
-			if p.fwd = m.set.s.forwardSetOne(i); p.fwd == nil {
-				m.markBad(i, MatchScanUnresolvedReason_compile)
-				return
-			}
+	}
+	if !p.fixed && p.fwd == nil {
+		// 变长: 右端靠这一条自己那份【正向 set】锚定往右伸。定长不用建任何对象。
+		// 惰性 —— 没被真问到位置的 pattern 一份都不占。
+		if p.fwd = m.set.s.forwardSetOne(i); p.fwd == nil {
+			m.failCompile(i)
+			return
 		}
 	}
 	if hi > p.lastHi {
-		// 游程乱序 —— 反向流必须降序, 前提没了就宁可退回老路。
-		m.markBad(i, MatchScanUnresolvedReason_runOrder)
+		// 游程乱序 —— 反向流必须降序, 前提没了再走下去就是错答案。见 failRunOrder。
+		m.failRunOrder(i, hi, p.lastHi)
 		return
 	}
 	p.lastHi = lo
@@ -310,9 +336,8 @@ func (m *MatchScannerReverse) feed(i int, lo, hi int32) {
 		//    下游拿去做定长校验会把真命中判成假 (见 spanresolve.go 那段红字)。
 		end, ok, err := p.fwd.ResolveSpanWithin(m.text, s, p.cur, 0)
 		if err != nil {
-			// DFA 放弃 (预算不够) —— 不是"没有匹配", 也不该把整遍扫描带崩, 更不该让
-			// 【已经交出去的那些】跟着作废: 报出游标当断点, 调用方从那儿往左补。
-			m.markBad(i, MatchScanUnresolvedReason_dfaBudget)
+			// DFA 放弃 (预算不够) —— 不是"没有匹配"。这一层不猜、不静默跳过, 整遍报错。
+			m.failResolve(i, err)
 			return
 		}
 		if !ok {

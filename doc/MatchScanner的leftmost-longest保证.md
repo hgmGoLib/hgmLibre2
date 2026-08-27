@@ -26,18 +26,20 @@
 ```go
 set, _ := hgmLibre2.NewRegexpSet(patterns)   // 包级变量, 建一次
 
-ms, _ := set.NewMatchScanner()               // 热路径上建一次留着; 不是并发安全的
+ms, unsup, _ := set.NewMatchScanner()        // 热路径上建一次留着; 不是并发安全的
 defer ms.Close()
+// unsup: 走不了区间这条路的那几条下标 (当下只有"能匹配空串"一个原因)。与正文无关,
+// 建工作区那一刻就定死 —— 装表这一步把它们配成 boolOnly 或者干脆走老路。
 
 // 可选: 每条 pattern 要什么。不调 = 全默认档 (要区间, 保证 leftmost-longest)。
 ms.SetModes(modes)
 
-unres, err := ms.Scan(body, func(batch []hgmLibre2.SetMatch) {
+err := ms.Scan(body, func(batch []hgmLibre2.SetMatch) {
     for _, m := range batch {
         // body[m.Lo:m.Hi] 是第 m.Index 条 pattern 的真匹配
         handle(m.Index, body[m.Lo:m.Hi])
     }
-})
+})   // 🔴 要么全给, 要么整遍不算数: err != nil ⟹ 这一遍作废, 整篇走老路 FindAll
 ids := ms.HitIDs()      // 与 Set.Match 同解的那张命中表; ms.Hit(i) 是 O(1) 的同一个答案
 ```
 
@@ -55,9 +57,10 @@ ids := ms.HitIDs()      // 与 Set.Match 同解的那张命中表; ms.Hit(i) 是
 门上很多位只当外层短路的 bool 用, 从来没人问它在哪 —— 真表上光两条这样的 pattern 就占了
 **57%** 的游程。在回调里过滤是钱已经花完了才扔。
 
-🔴 **能匹配空串的 pattern** 配 `span`/`spanFast` 会被 `SetModes` **当场报错**(每个偏移都是零长命中,
-游标推不过去), 不是运行时静默退化。这种条只能配 `boolOnly` 或者走老路。
-钉在 `TestMatchScanSetModesRejectsEmptyCapable`。
+🔴 **能匹配空串的 pattern** 在 `NewMatchScanner` 就进 `unsupported` 名单, 配 `span`/`spanFast`
+会被 `SetModes` **当场报错**(每个偏移都是零长命中, 游标推不过去), 不是运行时静默退化。
+这种条只能配 `boolOnly` 或者走老路。钉在 `TestMatchScanSetModesRejectsEmptyCapable` 与
+`TestMatchScanEmptyCapableFallback`。
 
 ---
 
@@ -99,42 +102,49 @@ Lo = Hi - min
 
 ### (c) 补不出来的 —— 退回去, 不猜
 
-单条正向/反向对象编不出来、能匹配空串、游程乱序、DFA 预算不够 ⟹ 那一条进 `unresolved`,
-一条一个 `MatchScanUnresolved{Index, Reason, ResumeFrom}`。
-配了 `boolOnly` 的**不**进 `unresolved` —— 那是调用方自己关掉的, 不是库补不出来。
-
 **宁可退回去也不给一个"像是对的"答案** —— 这是第三条腿, 也是前两条腿敢写成"保证"的前提。
 
-#### "退回去"退多少: 一个断点, 不是全废
+"退回去"只有两个形状, 而且两个都是调用方**造得出来**的:
 
-旧版这里返回的是光秃秃的 `[]int32`, 配的话是"把这一条本遍收到的**全丢掉**再走老路"。
-那句话说得太狠了 —— 四种原因里只有**一种**能发生在已经交出去几处之后:
+| 在哪儿交代 | 说的是什么 |
+|---|---|
+| `NewMatchScanner` 的 `unsupported` | `[]int32` —— 走不了区间这条路的那几条 pattern 下标。当下只有一个原因: 这条能匹配空串 (`PatternLenRange` 的 `min <= 0`), 每个位置都是一处零长命中, 游标压不住。 |
+| `Scan` 的 `err` | 这一遍不算数 (已经交出去的批次也不算), 整篇走老路 `FindAll`。 |
 
-| `Reason` | 什么时候判掉 | 会不会连累已交付的 |
-|---|---|---|
-| `emptyMatch` | 这条的**第一条游程**上 (min <= 0) | 不会, 一处都还没交出去 |
-| `compile` | 同上, 初始化那一下 | 不会 |
-| `dfaBudget` | 锚定解析时 DFA 放弃 (arena 撞 maxMem) | **会 —— 只有这一种** |
-| `runOrder` | 游程不按扫描方向单调 | native 不变量崩了, 本不该发生 |
+`unsupported` **与正文无关**, 建工作区那一刻就定死、扫多少遍都不变 ⟹ 它能直接写成回归测试
+(扔一条 `a*` 进 set, 必然报出它的下标, 见 `TestMatchScanEmptyCapableFallback`)。名单上的那几条
+配成 `boolOnly` (命中表照样有它们) 或者自己走老路; 配了要区间的档 `SetModes` 当场报错。
 
-而就算是 `dfaBudget`, "全丢掉"也是白丢的: 出事那一刻这一条已经交出去的每一处都被锚定解析
-验过 (①), 彼此不相交 (②), 而且**完整覆盖到游标为止**。缺的只有游标之后那一截。所以现在
-每条带一个断点:
+`Scan` 的 `err` 三种来由都是 `maxMem` 配小了 —— 底下那遍 `FindAllIndex` 失败 / 补端点的单条
+对象编不出来 / 锚定解析时 DFA 放弃。另有一种"游程不按扫描方向单调", 那是**本库的不变量崩了**
+= bug, 也从这里以 `err` 交出来, 不吞。
 
-* 正向 —— 已交付覆盖 `[0, ResumeFrom)`, 从 `ResumeFrom` 往后补;
-* 反向 —— 已交付覆盖 `[ResumeFrom, len(text))`, 从 `ResumeFrom` 往前补。
+#### 为什么不做成"部分成功"
 
-`emptyMatch` / `compile` / `runOrder` 三类的 `ResumeFrom` 就是整篇 (正向 `0` · 反向
-`len(text)`), 与旧的"全部重来"逐字同解。
+旧版这里是一张 `unresolved` 名单, 每条带 `{Index, Reason, ResumeFrom}` 断点, 意思是"这几条
+没给全, 你从断点起自己补"。2026-08-27 整个拆掉了。
 
-🔴 补的时候**别切片**: `text[ResumeFrom:]` 会让 `\b` / `^` / `$` 看到假邻居, 答案会错。
-用 `(*Regexp).FindStringIndexFrom(text, pos)` —— 参数是原串上的偏移, 整串照样喂给 RE2。
+理由不是那个断点算错了 (它是对的), 而是它服务的那条分支**调用方永远验不了**:
 
-前两类只跟 pattern 有关、跟正文无关, 出现一次就是每一遍都出现 ⟹ 该在建集那一步挑掉
-(`SetModes` 已经把 `emptyMatch` 那类挡在建工作区那一步, 当场报错而不是运行时静默退化)。
-`dfaBudget` 实际很难打到: 锚定解析跑的是**小 DFA**(起点只有一个, 不是扫全文那个), 拿真表
-形状的 pattern 试到 8KB `maxMem` 都不放弃。所以调用方图省事整条重跑也没错 —— 结果逐位相同,
-只是没省到。asc 那侧 (`engine/sd_body_gate_span.go`) 就是这么选的, 并且把理由写在了原地。
+> 一个调用方造不出来的错误码, 不该出现在返回值里。
+
+它逼出的是这么一条链 —— 调用方必须写兜底 → 兜底跑不到 → 跑不到就没法测 → 没法测的代码
+基本是错的 → 真出事那天走的是一段从没执行过的路。那比"根本没有兜底、直接整遍失败"**更危险**。
+
+而"锚定解析 DFA 放弃"实测**造不出来**: 它跑的是**小 DFA**(起点只有一个, 不是扫全文那个)。
+三种形状 (`ab` · `[A-Za-z][A-Za-z0-9]{2,19}key` · `(?i)[a-z0-9]{3,20}@[a-z0-9.\-]{3,20}`)
+在"刚好编得出来"的那道墙 (`maxMem` 分别是 2400 / 5800 / 24400) 上面 3000 字节的带子里每
+100 字节一档, 拿 60KB 带中文的正文每 3 字节一个起点全量解析 —— **放弃 0 次**。墙底下则是
+`NewRegexpSetMaxMem` 当场干净报错。根子在 prog 与 DFA 花的是同一笔 `maxMem`: prog 编得下,
+剩的钱就够放一次解析走过的那几个状态; prog 编不下就在建 set 那一步失败。中间那条"编得出来
+但解析不出来"的缝扫不到。
+
+🔴 顺带一句"为什么不退化成 NFA": set 这条路上**根本没有 NFA**。单条正则有回退
+(`re2_re2.cc` 里那一串 `Fall back to NFA below`), 但 `RE2::Set::Match` 上游自己就是
+DFA-only (`re2_set.cc:216`, `dfa_failed` ⟹ 直接 `return false`) —— NFA 那套接口不回答
+"命中的是哪一条", 而 `kManyMatch` 的 id 是 DFA 状态里那串 id 列表给的。要给 set 的锚定解析
+配 NFA, 只能给每条 pattern 单独编一个 `\A(?:pat)` 的 `RE2` 对象, 那正是 `ResolveSpan` 存在
+的全部理由被推翻。
 
 ---
 
@@ -263,7 +273,7 @@ for _, c := range 那三个已知反例 {
 对应 `TestBodyGateSpan_CrossFuzzSelfCheck` 与 `TestBodyGateSpan_CrossFuzzPathBSelfCheck`。
 **没有这道门的 fuzz 结果不算凭据。**
 
-### (e) 库把这条退回老路 (`unresolved`) 不算差异
+### (e) 库整遍报错 (`Scan` 的 `err`) 不算差异
 
 生产上那种情形就是照走 `FindAll`, 不是错答案。对拍里要跳过, 不要记成岔开。
 
@@ -334,7 +344,7 @@ ASCP 的敏感数据门(`asc/engine/`)把整张规则表接到了 `MatchScanner`
 ## 8. 反向 MatchScanner: 同一件事的镜像, 口径是 rightmost-longest
 
 `RegexpSetReverse.NewMatchScanner()` 开出来的是 `*MatchScannerReverse`。方法名、回调形状、
-`unresolved` 的语义 (含 `ResumeFrom` 断点, 见第 3 节 (c))、那块固定 12KB 缓冲 —— 与正向那个
+`unsupported` 名单与 `err` 的语义 (见第 2 节 (c))、那块固定 12KB 缓冲 —— 与正向那个
 **逐字相同**。只有两处不一样:
 
 1. 交出来的区间按 `Lo` **降序**(正向是升序);

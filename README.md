@@ -522,16 +522,18 @@ the hit table and de-duplicated match spans, in batches, with a fixed memory
 footprint.
 
 ```go
-ms, err := set.NewMatchScanner()  // reusable workspace: build once, keep it, Close it
+ms, unsupported, err := set.NewMatchScanner()  // reusable workspace: build once, keep it, Close it
 defer ms.Close()
+// unsupported: pattern indices that cannot produce spans at all (today: they match the
+// empty string). Fixed at construction, independent of any input — settle them here.
 
 ms.SetModes(modes)                // optional: what each pattern needs (default: spans, auto-tiered)
 
-unresolved, err := ms.Scan(body, func(batch []hgmLibre2.SetMatch) {
+err = ms.Scan(body, func(batch []hgmLibre2.SetMatch) {
     for _, m := range batch {     // body[m.Lo:m.Hi] is a real match of pattern m.Index
         handle(m.Index, body[m.Lo:m.Hi])
     }
-})
+})                                // err != nil ⟹ the whole pass is void; redo it with FindAll
 ids := ms.HitIDs()                // the same hit table Set.Match would have returned
 // ms.Hit(i) is the O(1) form of the same answer
 ```
@@ -638,7 +640,7 @@ How the endpoint is recovered, per pattern:
 | `min == max` (fixed length) | any | `Lo = Hi - min`, one subtraction, the regex engine is never entered. Both paths agree here, so the mode does not apply. |
 | variable | `span` (default) | forward unanchored search from `max(cursor, Hi-maxLen)` for the leftmost start, then an anchored longest end. This *is* the definition of leftmost-longest, so it holds for any pattern shape. Costs ~1.6× path A per hit, plus walking the gaps for patterns with no length bound (bounded by one extra pass over the text). |
 | variable | `spanFast` | one anchored look-back from `Hi` using a reverse object built for **that one pattern**, bounded by the cursor. Cost is independent of text length — that is the whole reason it exists. Semantics: the third kind, below — equal to leftmost-longest in 119 972 of 120 000 measured spans, but not guaranteed. |
-| — | — | patterns whose single-pattern object will not compile are reported in `unresolved`. |
+| — | — | if the single-pattern object will not compile, `maxMem` is too small and `Scan` fails the whole pass. |
 
 #### `spanFast`: the third semantics (read this before hanging a pattern here)
 
@@ -677,53 +679,59 @@ patterns are safe when both ends are anchored (`\b`, `^`, `$`, a fixed delimiter
 unanchored variable patterns should be treated as "something is around here" and
 re-checked with the pattern itself.
 
-#### `unresolved`: a fall-back list that comes with a resume point
+#### "I could not give you everything": exactly two ways to say it
 
-`Scan` returns a `[]MatchScanUnresolved` — one entry per pattern it could not fully
-serve this pass, each carrying `Index`, `Reason`, and `ResumeFrom`. Four reasons:
+🔴 There is no "I bailed halfway through, these patterns are yours to finish" middle
+state (it was removed on 2026-08-27). Only two:
 
-| `Reason` | what happened | can it strand delivered spans? |
-| — | — | — |
-| `emptyMatch` | the pattern matches the empty string (`min <= 0`) | no — decided on its *first* run, before anything was emitted |
-| `compile` | the single-pattern object needed to fill in the other end would not compile | no — same, at init |
-| `dfaBudget` | the anchored resolve gave up (arena hit `maxMem`) | **yes** — this is the only one |
-| `runOrder` | runs did not arrive monotonically in scan order | shouldn't happen; native invariant broken |
+| where | what it says |
+|---|---|
+| `NewMatchScanner`'s `unsupported` | `[]int32` — pattern indices that cannot produce spans at all. Today there is exactly one reason: the pattern matches the empty string (`PatternLenRange`'s `min <= 0`), so every position is a zero-length hit the cursor cannot pin down. |
+| `Scan`'s `err` | this pass is void — the batches you already received do not count either. Redo the whole input with `FindAll`. |
 
-**What you already received is not garbage.** Even for `dfaBudget`, every span handed
-out for that pattern is a real match verified by an anchored resolve, and together
-they cover the input completely up to `ResumeFrom`. So the entry tells you where the
-delivered part stops rather than asking you to throw it away:
+`unsupported` **does not depend on the input**: it is decided when the workspace is
+built and never changes, so you can pin it in a regression test (put an `a*` in the
+set and the index comes back). Configure those patterns as `boolOnly` — they still
+appear in the hit table — or run them the old way. Asking for spans on one makes
+`SetModes` fail immediately; if you never call `SetModes` they are handled as
+`boolOnly`, since you were already told at construction.
 
-* forward — delivered spans cover `[0, ResumeFrom)`; resume forward from there;
-* reverse — delivered spans cover `[ResumeFrom, len(text))`; resume backwards from there.
+`Scan`'s `err` has three causes, all of them "`maxMem` is too small": the underlying
+`FindAllIndex` pass failed; the single-pattern object needed to fill in the other end
+would not compile; the anchored resolve gave up. A fourth, "runs did not arrive
+monotonically in scan order", is a **broken invariant inside this library** — a bug,
+reported through the same `err` rather than swallowed.
 
-For `emptyMatch` / `compile` / `runOrder`, `ResumeFrom` is simply the whole input
-(`0` forward, `len(text)` reverse), which is exactly the old "redo the lot".
+**Why not partial success?** An error code the caller cannot construct has no business
+being in a return value. It forces this chain: the caller must write a fallback → the
+fallback never runs → what never runs cannot be tested → untested code is usually
+wrong → the day it finally matters, execution goes down a path that has never
+executed. That is worse than having no fallback and failing the whole pass.
 
-🔴 When you resume, **do not slice**. `text[ResumeFrom:]` makes `\b`, `^` and `$` see
-a fabricated neighbour byte. Use `(*Regexp).FindStringIndexFrom(text, pos)`, whose
-offsets are into the original string — RE2 still sees the whole text.
+And the anchored resolve giving up could not be provoked at all: it runs the *small*
+DFA (a single start position, not the whole-text scan). Three shapes (`ab`,
+`[A-Za-z][A-Za-z0-9]{2,19}key`, `(?i)[a-z0-9]{3,20}@[a-z0-9.\-]{3,20}`) were swept
+every 100 bytes across the 3 000-byte band just above the wall where they first
+compile (`maxMem` 2400 / 5800 / 24400), resolving every 3rd offset of a 60 KB text
+with CJK in it — **zero** give-ups. Below the wall, `NewRegexpSetMaxMem` fails
+cleanly instead. The program and the DFA are funded from the same `maxMem`: if the
+program fits, what is left covers the handful of states one resolve walks; if it does
+not, you never get a set. There is no window in between.
 
-The first two reasons depend only on the pattern, never on the input, so a pattern
-that hits them once hits them on every pass: sort those out when you build the set
-(`SetModes` already rejects the `emptyMatch` shape at workspace-construction time).
-`dfaBudget` is hard to provoke in practice — the anchored resolve runs the *small*
-DFA (one start position, not the whole-text scan), and on production-shaped patterns
-it does not give up even at an 8 KB `maxMem`. Redoing the whole pattern instead of
-resuming is therefore a perfectly reasonable caller-side simplification; it is
-bit-for-bit the same answer, just not as cheap.
-
-Indices you set to `boolOnly` are never listed — those are your choice, not a
-library limitation. The slice is overwritten by the next `Scan`.
+🔴 And no, it cannot "fall back to the NFA": on the set path there **is** no NFA.
+A single `RE2` falls back (see the `Fall back to NFA below` chain in `re2_re2.cc`),
+but `RE2::Set::Match` is DFA-only upstream too (`re2_set.cc:216` — `dfa_failed` just
+returns false). The NFA interface does not answer *which* pattern matched, and the
+`kManyMatch` ids come out of the id list inside a DFA state. Giving the set's anchored
+resolve an NFA path means compiling a separate `\A(?:pat)` `RE2` per pattern — which
+is the whole thing `ResolveSpan` exists to avoid.
 
 🔴 There is deliberately **no** "give me one array at the end" entry point
 (`AppendAllMatches` was removed on 2026-08-27). Such a convenience form always creeps
 from tests and measurement into production, and its `dst` is a ratchet buffer that
 tracks input length (~0.037 MB per MB of input on the table above) — exactly what the
 batched interface exists to avoid. Callers who want an array append one line inside
-their own `Scan` callback, where the cost is visible to whoever wrote it; for the
-`unresolved` entries they keep what they already have and only fill in from
-`ResumeFrom`.
+their own `Scan` callback, where the cost is visible to whoever wrote it.
 
 #### `FindAllIndex`: the raw end-point runs
 
@@ -833,10 +841,10 @@ de-duplicated, non-overlapping spans in batches. The API is identical — open i
 
 ```go
 rs, _ := hgmLibre2.NewRegexpSetReverseMaxMem(patterns, hgmLibre2.DefaultSetMaxMem)
-ms, _ := rs.NewMatchScanner()       // reusable workspace; not concurrency-safe
+ms, unsupported, _ := rs.NewMatchScanner()   // reusable workspace; not concurrency-safe
 defer ms.Close()
 
-unresolved, _ := ms.Scan(body, func(batch []hgmLibre2.SetMatch) {
+err := ms.Scan(body, func(batch []hgmLibre2.SetMatch) {
     for _, m := range batch { _ = body[m.Lo:m.Hi] }   // a real match of pattern m.Index
 })
 ```

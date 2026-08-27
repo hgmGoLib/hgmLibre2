@@ -41,44 +41,36 @@ func TestPatternLenRangeTable(t *testing.T) {
 	}
 }
 
-// scanByPat 把一遍 Scan 的【分批】输出按 pattern 归拢成扁平 (lo,hi) 表, 并把 unresolved
-// 那几条整条剔掉 —— 这是【对拍口径】: 那几条不参与和 FindAll 的逐位比对。生产上不必这么做,
-// 已交付的部分是好的, 只要从 u.ResumeFrom 起补后半截 (见 matchscan_unresolved.go)。库这边【不归拢】—— 归拢就得攒, 正是分批接口
-// 要躲开的 (见 matchscan.go 文件头); 归拢是调用方一句 append 的事, 这个函数就是那一句。
-func scanByPat(t *testing.T, ms *MatchScanner, text string) (map[int32][]int32, map[int32]bool) {
+// scanByPat 把一遍 Scan 的【分批】输出按 pattern 归拢成扁平 (lo,hi) 表。
+// 库这边【不归拢】—— 归拢就得攒, 正是分批接口要躲开的 (见 matchscan.go 文件头); 归拢是
+// 调用方一句 append 的事, 这个函数就是那一句。
+func scanByPat(t *testing.T, ms *MatchScanner, text string) map[int32][]int32 {
 	t.Helper()
 	out := map[int32][]int32{}
-	unres, err := ms.Scan(text, func(mm []SetMatch) {
+	if err := ms.Scan(text, func(mm []SetMatch) {
 		for _, m := range mm {
 			out[m.Index] = append(out[m.Index], m.Lo, m.Hi)
 		}
-	})
-	if err != nil {
+	}); err != nil {
 		t.Fatal(err)
 	}
-	bad := map[int32]bool{}
-	for _, u := range unres {
-		bad[u.Index] = true
-		delete(out, u.Index) // 对拍用: 这几条整条不参与比对 (生产上只要补 u.ResumeFrom 之后那一截)
-	}
-	return out, bad
+	return out
 }
 
 // scanAll 把一遍 MatchScanner 的输出按 pattern 收成扁平 (lo,hi) 表。
 func scanAll(t *testing.T, set *RegexpSet, text string) map[int32][]int32 {
 	t.Helper()
-	ms, err := set.NewMatchScanner()
+	ms, unsup, err := set.NewMatchScanner()
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(unsup) != 0 {
+		t.Errorf("有 %d 条走不了区间: %v", len(unsup), unsup)
 	}
 	defer ms.Close()
 	var all []SetMatch
-	unres, err := ms.Scan(text, func(batch []SetMatch) { all = append(all, batch...) })
-	if err != nil {
+	if err := ms.Scan(text, func(batch []SetMatch) { all = append(all, batch...) }); err != nil {
 		t.Fatal(err)
-	}
-	if len(unres) != 0 {
-		t.Errorf("有 %d 条补不出左端: %v", len(unres), unres)
 	}
 	out := map[int32][]int32{}
 	for _, m := range all {
@@ -198,11 +190,25 @@ func TestMatchScanStrictVsFindAll(t *testing.T) {
 		}
 		anch[i] = regexp.MustCompile(`\A(?:` + p + `)\z`)
 	}
-	ms, err := set.NewMatchScanner()
+	ms, unsup, err := set.NewMatchScanner()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ms.Close()
+	// 🔴 "这几条走不了区间"是【建工作区那一刻】给的名单, 与正文无关 —— 下面 400 轮随机
+	//    正文一遍都不该改变它。这正是这一层没有"扫到一半反悔"的地方。
+	gotUnsup := map[int32]bool{}
+	for _, id := range unsup {
+		gotUnsup[id] = true
+	}
+	if len(gotUnsup) != len(wantUnres) {
+		t.Fatalf("unsupported 名单对不上: 得到 %v, 要 %v", unsup, wantUnres)
+	}
+	for id := range wantUnres {
+		if !gotUnsup[id] {
+			t.Fatalf("#%d %q 能匹配空串, 该在 unsupported 名单里: %v", id, pats[id], unsup)
+		}
+	}
 
 	alphabet := []string{"a", "b", "c", "d", "e", "f", "q", "w", "x", "y", "z",
 		"0", "1", "9", "A", "B", "F", "Z", " ", "-", "张", "三", "李"}
@@ -215,18 +221,17 @@ func TestMatchScanStrictVsFindAll(t *testing.T) {
 			sb.WriteString(alphabet[rng.Intn(len(alphabet))])
 		}
 		text := sb.String()
-		byPat, bad := scanByPat(t, ms, text)
+		byPat := scanByPat(t, ms, text)
 		for id := range pats {
 			f := byPat[int32(id)]
 			if wantUnres[int32(id)] {
-				if !bad[int32(id)] && len(f) > 0 {
-					t.Fatalf("轮 %d: #%d %q 能匹配空串, 必须进 unresolved 交回老路, 却给了 %v",
+				// 能匹配空串的那几条在建工作区时就报进 unsupported 了 (见下面那处断言),
+				// 这一遍它们一处区间都不该交出来。
+				if len(f) > 0 {
+					t.Fatalf("轮 %d: #%d %q 能匹配空串, 走不了区间, 却给了 %v",
 						round, id, pats[id], f)
 				}
 				continue
-			}
-			if bad[int32(id)] {
-				t.Fatalf("轮 %d: #%d %q 意外补不出左端", round, id, pats[id])
 			}
 			// ① 每一段都是真匹配 · ② 互不相交且升序
 			prev := int32(-1)
@@ -263,23 +268,26 @@ func TestMatchScanStrictVsFindAll(t *testing.T) {
 	t.Logf("400 轮: 定长档对 FindAll %d 处 · 变长档对 Longest %d 处", nStrict, nLoose)
 }
 
-// TestMatchScanEmptyCapableFallback —— 能匹配空串的 pattern 必须落进"补不出左端"那一档,
-// 交给调用方走老路, 而不是在每个位置吐一处零长命中。
+// TestMatchScanEmptyCapableFallback —— 能匹配空串的 pattern 必须在【建工作区】那一刻就被
+// 报进 unsupported (交给调用方走老路), 而不是在每个位置吐一处零长命中, 也不是扫到一半才说。
 func TestMatchScanEmptyCapableFallback(t *testing.T) {
 	set, err := NewRegexpSet([]string{`a*`, `b+`})
 	if err != nil {
 		t.Fatal(err)
 	}
-	ms, err := set.NewMatchScanner()
+	ms, unsup, err := set.NewMatchScanner()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ms.Close()
-	if unres, err := ms.Scan("--aa--bb--", func([]SetMatch) {}); err != nil {
-		t.Fatal(err)
-	} else if len(unres) != 1 || unres[0].Index != 0 ||
-		unres[0].Reason != MatchScanUnresolvedReason_emptyMatch || unres[0].ResumeFrom != 0 {
-		t.Fatalf("要 {0 emptyMatch 0} (a* 走老路 · 一处都没交出去 ⟹ 断点 0), 得到 %v", unres)
+	if len(unsup) != 1 || unsup[0] != 0 {
+		t.Fatalf("要 unsupported=[0] (a* 能匹配空串), 得到 %v", unsup)
+	}
+	// 名单是静态的: 扫多少遍都不变, 而且 Scan 本身不因为它报错。
+	for round := 0; round < 3; round++ {
+		if err := ms.Scan("--aa--bb--", func([]SetMatch) {}); err != nil {
+			t.Fatalf("轮 %d: Scan 不该因为 unsupported 报错: %v", round, err)
+		}
 	}
 }
 
@@ -290,7 +298,7 @@ func TestMatchScanBoolOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ms, err := set.NewMatchScanner()
+	ms, _, err := set.NewMatchScanner()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -298,15 +306,12 @@ func TestMatchScanBoolOnly(t *testing.T) {
 	if err := ms.SetModes([]MatchScanMode_t{MatchScanMode_boolOnly, MatchScanMode_span}); err != nil {
 		t.Fatal(err)
 	}
-	byPat, bad := scanByPat(t, ms, "A123 beef")
+	byPat := scanByPat(t, ms, "A123 beef")
 	if !ms.Hit(0) || !ms.Hit(1) {
 		t.Fatalf("两条都该命中: %v", ms.HitIDs())
 	}
 	if len(byPat[0]) != 0 {
 		t.Errorf("第 0 条配的是 boolOnly, 不该交出任何区间, 却给了 %v", byPat[0])
-	}
-	if bad[0] || bad[1] {
-		t.Errorf("配 boolOnly 不等于补不出来, 不该进 unresolved: %v", bad)
 	}
 	got := byPat[1]
 	if fmt.Sprint(got) != fmt.Sprint([]int32{5, 9}) {
@@ -344,18 +349,15 @@ func TestMatchScanSpanIsLongest(t *testing.T) {
 			flat = append(flat, int32(loc[0]), int32(loc[1]))
 		}
 		for _, mode := range []MatchScanMode_t{MatchScanMode_span, MatchScanMode_spanFast} {
-			ms, err := set.NewMatchScanner()
+			ms, _, err := set.NewMatchScanner()
 			if err != nil {
 				t.Fatal(err)
 			}
 			if err := ms.SetModes([]MatchScanMode_t{mode}); err != nil {
 				t.Fatal(err)
 			}
-			byPat, bad := scanByPat(t, ms, c.text)
+			byPat := scanByPat(t, ms, c.text)
 			ms.Close()
-			if bad[0] {
-				t.Fatalf("%q 档 %q: 意外进了 unresolved", c.pat, mode)
-			}
 			got := byPat[0]
 			same := fmt.Sprint(got) == fmt.Sprint(flat)
 			if mode == MatchScanMode_span {
@@ -382,11 +384,14 @@ func TestMatchScanSetModesRejectsEmptyCapable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ms, err := set.NewMatchScanner()
+	ms, unsup, err := set.NewMatchScanner()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ms.Close()
+	if len(unsup) != 1 || unsup[0] != 0 {
+		t.Fatalf("a* 该在建工作区时就报进 unsupported: %v", unsup)
+	}
 	if err := ms.SetModes([]MatchScanMode_t{MatchScanMode_span, MatchScanMode_span}); err == nil {
 		t.Fatalf("a* 能匹配空串却要区间, SetModes 必须报错")
 	}
@@ -395,36 +400,30 @@ func TestMatchScanSetModesRejectsEmptyCapable(t *testing.T) {
 	}
 }
 
-// TestMatchScanUnresolvedResume —— 钉 unresolved 的【形状】: 一条一个 {Index, Reason, ResumeFrom},
-// 而且"没能全给你"不等于"前面交出去的白干了"。
+// TestMatchScanUnsupportedNoCollateral —— "这一条走不了区间"绝不许连坐同一遍里【别的】
+// pattern: unsupported 是一条 pattern 自己的属性, 不是这一遍扫描的事故。
 //
-// 这里能确定性造出来的只有 emptyMatch 一类 (dfaBudget 要让锚定解析撞 maxMem —— 那跑的是
-// 起点唯一的小 DFA, 拿真表形状的 pattern 试到 8KB maxMem 都不放弃, 造不出稳定的红)。
-// emptyMatch 这一类的判据正好是最强的那条: 它在【第一条游程】上就判掉, 所以同一遍里
-// 【别的 pattern】的结果必须一处不少地照常交出来 —— 旧契约那句"全丢掉"从来就不该连坐到这儿。
-func TestMatchScanUnresolvedResume(t *testing.T) {
+// 🔴 顺带钉住这一层【唯一】的两处交代: 建工作区给一张静态名单, Scan 只给一个整遍的 err。
+//    从前那个"Scan 返回 unresolved 名单、每条带 ResumeFrom 断点"的中间态已经拆掉了 ——
+//    调用方造不出来的错误码不该出现在返回值里 (原委见 matchscan.go 文件头)。
+func TestMatchScanUnsupportedNoCollateral(t *testing.T) {
 	set, err := NewRegexpSet([]string{`a*`, `\d{3}`})
 	if err != nil {
 		t.Fatal(err)
 	}
-	ms, err := set.NewMatchScanner()
+	ms, unsup, err := set.NewMatchScanner()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ms.Close()
+	if len(unsup) != 1 || unsup[0] != 0 {
+		t.Fatalf("要 unsupported=[0] (a* 能匹配空串), 得到 %v", unsup)
+	}
 
 	text := "aa 123 aaa 456"
 	var got []SetMatch
-	unres, err := ms.Scan(text, func(b []SetMatch) { got = append(got, b...) })
-	if err != nil {
+	if err := ms.Scan(text, func(b []SetMatch) { got = append(got, b...) }); err != nil {
 		t.Fatal(err)
-	}
-	if len(unres) != 1 {
-		t.Fatalf("要 1 条 unresolved (a* 能匹配空串), 得到 %+v", unres)
-	}
-	u := unres[0]
-	if u.Index != 0 || u.Reason != MatchScanUnresolvedReason_emptyMatch || u.ResumeFrom != 0 {
-		t.Fatalf("要 {Index:0 Reason:emptyMatch ResumeFrom:0}, 得到 %+v", u)
 	}
 	// 第 1 条 (\d{3}) 与它无关, 必须一处不少。
 	want := []SetMatch{{Index: 1, Lo: 3, Hi: 6}, {Index: 1, Lo: 11, Hi: 14}}
@@ -435,17 +434,17 @@ func TestMatchScanUnresolvedResume(t *testing.T) {
 		}
 	}
 	if len(only1) != len(want) {
-		t.Fatalf("\\d{3} 要 %v, 得到 %v (unresolved 不该连坐别的 pattern)", want, only1)
+		t.Fatalf("\\d{3} 要 %v, 得到 %v (unsupported 不该连坐别的 pattern)", want, only1)
 	}
 	for k := range want {
 		if only1[k] != want[k] {
 			t.Fatalf("\\d{3} 要 %v, 得到 %v", want, only1)
 		}
 	}
-	// 作废那一条一处都不该交出来 (它是初始化那一下判掉的)。
+	// 名单上那一条一处都不该交出来。
 	for _, m := range got {
 		if m.Index == 0 {
-			t.Fatalf("emptyMatch 那一条不该交出任何区间, 却给了 %+v", m)
+			t.Fatalf("unsupported 那一条不该交出任何区间, 却给了 %+v", m)
 		}
 	}
 }

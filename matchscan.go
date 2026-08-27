@@ -22,8 +22,7 @@
 //	                           要区间但强制走便宜那条路。全文见下一节。
 //	Scan(text, batchFn)        一遍全文。命中表 (HitIDs / Hit, 与 Set.Match 同解) 边扫边填,
 //	                           命中区间【边扫边收口、攒够一批就交出去】。
-//	                           返回 unresolved: 这几条没能全给你, 每条带一个 ResumeFrom
-//	                           断点 —— 已交出去的部分是好的, 从断点往后补即可。
+//	                           只返回 err: 要么全给, 要么整遍不算数 —— 见下面那一节。
 //
 // 🔴 一批一批交出去是【内存】上的要求, 不是风格。底下 FindAllIndex 本来就是 sqlite3_step
 //    式的: 一批 4096 条游程 (48KB) 装满就挂起、交给 Go、取走再进去接着扫, 缓冲循环复用,
@@ -41,15 +40,27 @@
 //    内部仍按 Lo 升序)。想按条归拢是调用方那边一句 append 的事, 库这边归拢就得攒 = 又是缓冲。
 //
 // 能边扫边收口是因为同一条 pattern 的游程【跨批次也是升序】的 (正向扫本来就从左往右走)。
-// 万一不是 (真出现了乱序), 那一条当场作废进 unresolved 让调用方走老路 —— 宁可退回去也不给
-// 错答案。
 //
-// 🔴 作废【不会】让已经交出去的东西作废。作废确实可能发生在交出去几处之后 (DFA 中途放弃是
-//    走到一半才知道的), 但那一刻已交付的每一处都是被锚定解析验过的真匹配, 而且完整覆盖到
-//    游标为止 —— 所以 unresolved 里每一条带的是一个 ResumeFrom 断点, 调用方从断点往后补就行,
-//    不必把已收到的挑出来删掉。四种作废原因里只有 DFA 放弃这一种断点不是 0, 另外三种
-//    (能匹配空串 / 单条对象编不出来 / 游程乱序) 断点就是 0 = 整篇重来。全文见
-//    matchscan_unresolved.go。
+// ── "没能全给你"这件事: 一张建工作区就交的名单 + 一个整遍的 err ─────────────
+//
+// 🔴 这一层【没有】"扫到一半反悔、这几条你自己补"的中间态 (2026-08-27 拆掉的; 之前那个
+//    Scan 返回 unresolved 名单的设计是错的, 原委见下)。现在只有两处交代:
+//
+//	NewMatchScanner 的 unsupported   走不了区间这条路的那几条 pattern (当下只有一个原因:
+//	                                 能匹配空串)。【与正文无关】, 建工作区那一刻就定死,
+//	                                 想写回归测试就写 —— 扔一条 a* 进去必然报出它。
+//	Scan 的 err                      这一遍不算数, 整篇走老路 FindAll。三种来由都是
+//	                                 maxMem 配小了 (底下那遍 FindAllIndex 失败 / 单条对象
+//	                                 编不出来 / 锚定解析放弃), 另有一种"游程乱序"是本库
+//	                                 的 bug。
+//
+// 🔴 为什么不做成"部分成功": 一个调用方【造不出来】的错误码, 不该出现在返回值里。它逼出
+//    的是这么一条链 —— 调用方必须写兜底 → 兜底跑不到 → 跑不到就没法测 → 没法测的代码基本
+//    是错的 → 真出事那天走的是一段从没执行过的路。那比"根本没有兜底、直接整遍失败"更危险。
+//    量过: 锚定解析用的是【小 DFA】(起点唯一), 不是扫全文那个; 三种形状的 pattern 在"刚好
+//    编得出来"的那道墙上面 3000 字节的带子里逐档细扫 (60KB 正文 · 每 3 字节一个起点),
+//    放弃 0 次 —— 墙底下则是 NewRegexpSetMaxMem 当场干净报错。所以这条分支本来就该是
+//    "整遍失败"这种粗粒度的交代, 而不是一套调用方永远验不了的补偿逻辑。
 //
 // ── 三态旋钮 (SetModes): 每条 pattern 要什么 ─────────────────────────────────
 //
@@ -99,7 +110,7 @@
 //	                   给最靠左的那个起点。代价 = 回看多远, 与正文长度【无关】—— 这是它比
 //	                   B 便宜的全部原因。给的口径见下面"第三种口径"那一节。
 //
-//	两条路要的那个单条对象编译不出来的, 进 unresolved, 请调用方照老路 FindAll。
+//	两条路要的那个单条对象编译不出来 = maxMem 配小了, Scan 整遍报错 (见上面那一节)。
 //
 // 🔴 反向必须是【一条一个 set】。整表建一个反向 set 是死路: set 里状态数是相乘的
 //    (doc/状态数为什么会相乘.txt), 155 条的反向表在 6.4MB 正文上实测 65 秒 / arena 顶满 254MB
@@ -187,11 +198,10 @@
 //     把口子堵严的话它就退化成 min == max 本身 —— 也就是变长快路整个清空。既然它兑现不了
 //     "等于 FindAll"这个承诺, 就不该拿 8 倍的钱去买: 真表上闸装着 1.82×, 拆掉 15.03×。)
 //
-// unresolved 里的那几条 (单条对象编不出来 / 游程乱序 / DFA 预算不够) 请调用方照老路对它跑
-// FindAll —— 库这边宁可退回去也不给一个"像是对的"答案。跑的时候【从这一条的 ResumeFrom 起】
-// 就够了, 而且别切片: (*Regexp).FindStringIndexFrom(text, pos) 参数是原串偏移, \b / ^ / $
-// 看到的还是真邻居 (见 find_from.go)。
-// 配了 boolOnly 的【不】进 unresolved: 那是调用方自己关掉的, 不是库补不出来。
+// Scan 报了 err 就整篇走老路 FindAll —— 库这边宁可退回去也不给一个"像是对的"答案。
+// 老路要是想从某个偏移接着扫, 【别切片】: (*Regexp).FindStringIndexFrom(text, pos) 参数是
+// 原串偏移, \b / ^ / $ 看到的还是真邻居 (见 find_from.go)。
+// 配了 boolOnly 的那几条从来不参与收口, 也就无所谓补不补。
 //
 // 生命周期同 FindAllIndex 的 alloc: 可复用工作区, 热路径上建一次留着,【不是并发安全的】。
 // text 只在 Scan 那一遍里被引用 (补左端要读它), Scan 返回之后这一层不再持有它。
@@ -223,7 +233,9 @@ type MatchScanner struct {
 	mode  []MatchScanMode_t // 每条要什么 (见 SetModes); nil = 全走默认档
 	hit   []bool
 	hits  []int32 // 上一遍命中过的下标 (= Set.Match 那张表), 去重且只含真命中
-	bad   []MatchScanUnresolved // 本遍作废的那几条, Scan 收尾时原样还给调用方
+	// scanErr 是本遍出的错。收口是在 FindAllIndex 的回调里跑的, 那里没法 return, 所以记
+	// 在这儿由 Scan 收尾时交出去。🔴 只记第一个不覆盖: 后面的错多半是第一个的连锁。
+	scanErr error
 	// out 是那块固定的输出缓冲 (长度恒为 matchScanBatch), outN 是已填几处。
 	// 满了就交给 fn 再从头填 —— 整个 Scan 期间这一层留下的就只有这 12KB。
 	out  []SetMatch
@@ -234,36 +246,62 @@ type MatchScanner struct {
 }
 
 // msPat_t 是每条 pattern 的推进状态。cur 就是那把游标。
+//
+// 🔴 分档所需的那几件事 (spanable · fixed · minL · maxL · pathB) 全是【与正文无关】的,
+//    所以一律在 NewMatchScanner / SetModes 里算完, Scan 里一件都不算 —— 这正是"没有
+//    unresolved"的前提: 一条 pattern 能不能走这条路, 建工作区那一刻就有答案。
 type msPat_t struct {
-	inited bool
-	fixed  bool
-	bad    bool // 补不出左端 (能匹配空串 / 编不出单条对象 / 游程乱序) → 调用方走老路
-	minL   int32
-	rev    *RegexpSetReverse // 路 A 用: 反向锚定回推起点
-	cur    int32             // 已吐出去的最右字节
-	lastLo int32             // 上一条游程的左端, 用来确认升序
-
-	// ── 以下三个只给路 B ──
-	pathB bool
-	maxL  int32   // PatternLenRange 的上界; <0 = 无上界 (窗口退化成"从游标起")
-	fwd   *Regexp // 这一条自己那条正向正则, 惰性建
-	done  bool    // 从游标起整篇再没有匹配了 —— 本遍这一条到此为止
+	spanable bool // 能不能收口成区间 (false = 能匹配空串, 只能当 bool 用)
+	fixed    bool
+	pathB    bool
+	minL     int32
+	maxL     int32             // PatternLenRange 的上界; <0 = 无上界 (窗口退化成"从游标起")
+	rev      *RegexpSetReverse // 路 A 用: 反向锚定回推起点, 惰性建
+	fwd      *Regexp           // 路 B 用: 这一条自己那条正向正则, 惰性建
+	cur      int32             // 已吐出去的最右字节
+	lastLo   int32             // 上一条游程的左端, 用来确认升序
+	done     bool              // 从游标起整篇再没有匹配了 —— 本遍这一条到此为止
 }
 
 // NewMatchScanner 开一个工作区。热路径上建一次长期留着, 别每次扫描新建。
-func (s *RegexpSet) NewMatchScanner() (*MatchScanner, error) {
+//
+// unsupported 是【走不了区间这条路】的那几条 pattern 的下标 —— 当下只有一个原因: 这条能
+// 匹配空串 (PatternLenRange 的 min <= 0)。每个位置都是一处零长命中, 游标压不住, 吐出来的
+// text[Lo:Lo] 对下游也没有意义。
+//
+// 🔴 这张名单是【建工作区那一刻就定死】的: 它只看 pattern 本身, 与你之后喂什么正文无关,
+//    所以它也是唯一一处"这条给不了你"的交代 —— Scan 那一遍要么全给, 要么整遍报错, 不存在
+//    "扫到一半反悔"。名单上的那几条: 配 MatchScanMode_boolOnly (命中表照样有它们), 或者
+//    自己走老路 FindAll。不配 boolOnly 而配了要区间的档, SetModes 当场报错; 压根不调
+//    SetModes (全默认档) 的, 它们自动按 boolOnly 处理 —— 反正你在这里已经知道了。
+//
+// 名单可以直接写回归测试: 把 a* 之类扔进 set, 这里必然报出它的下标。
+func (s *RegexpSet) NewMatchScanner() (m *MatchScanner, unsupported []int32, err error) {
 	alloc, err := s.NewFindAllIndexAlloc()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return &MatchScanner{
+	m = &MatchScanner{
 		set:     s,
 		alloc:   alloc,
 		per:     make([]msPat_t, s.size),
 		hit:     make([]bool, s.size),
 		out:     make([]SetMatch, matchScanBatch),
 		findCtx: NewFindStringIndex_ctx(),
-	}, nil
+	}
+	for i := 0; i < s.size; i++ {
+		p := &m.per[i]
+		minL, maxL := s.PatternLenRange(i)
+		if minL <= 0 {
+			unsupported = append(unsupported, int32(i))
+			continue // spanable 留 false: 之后一律当 bool 用
+		}
+		p.spanable = true
+		p.minL, p.maxL = int32(minL), int32(maxL)
+		p.fixed = minL == maxL && maxL >= 0
+		p.pathB = !p.fixed // 默认档 = 路 B; SetModes 里按档位再拧一遍
+	}
+	return m, unsupported, nil
 }
 
 // MatchScanMode_t 是【每条 pattern 要什么】。三态, 零值 = 默认档 (要区间, 自动分档)。
@@ -275,7 +313,7 @@ type MatchScanMode_t string
 const MatchScanMode_span MatchScanMode_t = ""
 
 // MatchScanMode_boolOnly 只要"命中没命中", 一处区间都不收口、一次端点都不补。
-// 这几条照样进命中表 (Hit/HitIDs), 也【不】进 unresolved (是调用方自己关掉的, 不是库补不出来)。
+// 这几条照样进命中表 (Hit/HitIDs), 只是一处区间都不给。
 //
 // 🔴 这是最值钱的一档: 真表上 57% 的游程来自两条只当 bool 用的宽 pattern, 这一挡挡掉的是
 //    它们的端点补全 (真花钱的那步), 不只是内存。
@@ -300,20 +338,24 @@ const MatchScanMode_spanFast MatchScanMode_t = "spanFast"
 // SetModes 声明每条 pattern 要什么 (下标即 pattern 下标, 长度不足的按零值 = 默认档)。
 // 传 nil = 全默认档。调用方那边这是【静态】信息, 建集的时候就知道, 热路径上不该每遍改。
 //
-// 🔴 能匹配空串的 pattern (PatternLenRange 的 min <= 0) 只允许配 boolOnly, 否则这里【当场
-//    报错】而不是运行时静默退回老路: 每个位置都是一处零长命中, 游标压不住, 吐出来的
-//    text[Lo:Lo] 对下游也没有意义。这种事该在建工作区的时候就被发现。
+// 🔴 NewMatchScanner 报出来的 unsupported 那几条只允许配 boolOnly, 否则这里【当场报错】——
+//    那张名单就是给这一步对的。理由见 NewMatchScanner。
 func (m *MatchScanner) SetModes(modes []MatchScanMode_t) error {
 	for i := 0; i < len(modes) && i < len(m.per); i++ {
 		if modes[i] == MatchScanMode_boolOnly {
 			continue
 		}
-		if minL, _ := m.set.PatternLenRange(i); minL <= 0 {
+		if !m.per[i].spanable {
 			return errors.New("re2native: match scanner pattern " + strconv.Itoa(i) +
 				" 能匹配空串, 只能配 MatchScanMode_boolOnly; pattern=" + m.set.pats[i])
 		}
 	}
 	m.mode = modes
+	// 档位定了才知道变长条走哪条路 —— 这里一次算完, Scan 里不再判。
+	for i := range m.per {
+		p := &m.per[i]
+		p.pathB = p.spanable && !p.fixed && m.modeOf(i) != MatchScanMode_spanFast
+	}
 	return nil
 }
 
@@ -341,29 +383,31 @@ func (m *MatchScanner) Close() {
 // 🔴 交给 batchFn 的切片是内部缓冲本身, 下一批原地覆写 —— 要留就 append 走。
 // 🔴 各条 pattern 的结果是【交错】着来的 (同一条内部按 Lo 升序), 不按 pattern 分组。
 //
-// unresolved 是这一遍里没能全给出来的那几条 (能匹配空串 / 反向编不出来 / 游程乱序 / DFA
-// 预算不够), 每条带 Index · Reason · ResumeFrom。【已经交出去的那些不作废】: 它们是验过的
-// 真匹配且完整覆盖到 ResumeFrom, 调用方只要对这几条从 ResumeFrom 起补一遍老路 FindAll
-// (用 FindStringIndexFrom, 别切片)。切片下次 Scan 会被覆写。
+// 🔴 【要么全给, 要么整遍报错】—— 没有"这几条没给全, 你自己补"这种中间态。返回 err 的时候
+//    这一遍不算数 (交出去的批次也不算), 调用方就整篇走老路 FindAll。三种 err:
+//      ① 底下那一遍 FindAllIndex 自己失败 (native 侧 DFA 预算不够);
+//      ② 某条 pattern 补端点要的那个【单条对象】编不出来 —— 配置错 (maxMem 太小), 与正文
+//         无关, 把 maxMem 调大即可;
+//      ③ 某条 pattern 的锚定解析失败 (DFA 放弃) —— 同样是 maxMem 的事。
+//    另有一种"游程乱序", 那是【库内不变量崩了】= 本库的 bug, 也从这里以 err 交出来。
+//    能匹配空串的那几条不在这里出现: NewMatchScanner 建的时候就报过名单了。
 //
 // batchFn 传 nil 合法: 只要命中表 (等价于 Set.Match), 一处区间都不收口。
-func (m *MatchScanner) Scan(text string, batchFn func(ms []SetMatch)) (unresolved []MatchScanUnresolved, err error) {
+func (m *MatchScanner) Scan(text string, batchFn func(ms []SetMatch)) error {
 	if m.alloc == nil {
-		return nil, errClosedMatchScanner
+		return errClosedMatchScanner
 	}
 	for _, id := range m.hits {
 		p := &m.per[id]
-		p.inited, p.fixed, p.bad = false, false, false
-		p.cur, p.lastLo = 0, 0
-		p.pathB, p.done = false, false
+		p.cur, p.lastLo, p.done = 0, 0, false
 		m.hit[id] = false
 	}
 	m.hits = m.hits[:0]
-	m.bad = m.bad[:0]
+	m.scanErr = nil
 	m.text = text
 	m.fn = batchFn
 	m.outN = 0
-	err = m.set.FindAllIndex(text, m.alloc, func(runs []RegexpSet_FindAllIndex_Run_t) {
+	err := m.set.FindAllIndex(text, m.alloc, func(runs []RegexpSet_FindAllIndex_Run_t) {
 		for k := range runs {
 			r := &runs[k]
 			i := int(r.ReIndex)
@@ -374,24 +418,27 @@ func (m *MatchScanner) Scan(text string, batchFn func(ms []SetMatch)) (unresolve
 				m.hit[i] = true
 				m.hits = append(m.hits, r.ReIndex)
 			}
-			if batchFn == nil || m.modeOf(i) == MatchScanMode_boolOnly {
+			if batchFn == nil || !m.per[i].spanable || m.modeOf(i) == MatchScanMode_boolOnly {
 				continue // 只当 bool 用的那几条: 到此为止, 一次端点都不补
 			}
 			m.feed(i, r.Lo, r.Hi)
 		}
 	})
+	m.text = ""
+	m.fn = nil
 	if err != nil {
-		m.text = ""
-		m.fn = nil
-		return nil, err
+		m.outN = 0
+		return err
+	}
+	if m.scanErr != nil {
+		m.outN = 0 // 这一遍不算数, 余下那不足一批的也不交
+		return m.scanErr
 	}
 	if m.outN > 0 && batchFn != nil {
 		batchFn(m.out[:m.outN])
 		m.outN = 0
 	}
-	m.text = ""
-	m.fn = nil
-	return m.bad, nil
+	return nil
 }
 
 // emit 把收口出来的一处区间写进那块固定缓冲, 满了就交出去。
@@ -404,64 +451,70 @@ func (m *MatchScanner) emit(i int, lo, hi int32) {
 	}
 }
 
-// markBad 把第 i 条当场作废: 之后它的游程一律不看, 收尾时进 unresolved。
-//
-// ResumeFrom 就是这一条的游标 —— 已交付的那些完整覆盖 [0, cur), 缺的只有它之后那一截。
-// 只有 dfaBudget 能走到"已经交出去几处"的地步 (另外三类都是初始化那一下或不变量崩了),
-// 其余一律 0 = 整篇重来, 与旧契约同解。见 matchscan_unresolved.go。
-func (m *MatchScanner) markBad(i int, reason MatchScanUnresolvedReason_t) {
-	p := &m.per[i]
-	p.bad = true
-	from := int32(0)
-	if reason == MatchScanUnresolvedReason_dfaBudget {
-		from = p.cur
+// fail 记下本遍的错。收口跑在 FindAllIndex 的回调里, 那里 return 不出去, 只能记下来由
+// Scan 收尾时交出去; 记完之后 feed 对所有 pattern 一概空转 (这一遍已经不算数了)。
+// 🔴 只记第一个: 后面的错多半是第一个的连锁, 覆盖掉反而把真凶盖了。
+func (m *MatchScanner) fail(err error) {
+	if m.scanErr == nil {
+		m.scanErr = err
 	}
-	m.bad = append(m.bad, MatchScanUnresolved{Index: int32(i), ResumeFrom: from, Reason: reason})
+}
+
+// failCompile: 补端点要的那个单条对象编不出来。与正文无关, 是 maxMem 配小了。
+func (m *MatchScanner) failCompile(i int) {
+	m.fail(errors.New("re2native: match scanner pattern " + strconv.Itoa(i) +
+		" 补端点要的单条对象编不出来 (maxMem 配小了); 用 NewRegexpSetMaxMem 把 maxMem 调大" +
+		"; pattern=" + m.set.pats[i]))
+}
+
+// failResolve: 锚定解析时 DFA 放弃了。同样是 maxMem 的事 —— 这一层不猜、不静默跳过。
+func (m *MatchScanner) failResolve(i int, err error) {
+	m.fail(errors.New("re2native: match scanner pattern " + strconv.Itoa(i) +
+		" 锚定解析失败: " + err.Error() + "; pattern=" + m.set.pats[i]))
+}
+
+// failRunOrder: 同一条 pattern 的游程不是升序了。推进的前提没了 ⟹ 再往下走就是错答案。
+// 🔴 这一条【不是】调用方能做错的事, 它是本库的不变量崩了 = bug。原样报出来别吞。
+func (m *MatchScanner) failRunOrder(i int, lo, last int32) {
+	m.fail(errors.New("re2native: match scanner pattern " + strconv.Itoa(i) +
+		" 游程乱序 (lo=" + strconv.Itoa(int(lo)) + " < 上一条 " + strconv.Itoa(int(last)) +
+		") —— 这是【本库的 bug】, 不是调用方的用法问题, 请连 pattern 与正文一起报" +
+		"; pattern=" + m.set.pats[i]))
 }
 
 // feed 把一条游程 [lo,hi] (都是右端偏移) 喂给第 i 条的游标, 当场推进并收口。
 func (m *MatchScanner) feed(i int, lo, hi int32) {
 	p := &m.per[i]
-	if p.bad {
-		return
+	if m.scanErr != nil {
+		return // 这一遍已经不算数了, 后面一律空转
 	}
-	if !p.inited {
-		p.inited = true
-		minL, maxL := m.set.PatternLenRange(i)
-		if minL <= 0 {
-			// 能匹配【空串】的 pattern 不走这条路: 每个位置都是一处零长命中, 游标压不住,
-			// 吐出来的 text[Lo:Lo] 对下游也没有意义。这种交给老路。
-			m.markBad(i, MatchScanUnresolvedReason_emptyMatch)
-			return
-		}
-		p.minL = int32(minL)
-		p.fixed = minL == maxL && maxL >= 0
-		// 分档就这一句: 定长恒走减法 (两条路在定长上是同一个答案, 见文件头那一节),
-		// 变长看档位 —— 默认档走 B (保 leftmost-longest), 显式降级的走 A。
-		p.pathB = !p.fixed && m.modeOf(i) != MatchScanMode_spanFast
-		switch {
-		case p.fixed:
-			// 定长: 起点唯一 (e-minL), 一句减法, 不进正则引擎。什么对象都不用建。
-		case p.pathB:
-			// 路 B: 只要这一条自己那条【正向】正则 + 一个长度上界当窗口。
-			// 🔴 反向对象一个都不建 —— 这正是 B 相对 A 省下的那一半。
-			p.maxL = int32(maxL) // maxL < 0 (无上界) 原样带下去, 窗口退化成"从游标起"
+	// 分档 (定长 / 路 A / 路 B) 早在 NewMatchScanner + SetModes 里算完了, 这里只把那条路
+	// 要的对象补建出来 —— 惰性: 没被真问到位置的 pattern 一个对象都不占。
+	switch {
+	case p.fixed:
+		// 定长: 起点唯一 (e-minL), 一句减法, 不进正则引擎。什么对象都不用建。
+	case p.pathB:
+		// 路 B: 只要这一条自己那条【正向】正则 + 一个长度上界当窗口。
+		// 🔴 反向对象一个都不建 —— 这正是 B 相对 A 省下的那一半。
+		if p.fwd == nil {
 			if p.fwd = m.set.forwardOne(i); p.fwd == nil {
-				m.markBad(i, MatchScanUnresolvedReason_compile)
+				m.failCompile(i)
 				return
 			}
-		default:
-			// 路 A: 起点靠这一条自己的反向对象锚定回推。给出来的口径是第三种 ——
-			// 见文件头那一节, 选了 spanFast 的调用方自己举证。
+		}
+	default:
+		// 路 A: 起点靠这一条自己的反向对象锚定回推。给出来的口径是第三种 ——
+		// 见文件头那一节, 选了 spanFast 的调用方自己举证。
+		if p.rev == nil {
 			if p.rev = m.set.reverseOne(i); p.rev == nil {
-				m.markBad(i, MatchScanUnresolvedReason_compile)
+				m.failCompile(i)
 				return
 			}
 		}
 	}
 	if lo < p.lastLo {
-		// 游程乱序 —— 推进的前提没了, 宁可退回老路也不给错答案。
-		m.markBad(i, MatchScanUnresolvedReason_runOrder)
+		// 游程乱序 —— 推进的前提没了, 再走下去就是错答案。这是不变量崩了, 见 failRunOrder。
+		m.failRunOrder(i, lo, p.lastLo)
 		return
 	}
 	p.lastLo = lo
@@ -504,7 +557,7 @@ func (m *MatchScanner) feed(i int, lo, hi int32) {
 			// 所以终点这一下要重新取最长 (锚定, 代价 = 这处命中有多长)。
 			pos, ok, err := m.set.ResolveSpan(m.text, start, int32(i))
 			if err != nil {
-				m.markBad(i, MatchScanUnresolvedReason_dfaBudget)
+				m.failResolve(i, err)
 				return
 			}
 			if ok && pos > end {
@@ -518,10 +571,8 @@ func (m *MatchScanner) feed(i int, lo, hi int32) {
 		// 顺带它把回看代价钉成"离游标多远", 与正文长度无关。
 		start, ok, err := p.rev.ResolveSpanWithin(m.text, e, p.cur, 0)
 		if err != nil {
-			// DFA 放弃 (预算不够) —— 不是"没有匹配", 也不该把整遍扫描带崩。
-			// 这一条当场作废进 unresolved, 但【已经交出去的那些是好的】: 报出游标当
-			// 断点, 调用方从那儿往后补就行 (见 matchscan_unresolved.go)。
-			m.markBad(i, MatchScanUnresolvedReason_dfaBudget)
+			// DFA 放弃 (预算不够) —— 不是"没有匹配"。这一层不猜、不静默跳过, 整遍报错。
+			m.failResolve(i, err)
 			return
 		}
 		if !ok {
@@ -532,7 +583,7 @@ func (m *MatchScanner) feed(i int, lo, hi int32) {
 		end := e
 		pos, ok, err := m.set.ResolveSpan(m.text, start, int32(i))
 		if err != nil {
-			m.markBad(i, MatchScanUnresolvedReason_dfaBudget)
+			m.failResolve(i, err)
 			return
 		}
 		if ok && pos > end {
@@ -557,8 +608,7 @@ func (m *MatchScanner) Hit(i int) bool {
 // ∝ 命中数的 ratchet 缓冲, 正是分批接口要躲开的那个东西 (真表 0.037MB/MB, 200MB 的 body
 // 就是每个并发扫描 7.4MB 常驻), 而一行"生产路径别用"的注释拦不住任何人。
 // 要一次性数组的调用方自己在 Scan 的回调里 append 一行就有了 —— 那一行写在调用方自己家里,
-// 谁写谁看得见代价。unresolved 那几条已经交出去的处数【留着就行】, 只补 ResumeFrom 之后的
-// 那一截 (见 Scan 的说明)。
+// 谁写谁看得见代价。Scan 报 err 的那一遍收到的东西一概作数不得 —— 整篇重来 (见 Scan 的说明)。
 
 // errClosedMatchScanner 单独提出来, 免得每次构造一遍 error。
 var errClosedMatchScanner = errors.New("re2native: match scanner closed")

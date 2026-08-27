@@ -18,18 +18,17 @@ func msrScan(t *testing.T, pat, text string) []SetMatch {
 	if err != nil {
 		t.Fatalf("建反向 set 失败 pat=%q: %v", pat, err)
 	}
-	ms, err := rs.NewMatchScanner()
+	ms, unsup, err := rs.NewMatchScanner()
 	if err != nil {
 		t.Fatalf("开反向 MatchScanner 失败: %v", err)
 	}
+	if len(unsup) != 0 {
+		t.Fatalf("pat=%q 意外走不了区间: unsupported=%v", pat, unsup)
+	}
 	defer ms.Close()
 	var got []SetMatch
-	unres, err := ms.Scan(text, func(batch []SetMatch) { got = append(got, batch...) })
-	if err != nil {
+	if err := ms.Scan(text, func(batch []SetMatch) { got = append(got, batch...) }); err != nil {
 		t.Fatalf("Scan 失败 pat=%q: %v", pat, err)
-	}
-	if len(unres) != 0 {
-		t.Fatalf("pat=%q text=%q 意外退回 unresolved=%v", pat, text, unres)
 	}
 	return got
 }
@@ -200,11 +199,15 @@ func TestMatchScanReverse_Modes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ms, err := rs.NewMatchScanner()
+	ms, unsup, err := rs.NewMatchScanner()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ms.Close()
+	// 🔴 走不了区间的那几条在【建工作区】那一刻就报出来了, 不是扫到一半才知道。
+	if len(unsup) != 1 || unsup[0] != 2 {
+		t.Fatalf("x* 该在建工作区时就报出来: unsupported=%v", unsup)
+	}
 
 	// 能匹配空串的只能配 boolOnly。
 	if err := ms.SetModes([]MatchScanMode_t{MatchScanMode_span, MatchScanMode_span, MatchScanMode_span}); err == nil {
@@ -219,7 +222,7 @@ func TestMatchScanReverse_Modes(t *testing.T) {
 		t.Fatal(err)
 	}
 	var got []SetMatch
-	if _, err := ms.Scan("ab 123 cd", func(b []SetMatch) { got = append(got, b...) }); err != nil {
+	if err := ms.Scan("ab 123 cd", func(b []SetMatch) { got = append(got, b...) }); err != nil {
 		t.Fatal(err)
 	}
 	if !ms.Hit(0) || !ms.Hit(1) || !ms.Hit(2) {
