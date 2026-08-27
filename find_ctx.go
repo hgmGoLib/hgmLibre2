@@ -32,7 +32,7 @@ func NewFindStringIndex_ctx() *FindStringIndex_ctx_t {
 // FindStringIndex 同 (*Regexp).FindStringIndex, 但复用 ctx 的 scratch 缓冲, 单线程顺序反复调
 // 稳态零分配. 返回最左匹配的 [start,end) (切自 ctx.ret · 仅在下次用本 ctx 调用前有效), 无匹配返回 nil。
 func (ctx *FindStringIndex_ctx_t) FindStringIndex(re *Regexp, s string) []int {
-	if len(s) > maxCInt { // 超 C.int 的输入直接当无匹配 (同 findFrom 守卫)
+	if len(s) > maxCInt { // 超 C.int 的输入直接当无匹配 (同 findWithin 守卫)
 		return nil
 	}
 	if cap(ctx.cbuf) < 2 {
@@ -40,8 +40,8 @@ func (ctx *FindStringIndex_ctx_t) FindStringIndex(re *Regexp, s string) []int {
 	}
 	cbuf := ctx.cbuf[:2]
 	tp := strBytePtr(s)
-	// nmatch=1: 只回填 group0; cre2_match_at 内部 vector<StringPiece>(1), 不取子组 (比 findFrom 更省)。
-	ok := C.cre2_match_at(re.h, tp, C.int(len(s)), 0, &cbuf[0], 1) != 0
+	// nmatch=1: 只回填 group0; cre2_match_at 内部 vector<StringPiece>(1), 不取子组 (比 findWithin 更省)。
+	ok := C.cre2_match_at(re.h, tp, C.int(len(s)), 0, C.int(len(s)), &cbuf[0], 1) != 0
 	runtime.KeepAlive(s)
 	runtime.KeepAlive(re)
 	if !ok {

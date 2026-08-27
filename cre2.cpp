@@ -75,13 +75,15 @@ int cre2_group_name(const cre2_re *h, int idx, char *buf, int buflen) {
 	return n;
 }
 
-int cre2_match_at(const cre2_re *h, const char *text, int textlen, int startpos, int *match, int nmatch) {
+int cre2_match_at(const cre2_re *h, const char *text, int textlen, int startpos, int endpos, int *match, int nmatch) {
 	// 用非空 base: RE2 文档规定 text==NULL 时连 group0 的 data() 都返回 NULL (无法算偏移),
 	// 故空串也喂一个合法指针, 偏移一律相对 base 计算.
 	const char *base = text ? text : "";
 	re2::StringPiece full(base, textlen);
 	std::vector<re2::StringPiece> sub(nmatch);
-	bool ok = h->re->Match(full, (size_t)startpos, (size_t)textlen, RE2::UNANCHORED, sub.data(), nmatch);
+	// full 是【整串】(context), 只有 [startpos,endpos) 这一段参与搜索 —— ^ / $ / \b 因此
+	// 看到的是真实邻字节. Go 侧已经保证 0 <= startpos <= endpos <= textlen.
+	bool ok = h->re->Match(full, (size_t)startpos, (size_t)endpos, RE2::UNANCHORED, sub.data(), nmatch);
 	if (!ok) {
 		return 0;
 	}

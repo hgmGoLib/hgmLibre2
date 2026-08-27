@@ -12,12 +12,12 @@ import (
 	"unicode/utf8"
 )
 
-// allMatchesPerCall 是批量化之前的逐处匹配循环 (每处命中一次 findFrom→cre2_match_at→一次 cgo).
+// allMatchesPerCall 是批量化之前的逐处匹配循环 (每处命中一次 findWithin→cre2_match_at→一次 cgo).
 // 仅作基准对照; 语义与 stdlib regexp.allMatches 一致.
 func (re *Regexp) allMatchesPerCall(s string, n int, deliver func([]int)) {
 	end := len(s)
 	for pos, i, prevMatchEnd := 0, 0, -1; i < n && pos <= end; {
-		m := re.findFrom(s, pos)
+		m := re.findWithin(s, pos, end)
 		if m == nil {
 			break
 		}

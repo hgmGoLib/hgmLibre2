@@ -59,7 +59,7 @@ func (re *Regexp) Match(b []byte) bool {
 
 // Find 返回最左匹配的字节 (b 的子切片, 零拷贝), 无匹配返回 nil。
 func (re *Regexp) Find(b []byte) []byte {
-	m := re.findFrom(bytesStr(b), 0)
+	m := re.findWithin(bytesStr(b), 0, len(b))
 	runtime.KeepAlive(b)
 	if m == nil {
 		return nil
@@ -76,7 +76,7 @@ func (re *Regexp) FindIndex(b []byte) []int {
 
 // FindSubmatch 返回最左匹配 + 各子组的字节 (都是 b 的子切片; 未参与的组为 nil), 无匹配返回 nil。
 func (re *Regexp) FindSubmatch(b []byte) [][]byte {
-	m := re.findFrom(bytesStr(b), 0)
+	m := re.findWithin(bytesStr(b), 0, len(b))
 	runtime.KeepAlive(b)
 	if m == nil {
 		return nil
@@ -86,7 +86,7 @@ func (re *Regexp) FindSubmatch(b []byte) [][]byte {
 
 // FindSubmatchIndex 返回最左匹配 + 各子组的 index 区间, 无匹配返回 nil。
 func (re *Regexp) FindSubmatchIndex(b []byte) []int {
-	m := re.findFrom(bytesStr(b), 0)
+	m := re.findWithin(bytesStr(b), 0, len(b))
 	runtime.KeepAlive(b)
 	return m
 }

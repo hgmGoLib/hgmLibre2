@@ -156,16 +156,23 @@ func (re *Regexp) NumSubexp() int { return re.numSubexp }
 // SubexpNames 返回各捕获组的名字 (下标 0 为整体匹配, 恒为 "").
 func (re *Regexp) SubexpNames() []string { return re.subexpNames }
 
-// findFrom 返回从 pos 起【非锚定】下一处匹配的子组区间 (长度 2*(numSubexp+1) 的 [start,end) 对,
-// 未参与的组为 -1,-1), 无匹配返回 nil. 等价 stdlib doExecute(pos).
-func (re *Regexp) findFrom(s string, pos int) []int {
+// findWithin 返回在 s 的 [from,bound) 这一段里【非锚定】的下一处匹配的子组区间
+// (长度 2*(numSubexp+1) 的 [start,end) 对, 未参与的组为 -1,-1), 无匹配返回 nil.
+// from=0 · bound=len(s) 时等价 stdlib doExecute(0).
+//
+// 🔴 整串 s 始终喂给 RE2 当 context, from/bound 只圈定"在哪一段里找" —— ^ / $ /  看到的
+//    是真实邻字节, 而不是 s[from:bound] 切完之后的假邻居.
+func (re *Regexp) findWithin(s string, from, bound int) []int {
 	if len(s) > maxCInt { // 超 C.int 的输入直接当无匹配, 不让 len/pos 溢出成错偏移
+		return nil
+	}
+	if from < 0 || bound > len(s) || from > bound { // 越界一律当无匹配, 不让 C 侧拿到坏区间
 		return nil
 	}
 	nmatch := re.numSubexp + 1
 	cbuf := make([]C.int, 2*nmatch)
 	tp := strBytePtr(s)
-	ok := C.cre2_match_at(re.h, tp, C.int(len(s)), C.int(pos), &cbuf[0], C.int(nmatch)) != 0
+	ok := C.cre2_match_at(re.h, tp, C.int(len(s)), C.int(from), C.int(bound), &cbuf[0], C.int(nmatch)) != 0
 	runtime.KeepAlive(s)
 	runtime.KeepAlive(re)
 	if !ok {
@@ -203,7 +210,7 @@ func (re *Regexp) MatchString(s string) bool {
 
 // FindStringIndex 返回最左匹配的 [start,end), 无匹配返回 nil.
 func (re *Regexp) FindStringIndex(s string) []int {
-	m := re.findFrom(s, 0)
+	m := re.findWithin(s, 0, len(s))
 	if m == nil {
 		return nil
 	}
@@ -212,7 +219,7 @@ func (re *Regexp) FindStringIndex(s string) []int {
 
 // FindString 返回最左匹配的文本, 无匹配返回 "".
 func (re *Regexp) FindString(s string) string {
-	m := re.findFrom(s, 0)
+	m := re.findWithin(s, 0, len(s))
 	if m == nil {
 		return ""
 	}
@@ -221,7 +228,7 @@ func (re *Regexp) FindString(s string) string {
 
 // FindStringSubmatch 返回最左匹配 + 各子组文本, 无匹配返回 nil.
 func (re *Regexp) FindStringSubmatch(s string) []string {
-	m := re.findFrom(s, 0)
+	m := re.findWithin(s, 0, len(s))
 	if m == nil {
 		return nil
 	}
@@ -230,7 +237,7 @@ func (re *Regexp) FindStringSubmatch(s string) []string {
 
 // FindStringSubmatchIndex 返回最左匹配 + 各子组的 index 区间, 无匹配返回 nil.
 func (re *Regexp) FindStringSubmatchIndex(s string) []int {
-	return re.findFrom(s, 0)
+	return re.findWithin(s, 0, len(s))
 }
 
 // 保留 (2026-08-26 量过才决定的, 别再改回 step): 本函数服务 FindAll* 的"一次吐完"契约。

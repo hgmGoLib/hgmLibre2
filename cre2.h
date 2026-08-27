@@ -33,9 +33,15 @@ int cre2_partial_match(const cre2_re *h, const char *text, int textlen);
 int cre2_num_groups(const cre2_re *h);
 /* 取第 idx 组的命名 (无名/越界返回 0), 把名字写进 buf, 返回名字真实长度 (可能 > buflen). */
 int cre2_group_name(const cre2_re *h, int idx, char *buf, int buflen);
-/* 从 startpos 起的【非锚定】下一处匹配, 把 group0..groupN 的字节区间写进 match
- * (长度须 = 2*nmatch, 每组 [start,end); 未参与的组写 -1,-1). 1=有匹配 0=无. */
-int cre2_match_at(const cre2_re *h, const char *text, int textlen, int startpos, int *match, int nmatch);
+/* 在 [startpos, endpos) 这一段里找【非锚定】的下一处匹配, 把 group0..groupN 的字节区间写进
+ * match (长度须 = 2*nmatch, 每组 [start,end); 未参与的组写 -1,-1). 1=有匹配 0=无.
+ *
+ * 🔴 text/textlen 传的始终是【整串】, startpos/endpos 只圈定"在哪一段里找" ——
+ *    ^ / $ / \b 看到的仍是整串的真实邻字节 (RE2::Match 把 text 当 context, 只在
+ *    text.substr(startpos, endpos-startpos) 上搜). 这正是这组入口存在的理由:
+ *    调用方不必自己 text[a:b] 切一刀, 切完两侧就是假邻居了.
+ * 要"从 startpos 一直找到底"就传 endpos = textlen. */
+int cre2_match_at(const cre2_re *h, const char *text, int textlen, int startpos, int endpos, int *match, int nmatch);
 
 /* cre2_match_step_result: cre2_match_all_step 的返回值。
  *   rc       : 1=正常; 0=参数不合法(当无匹配处理)。
