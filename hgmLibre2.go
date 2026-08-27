@@ -301,7 +301,7 @@ func (re *Regexp) FindStringSubmatchIndex(s string) []int {
 // 两件事下沉/合并:
 //   1. 「逐处匹配」循环在 C 的 cre2_match_all 里一次跑完 → cgo 跨界从 O(匹配数) 压成 1 次.
 //   2. 结果只在这一块 flat 上分配一次; Find* 系列直接对它切片 (见各方法), 不再每匹配 make 小 slice
-//      → 分配次数从 O(匹配数) 压成 O(1). 大正文多命中时这是分配次数的大头 (defillage 等).
+//      → 分配次数从 O(匹配数) 压成 O(1). 大正文多命中时这是分配次数的大头 (大表凭据扫描等).
 //
 // 内存正确性: flat 是本次调用的局部块 (并发各自持有, 不挂 re); re.h 只读, RE2 Match 可并发.
 // cflat 是 C malloc 内存上的视图, 仅在 C.free 前一次性拷出, 拷完即 free, 不外泄 C 指针.

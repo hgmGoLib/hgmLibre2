@@ -276,13 +276,13 @@ locs := want.FindAllStringIndex(text, -1)
 
 ### 换路的凭据
 
-11 份 100MB 量级真语料(console 前端产物 · 凭据二次方八腿 · asc 源码/说明书/端点 ELF 混合 ·
+11 份 100MB 量级真语料(console 前端产物 · 凭据二次方八腿 · 产品源码/说明书/端点 ELF 混合 ·
 本机 claude 真历史)× 9 张**生产真门表** = 99 格。原始报表在 `补起点换路的实测账_20260828.txt`。
 
 **口径** —— 逐区间按 `(条, Lo, Hi)` 排成规范序再比:
 
 - D2 与路 B **一处不差**(对账 **1.619 亿处**区间)。这是敢把默认档换掉的全部凭据。
-- D2 与路 A 差 **37 处**, 全在那份 asc 源码/说明书/ELF 的混合语料上, 而且**每一处都是路 A 把
+- D2 与路 A 差 **37 处**, 全在那份产品源码/说明书/ELF 的混合语料上, 而且**每一处都是路 A 把
   左端截短了**:
 
   | | 路 A | 真答案 |
@@ -312,9 +312,8 @@ locs := want.FindAllStringIndex(text, -1)
 - 这一页原来的 §5 "怎么 fuzz 出这份凭据"整节 —— 没有要挂的档, 也就没有要跑的凭据;
 - 库里的 `matchscan_paths_test.go`(路 A/B 与旧 set 路子的对拍)和 `matchscan2_bench_test.go`
   (三条路的对照台);
-- 产品侧 `asc/engine/sd_body_gate_span_fastcensus_test.go`(那份"这一条能不能挂 spanFast"
-  的普查门)、`bodyGateSpanLongestBits` 那张名单, 以及 `ascTestProj` 那两份三路量具
-  (`pathabd.go` / `pathabd_diff.go`)。
+- 产品侧那份"这一条能不能挂 spanFast"的普查门、对应的"哪些位按 longest 口径"名单, 以及
+  调用方产品那两份三路量具(价钱 / 对拍)。
 
 ---
 
@@ -344,14 +343,14 @@ break 把低优先级线程整段截掉(`re2_dfa.cc:1197`), `kLongestMatch` 干�
 
 ## 6. 真实产品上跑出来的结果
 
-ASCP 的敏感数据门(`asc/engine/`)把整张规则表接到了 `MatchScanner` 上, 现状:
+调用方产品的敏感数据门把整张规则表接到了 `MatchScanner` 上, 现状:
 
 | | |
 |---|---|
 | 接管的位数 | **56**(静态名单 53 位 + 凭据锚段 3 位) |
-| 分档 | 全部 `MatchScanMode_span`(`bodyGateSpanBitMode` 恒返它)—— 只有一档可配 |
+| 分档 | 全部 `MatchScanMode_span`(产品侧那个分档函数恒返它)—— 只有一档可配 |
 | 对拍 oracle | 全部 `Longest().FindAllStringIndex` |
-| 常驻对拍规模 | **3 983 754** 例交叉语料, 与 oracle **零差异**(`TestBodyGateSpan_EquivCrossFuzz`) |
+| 常驻对拍规模 | **3 983 754** 例交叉语料, 与 oracle **零差异**(产品侧那道常驻交叉对拍门) |
 
 **这些位的静态可论证性长这样**:
 

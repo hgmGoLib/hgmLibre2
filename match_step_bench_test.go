@@ -198,7 +198,7 @@ func BenchmarkFindAllSub_matAll_vs_step(b *testing.B) {
 // 于是差别只剩 C 侧:
 //   Append: std::vector 逐处 push_back(倍增) → malloc(精确) → C→Go 一次全量拷贝
 //   step  : C 直接写进固定批缓冲 → Go 侧一批一批抄进 dst (多一次小拷贝, 但没有 vector/malloc)
-// asc 里 cred_credential.go 那两处(倒序遍历 flat / 与 fillerLocs 共用底)正是这个形状,
+// 调用方产品里凭据回填那两处(倒序遍历 flat / 与另一份定位表共用底)正是这个形状,
 // 它们能不能换, 由这条基准说了算。
 //
 // 实测结论 (5900X · 2026-08-26 · 两边稳态都是 0 B/op 0 allocs/op):

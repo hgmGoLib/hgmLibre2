@@ -718,7 +718,7 @@ prefix: append `" ef"` and it becomes one). Only seeding every live state sees t
 candidate, which is exactly what step ① above does.
 
 **The evidence for collapsing them** — 11 corpora at the 100 MB scale (console build
-output · eight credential-dense generators · asc source + manuals + endpoint ELF · a real
+output · eight credential-dense generators · product source + manuals + endpoint ELF · a real
 local Claude history) × 9 **production** gate tables = 99 cells. Raw reports in
 `doc/补起点换路的实测账_20260828.txt`.
 

@@ -27,7 +27,7 @@
 //   E 库内 sync.Pool   128.6ns   230.8ns   773.8ns   6874ns    67651ns   0 B/op
 // ⟹ B 在 miss 路径与 A 打平 (惰性生效), 每有一次命中就付约 +26ns (20ns 过境 + 5ns malloc)。
 //
-// 规则表形状 (16~20 条 re 扫一份正文, 只有 p 条命中 —— asc 的真实形状):
+// 规则表形状 (16~20 条 re 扫一份正文, 只有 p 条命中 —— 调用方产品的真实形状):
 //   p=0/16   A 1581ns/0B · B 1662ns/0B · E 1767ns/0B · D 2258ns/3072B/16 笔
 //   p=4/20   A 3399ns/0B · B 3585ns/0B · E 3668ns/0B · D 4174ns/3840B/20 笔
 // ⟹ 名次在所有命中率上都一样: A < B < E < D。
@@ -53,7 +53,7 @@
 // 一句话: 那 11.6ns 只在基准里存在, 而那三样代价在每个调用点上都存在。
 //
 // 🔴 顺带记下 D 有多毒 (第一版落地当天量出来的真问题): 函数内 var st 每次调用白付 192B + 一笔
-//    分配【命不命中都付】, miss 路径上比 A 慢 43%。asc 8.2MB 档 FindAll→Step 换完之后
+//    分配【命不命中都付】, miss 路径上比 A 慢 43%。调用方产品 8.2MB 档 FindAll→Step 换完之后
 //    Go 分配 920.4M → 922.7M(字节反而涨), 就是这个。判据见 match_step_test.go 的
 //    TestStepAllString_MissZeroAlloc。
 package hgmLibre2
@@ -178,7 +178,7 @@ func BenchmarkX_stepVariantsParallel(b *testing.B) {
 	})
 }
 
-// ── 决定性一测: asc 的真实形状 —— 一张规则表 (N 条 re) 扫一份正文, 绝大多数条目 miss ────
+// ── 决定性一测: 调用方产品的真实形状 —— 一张规则表 (N 条 re) 扫一份正文, 绝大多数条目 miss ────
 // 命中率 p 是这里唯一的自变量: B 的账是 0×(1-p) + 约26ns×p, E 的账是恒定约 10ns,
 // D 的账是恒定约 50ns + 192B/次。交叉点在哪, 由这条基准直接给出。
 func BenchmarkX_ruleTable(b *testing.B) {

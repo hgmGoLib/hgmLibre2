@@ -248,7 +248,7 @@ func TestStepAllString_SteadyZeroAlloc(t *testing.T) {
 // TestStepAllString_MissZeroAlloc 🔴 miss 路径也必须零分配。
 // 这一条是为一个真踩过的坑立的判据: 老形状每次调用无条件先 make 一块 ~200B 的首批缓冲,
 // 【命不命中都付】, 而扫描型负载 (一张规则表挨个打同一份正文) 绝大多数调用是 miss ⟹ 换 step
-// 之后 Go 分配字节数反而涨 (asc 8.2MB 档 920.4M → 922.7M)。池化之后这条路一分钱不花。
+// 之后 Go 分配字节数反而涨 (调用方产品 8.2MB 档 920.4M → 922.7M)。池化之后这条路一分钱不花。
 func TestStepAllString_MissZeroAlloc(t *testing.T) {
 	re := MustCompile(`(zzz)=(qqq)`) // per=6, 扫不到
 	s := ""
