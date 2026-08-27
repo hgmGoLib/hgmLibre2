@@ -20,6 +20,16 @@ cre2_re *cre2_new(const char *pat, int patlen);
  * 单条 pattern 撞上状态爆炸时, 默认 8MB 会让 DFA 反复整表清空 (结果仍对, 吞吐掉两个数量级),
  * 而调用方在 cre2_dfa_stats 之外拿不到任何按对象的读数 —— 所以先得能把预算调大. */
 cre2_re *cre2_new_max_mem(const char *pat, int patlen, int64_t max_mem);
+/* 同 cre2_new_max_mem, 但打开 RE2::Options::set_longest_match —— 这个 handle 的匹配口径从
+ * leftmost-first (贪心, RE2/PCRE 默认) 换成 leftmost-longest (POSIX):【同一个起点】上取最长的
+ * 那个匹配, 而不是 NFA 指令优先序先撞上的那个. 起点的选法两者完全相同 (都是最靠左的那个).
+ *
+ * 🔴 存在理由: 调用方要"从这一点起最长的那个匹配"时, 有了它就是【一次】搜索的事 —— 不必再
+ *    先用贪心搜一次定起点、再另找一条路把终点重取成最长. 而且这一次走的是 RE2::Match 那条
+ *    完整的路 (DFA → OnePass/BitState/NFA 逐级回退), DFA 放弃了还有下家; set 那侧的锚定解析
+ *    是 DFA 独一条, 没有下家.
+ * 🔴 longest 是【编译期】的事 (kind 由 options 决定), 所以它是另一个 handle, 不是调用上的开关. */
+cre2_re *cre2_new_longest_max_mem(const char *pat, int patlen, int64_t max_mem);
 /* 这个 handle 编译时用的 max_mem (字节). */
 int64_t cre2_max_mem(const cre2_re *h);
 /* 1=编译成功 0=失败. */
@@ -33,9 +43,91 @@ int cre2_partial_match(const cre2_re *h, const char *text, int textlen);
 int cre2_num_groups(const cre2_re *h);
 /* 取第 idx 组的命名 (无名/越界返回 0), 把名字写进 buf, 返回名字真实长度 (可能 > buflen). */
 int cre2_group_name(const cre2_re *h, int idx, char *buf, int buflen);
-/* 从 startpos 起的【非锚定】下一处匹配, 把 group0..groupN 的字节区间写进 match
- * (长度须 = 2*nmatch, 每组 [start,end); 未参与的组写 -1,-1). 1=有匹配 0=无. */
-int cre2_match_at(const cre2_re *h, const char *text, int textlen, int startpos, int *match, int nmatch);
+/* 在 [startpos, endpos) 这一段里找【非锚定】的下一处匹配, 把 group0..groupN 的字节区间写进
+ * match (长度须 = 2*nmatch, 每组 [start,end); 未参与的组写 -1,-1). 1=有匹配 0=无.
+ *
+ * 🔴 text/textlen 传的始终是【整串】, startpos/endpos 只圈定"在哪一段里找" ——
+ *    ^ / $ / \b 看到的仍是整串的真实邻字节 (RE2::Match 把 text 当 context, 只在
+ *    text.substr(startpos, endpos-startpos) 上搜). 这正是这组入口存在的理由:
+ *    调用方不必自己 text[a:b] 切一刀, 切完两侧就是假邻居了.
+ * 要"从 startpos 一直找到底"就传 endpos = textlen. */
+int cre2_match_at(const cre2_re *h, const char *text, int textlen, int startpos, int endpos, int *match, int nmatch);
+
+/* 同 cre2_match_at, 但匹配必须【从 startpos 起头】(RE2::ANCHOR_START). 其余逐字相同:
+ * text/textlen 仍是整串 (context), 只有 [startpos,endpos) 参与搜索, ^ / $ / \b 看到真实邻字节.
+ *
+ * 配 cre2_new_longest_max_mem 编出来的 handle 用, 这一句给的就是"从 startpos 起、不越过 endpos
+ * 的【最长】匹配"—— 也就是 cre2_set_resolve_span 在 set 那侧干的事, 只不过走的是 RE2::Match
+ * 那条带 NFA 回退的路, 且不需要一个 set. 配普通 handle 用给的是贪心那个终点. */
+int cre2_match_at_anchored(const cre2_re *h, const char *text, int textlen, int startpos, int endpos, int *match, int nmatch);
+
+/* cre2_match_step_result: cre2_match_all_step 的返回值。
+ *   rc       : 1=正常; 0=参数不合法(当无匹配处理)。
+ *   nmatches : 本批填进 outBuf 的匹配【处】数 (写入 int 数 = nmatches * 2 * nmatch)。
+ *   pos      : 游标, 下次 step 原样传回来。
+ *   prevEnd  : 空匹配去重游标, 下次 step 原样传回来。
+ *   done     : 1=已扫到底(或已满 maxn), 不必再 step。 */
+typedef struct {
+	int rc;
+	int nmatches;
+	int pos;
+	int prevEnd;
+	int done;
+} cre2_match_step_result;
+
+/* cre2_match_all_step: cre2_match_all 的【分批】孪生 —— 逐处匹配的循环仍整段留在 C 内,
+ * 一直填到 outBuf 装满 (outCapMatches 处) 或扫到底才返回, 所以 cgo 过境次数是
+ * ceil(匹配数/outCapMatches)+1 而不是每处一次; 无匹配时就 1 次, 与 cre2_match_all 相同。
+ *
+ * 与 cre2_match_all 的差别只有"结果落在哪": 匹配集合 / 顺序 / 空匹配去重推进逐字相同
+ * (同一段循环)。结果【直接写进调用方给的 outBuf】—— 没有 std::vector 累积, 没有 malloc,
+ * 没有拷贝, 因此 C 侧不再出现"整张命中表的两份"那个峰值。
+ *
+ * 参数:
+ *   maxn_left     : 本次还允许再填几处; <0 = 不限。跨批的剩余额度由调用方递减。
+ *   pos, prevEnd  : 游标。首次调用传 pos=0, prevEnd=-1。
+ *   outBuf        : 调用方内存 (Go 侧就是一块 []int 的首元素地址); 本函数返回即不再引用,
+ *                   不留存 —— 满足 cgo "C 不得保存 Go 指针" 的规则。
+ *   outCapMatches : outBuf 能装几【处】匹配 (即 outBuf 至少有 outCapMatches*2*nmatch 个 int)。
+ *
+ * 🔴 native 侧不保存正文指针: text/textlen 每次 step 重新传进来。 */
+cre2_match_step_result cre2_match_all_step(const cre2_re *h, const char *text, int textlen, int nmatch,
+                                           int maxn_left, int pos, int prevEnd,
+                                           int *outBuf, int outCapMatches);
+
+/* ── 实验中 (2026-08-26): 缓冲改由 C 侧持有 ────────────────────────────────────────
+ * cre2_match_all_step_alloc 与上面那个逐字同一段循环, 唯一差别是【缓冲谁分配】:
+ *   inBuf==NULL 时不预先分配, 直到真的要写第一处命中才 malloc(capMatches*2*nmatch 个 int),
+ *   并把指针放进 res.buf 交回调用方; 之后每次 step 原样传回来。扫完由调用方 cre2_step_buf_free。
+ * 目的是回答"能不能干掉调用方持有的工作区(Go 侧 MatchStep_t)、让 miss 路径一分钱不花"。
+ * 结论见 match_step_alloc_bench_test.go 顶部。 */
+typedef struct {
+	int rc;
+	int nmatches;
+	int pos;
+	int prevEnd;
+	int done;
+	int *buf; /* C 侧缓冲 (可能是本次刚 malloc 的); 调用方负责最后 cre2_step_buf_free */
+} cre2_match_step_alloc_result;
+
+cre2_match_step_alloc_result cre2_match_all_step_alloc(const cre2_re *h, const char *text, int textlen, int nmatch,
+                                                       int maxn_left, int pos, int prevEnd,
+                                                       int *inBuf, int capMatches);
+void cre2_step_buf_free(int *p);
+/* cre2_nop: 量一次纯 cgo 过境要多少 ns (给上面那个方案的"额外一次 free 过境"定价)。 */
+void cre2_nop(void);
+/* cre2_malloc_free_roundtrip: 在 C 内做 n 轮 malloc(nbytes)+free, 量 glibc 分配器本身的价
+ * (不含 cgo 过境)。用来验证"C 的 malloc/free 是不是一个高效的 sync.Pool"。 */
+void cre2_malloc_free_roundtrip(int n, int nbytes);
+
+/* cre2_match_all vs cre2_match_all_step 的分工 (2026-08-26 实测定的, 别再改回去):
+ *   · 调用方【不需要全部物化】(顺序遍历一遍就完事) ⇒ step。零 Go 分配, C 侧也不攒表。
+ *   · 调用方【就是要一次吐完的数组】(FindAll* 的契约) ⇒ 本函数。因为"先在 C 里数好个数,
+ *     再一次精确 malloc"本来就是这个契约下的最优解: Go 侧拿到 count 后一次精确 make。
+ *     用 step 物化反而更贵 —— Go append 阶梯累计收敛到 5N, 实测 20000 处命中
+ *     1.45MB/4 笔 → 5.70MB/26 笔, CPU +17%。
+ * 所以两个都留着, 各管各的。中间那种"半物化"形态 (AppendAllStringIndexFlat) 才是两头不靠的
+ * 那个 —— 不物化就用 step, 要物化就用 FindAll*, 它没有自己的地盘, 所以它被删。 */
 
 /* 批量全匹配: 在 C 内一次循环跑完整个 text 的所有(最多 maxn 个; maxn<0=不限)非锚定匹配,
  * 复刻调用方 allMatches 的空匹配去重 + UTF-8 rune 推进语义. 每处匹配顺序写 2*nmatch 个 int
@@ -201,6 +293,102 @@ typedef struct {
 /* 反向非锚定匹配: 语义与 cre2_partial_match 逐字相同 (正文任意位置命中即 1), 但 DFA 反着跑。
  * 反向程序在首次调用时惰性编出来 (线程安全), 预算用 handle 的 max_mem。 */
 cre2_rev_match_result cre2_partial_match_reverse(const cre2_re *h, const char *text, int textlen, int want_stats);
+
+/* ── 流式游程扫描: 一遍扫正文, 边扫边说"哪条 pattern 命中在【哪】" ──────────────
+ * cre2_set_match 只回答"哪几条命中"; 要位置的调用方只能拿到 id 之后, 再用那几条各自
+ * 跑一遍【整篇正文】。位置本来就在 DFA 热循环里算出来了 (只是被丢掉), 这套 API 把它收下来。
+ *
+ * 吐出来的是【游程】(id, lo, hi), 不是逐个位置 —— kManyMatch 的 DFA 在每一个能结束匹配的
+ * 位置都会报一次, 可变长匹配上会连出一串 (`[a-z]{3,}` 撞 "abcdef" 会在 3/4/5/6 各报一次)。
+ * 按 pattern 把连号的收敛成一段再吐, 且【两端都给】所以无信息损失 (展开 [lo,hi] 即可还原)。
+ *   正向 set : 位置 = 匹配【右端】偏移 (不含)
+ *   反向 set : 位置 = 匹配【左端】偏移 (含)
+ * 恒 lo <= hi (原文坐标)。顺序【不保证】全局按位置升序 —— 游程要等"这条再次命中且不连号"
+ * 或"整篇扫完"才收口, 所以不同 pattern 的游程会交错。要有序自己排 (条数是游程数, 很少)。
+ *
+ * 语义细节和"为什么是轮询不是回调/不是一次吐完"见 internal_include/re2/span_scan.h。 */
+typedef struct cre2_spanscan cre2_spanscan;
+
+/* 开一个流式扫描工作区 (set 必须已 cre2_set_compile)。OOM / 没编译返回 NULL。
+ * 工作区可以反复用于多次扫描 (游程表不重新分配), 但【不是并发安全的】: 一个线程一个。 */
+cre2_spanscan *cre2_set_spanscan_new(const cre2_set *h);
+void cre2_spanscan_free(cre2_spanscan *ss);
+
+/* 开始一次新扫描 (清游程表, 绑定正文长度)。1=成功 0=失败(textlen<0)。 */
+int cre2_spanscan_begin(cre2_spanscan *ss, int textlen);
+
+/* 推进一步, 最多吐 outcap/3 条游程进 out (每条 3 个 int32: index, lo, hi)。
+ * 返回本批的【游程条数】(>=0); <0 = 出错 (DFA 放弃 / 状态恢复失败, 整次扫描作废)。
+ * *more: 1 = 还没扫完, 取走这批后再 step 一次; 0 = 扫完了。
+ * outcap 必须 >= 3*pattern条数 (保证"再来一个命中字节也一定塞得下"), 否则返回 -1。
+ *
+ * 🔴 text/textlen 每次 step 都要重新传, 且必须是同一份正文、同一个长度:
+ *    native 侧【只存偏移不存指针】—— 挂起期间不持有调用方的任何指针 (cgo 的硬要求),
+ *    也不持有 DFA 的任何锁 (持锁跨回调会把想 flush 的线程全堵住)。 */
+int cre2_spanscan_step(cre2_spanscan *ss, const char *text, int textlen,
+                       int32_t *out, int outcap, int *more);
+
+/* 给定 spanscan 吐出来的一个端点, 求第 id 条 pattern 在这个端点上的【另一端】(最长的那个)。
+ *   正向 set: from = 匹配左端(含), 写回右端(不含) —— text[from, *out) 是一个匹配;
+ *   反向 set: from = 匹配右端(不含), 写回左端(含) —— text[*out, from) 是一个匹配。
+ * bound = 最远看到哪 (正向是上界, 反向是下界), 负数 = 不限; 判定用的上下文恒是整篇正文,
+ * 所以 \b / ^ / $ 看到的永远是真实邻居, 不是 bound 切出来的假边界。
+ * 返回 1 = 找到, 0 = 这条 pattern 在这个端点上不匹配, -1 = 参数错 / DFA 放弃。
+ * 无状态、只读, 可以与扫描并发调。为什么这一步得在库里做见 internal_include/re2/span_scan.h。 */
+int cre2_set_resolve_span(const cre2_set *h, const char *text, int textlen,
+                          int from, int bound, int id, int32_t *out);
+
+/* cre2_span_resolve_result: cre2_set_resolve_span_r 的返回值。
+ *   rc  同 cre2_set_resolve_span 的返回值 (1 找到 / 0 不匹配 / -1 参数错或 DFA 放弃);
+ *   pos 就是那个出参 (rc!=1 时无意义)。 */
+typedef struct {
+	int32_t rc;
+	int32_t pos;
+} cre2_span_resolve_result;
+
+/* cre2_set_resolve_span_r: 上面那个的【按值返回】孪生 (同一份实现, 语义逐字相同)。
+ * 🔴 Go 侧一律走这个: 出参版要把 &out 这个 Go 指针交给 C, 逃逸分析据此每次调用把那个
+ * 局部变量搬上堆 —— 一次解析一笔 4 字节堆分配, 在"每个端点解析一次"的用法上直接按端点数
+ * 放大 (实测 6.5 万个端点 = 6.5 万笔)。同一招见 cre2_match_all_r。 */
+cre2_span_resolve_result cre2_set_resolve_span_r(const cre2_set *h, const char *text,
+                                                 int textlen, int from, int bound, int id);
+
+/* cre2_set_viable_starts: 【反向 set 专用】给一个匹配右端 from, 把 [bound, from) 里全部
+ * 【候选起点】收下来 —— 即那些位置 s 使 text[s, from) 是第 id 条 pattern 的一个
+ * 【可行前缀】(还能被某个后缀补成真匹配, 不一定当场就是匹配).
+ *
+ * 与 cre2_set_resolve_span_r 的差别只有一处, 但是决定性的: 那个的反向机器只种 accept,
+ * 所以只认"正好是匹配"的左端; 这个种【全部指令】, 连"路过这个右端的更长匹配"的起点也认.
+ * 前者是后者的子集, 而"leftmost 到底在哪"只有问后者才问得对 ——
+ *   (?:ab cd ef|cd) 撞 "ab cd ef": 门给的最小右端是 "cd" 那一处的右端, 只种 accept
+ *   只能回推到 "cd" 的左端, 种全部状态才能回推到 "ab" 那个真正的最左起点.
+ *
+ * out 里是【降序】(机器从右往左走). 返回【找到的总条数】, 可能 > outcap —— 此时只写了
+ * 前 outcap 个 (也就是最大的那几个, 恰好最没用), 调用方该换个更大的缓冲重来一次.
+ * -1 = 参数错 / 不是反向 set / DFA 放弃.
+ * 代价 = 这处命中能往回够多远 (机器走到死就收工), 与正文长度无关. */
+int cre2_set_viable_starts(const cre2_set *h, const char *text, int textlen,
+                           int from, int bound, int id, int32_t *out, int outcap);
+
+/* cre2_resolve_span_reverse_r: 【单条】正则的反向锚定解析 —— 不经过 set.
+ * from = 匹配右端 (不含), 返回【最靠左】的那个左端 (含), text[pos,from) 就是这条 pattern 的一个匹配.
+ * bound = 回看不越过它 (左下界), 负数 = 不限. 判定上下文恒是整篇正文, 所以 \b / ^ / $ 看到的
+ * 是真实邻居, 不是 bound 切出来的假边界.
+ *
+ * 实现就是 RE2::Match 自己求匹配【左端】时走的那一句: 反向程序 + kAnchored + kLongestMatch.
+ * 惰性编反向程序 (与 cre2_partial_match_reverse 共用同一份, 见 cre2_rev_prog).
+ * 返回 rc: 1 = 找到, 0 = 这个右端上伸不出匹配, -1 = 参数错 / 反向程序编不出来 / DFA 放弃.
+ *
+ * 🔴 为什么不能拿 cre2_set_resolve_span_r 套一条 pattern 的 set 凑: 那是 kManyMatch 的 DFA
+ *    (每个状态多背一张 id 表), 而且 set 那侧的 ^ / $ 是留在程序里的指令, 单条 Compile 却把
+ *    它们摘成 anchor_start_/anchor_end_ 两个标志 —— 只有 SearchDFA 会去检查那两个标志.
+ *    绕开它自己走 DFA 的话, `^foo` 会在正文中间也认. */
+cre2_span_resolve_result cre2_resolve_span_reverse_r(const cre2_re *h, const char *text,
+                                                     int textlen, int from, int bound);
+
+/* 查这条 pattern 的【反向程序】当前的 DFA 缓存水位 (字段同 cre2_set_mem).
+ * 没走过反向 (程序都没编 / DFA 没建) 就返回 Built=0, 【不会】因为查询而把它建出来. */
+void cre2_rev_mem_info(const cre2_re *h, cre2_set_mem *out);
 
 /* 建一个空 set, reversed!=0 时整个 set 反向编译 (Match 从末尾往前扫原始 buffer)。
  * cre2_set_new(mm) == cre2_set_new_ex(mm, 0)。其余 API (add/compile/match/stats/mem_info/attrib)

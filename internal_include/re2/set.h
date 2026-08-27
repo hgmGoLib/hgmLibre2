@@ -5,6 +5,8 @@
 #ifndef RE2_SET_H_
 #define RE2_SET_H_
 
+#include <stdint.h>
+
 #include <memory>
 #include <string>
 #include <utility>
@@ -14,6 +16,7 @@
 #include "re2/re2.h"
 
 namespace re2 {
+class DFASpanScan;   // ── hgmLibre2 追加 ── 见 re2/span_scan.h
 class Prog;
 class Regexp;
 }  // namespace re2
@@ -84,6 +87,29 @@ class RE2::Set {
   // stats 由调用方在栈上开一个即可, 不必清零; 传 NULL 等价于上面那个重载。
   bool Match(const StringPiece& text, std::vector<int>* v,
              ErrorInfo* error_info, DFAScanStats* stats) const;
+
+  // ── hgmLibre2 追加 (非上游 re2) ──
+  // 开一个【流式游程扫描】工作区: Match 只回答"哪几条命中", 这个回答"命中在哪"。
+  // 语义 (吐什么 / 为什么是游程 / 为什么是轮询) 全在 re2/span_scan.h, 用完 DFASpanScanFree。
+  // 没编译 / OOM 返回 NULL。工作区可以反复用于多次扫描, 但不是并发安全的。
+  DFASpanScan* NewSpanScan() const;
+
+  // ── hgmLibre2 追加 (非上游 re2) ──
+  // 给定 NewSpanScan 吐出来的一个端点, 求同一条 pattern 在这个端点上的【另一端】(最长的那个)。
+  // 语义 / 为什么这一步只能在库里做, 见 re2/span_scan.h 末尾那段。
+  // 无状态、只读, 可以与扫描并发调 (自己拿 DFA 的缓存读锁)。
+  // 返回 1 = 找到并写 *out, 0 = 这条 pattern 在这个端点上根本不匹配, -1 = 参数错 / DFA 放弃。
+  int ResolveSpan(const char* text, int textlen, int from, int bound,
+                  int id, int32_t* out) const;
+
+  // ── hgmLibre2 追加 (非上游 re2) ──
+  // 【反向 set 专用】给一个匹配右端 from, 把 [bound, from) 里全部【候选起点】收下来
+  // (text[s, from) 是第 id 条的可行前缀)。写进 out 的是降序, 返回找到的总条数
+  // (可能 > outcap, 此时只写了前 outcap 个); -1 = 参数错 / 不是反向 set / DFA 放弃。
+  // 这是 ResolveSpan 的"超集版": 那个只认【正好是匹配】的左端, 这个连"路过这个右端的
+  // 更长匹配"的起点也认 —— leftmost 到底在哪, 只有问这一个才问得对。
+  int ViableStarts(const char* text, int textlen, int from, int bound,
+                   int id, int32_t* out, int outcap) const;
 
   // 查这个 Set 的 DFA 缓存水位 + 生涯累计 (没扫过则 out->built=false)。
   // 只读, 短暂拿 DFA 的读锁, 可以和扫描并发调。

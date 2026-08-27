@@ -16,6 +16,7 @@
 #include "re2/prog.h"
 #include "re2/re2.h"
 #include "re2/regexp.h"
+#include "re2/span_scan.h"
 #include "re2/stringpiece.h"
 
 namespace re2 {
@@ -148,6 +149,30 @@ bool RE2::Set::Match(const StringPiece& text, std::vector<int>* v,
   return Match(text, v, error_info, NULL);
 }
 
+// ── hgmLibre2 追加 ── 见 set.h / re2/span_scan.h。
+// nid 传 size_ (Add 成功的条数) —— 吐出去的 id 与 Match 返回的下标是同一套。
+DFASpanScan* RE2::Set::NewSpanScan() const {
+  if (!compiled_ || prog_ == NULL)
+    return NULL;
+  return prog_->NewSpanScan(size_);
+}
+
+// ── hgmLibre2 追加 ── 见 set.h / re2/span_scan.h。id 与 Match 返回的下标同一套。
+int RE2::Set::ResolveSpan(const char* text, int textlen, int from, int bound,
+                          int id, int32_t* out) const {
+  if (!compiled_ || prog_ == NULL)
+    return -1;
+  return prog_->SpanResolve(size_, text, textlen, from, bound, id, out);
+}
+
+// ── hgmLibre2 追加 ── 见 set.h / re2_dfa_spanscan.inc。id 与 Match 返回的下标同一套。
+int RE2::Set::ViableStarts(const char* text, int textlen, int from, int bound,
+                           int id, int32_t* out, int outcap) const {
+  if (!compiled_ || prog_ == NULL)
+    return -1;
+  return prog_->SpanViableStarts(size_, text, textlen, from, bound, id, out, outcap);
+}
+
 // 没扫过就没有 DFA —— 这时候【不建】, 直接报 built=false。
 void RE2::Set::MemInfo(DFAMemInfo* out) const {
   memset(out, 0, sizeof *out);
@@ -191,7 +216,10 @@ bool RE2::Set::Match(const StringPiece& text, std::vector<int>* v,
     matches.reset(new SparseSet(size_));
     v->clear();
   }
-  bool ret = prog_->SearchDFA(text, text, Prog::kAnchored, Prog::kManyMatch,
+  // ── hgmLibre2 改动 ── 上游这里传的是 kAnchored (靠 CompileSet 设的 anchor_start_ 把
+  // 搜索钉成锚定的, 而那个"锚定入口"其实带着 .*? 前缀)。CompileSet 现在按 Compile 的规矩
+  // 摆两个入口了 (见那里), 所以这里照实传 kUnanchored —— 走的还是同一个带前缀的入口。
+  bool ret = prog_->SearchDFA(text, text, Prog::kUnanchored, Prog::kManyMatch,
                               NULL, &dfa_failed, matches.get(), stats);
   if (dfa_failed) {
     if (options_.log_errors())

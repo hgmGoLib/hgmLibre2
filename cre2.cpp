@@ -1,5 +1,6 @@
 // cre2.cpp — cre2.h 的实现, 直接调 vendored RE2 (2023-03-01, 无 abseil).
 #include "cre2.h"
+#include "cre2_internal.h"
 #include "re2/re2.h"
 #include "re2/set.h"
 // 反着扫要直接用 re2 的内部件: Regexp::Parse + Regexp::CompileToReverseProg + Prog::SearchDFA。
@@ -27,12 +28,17 @@ struct cre2_re {
 
 extern "C" {
 
-cre2_re *cre2_new_max_mem(const char *pat, int patlen, int64_t max_mem) {
+// cre2_new_common: cre2_new_max_mem 与 cre2_new_longest_max_mem 的同一份实现 ——
+// 两者只差 longest_match 一个 option, 而那个 option 是【编译期】的事 (它定的是搜索 kind)。
+static cre2_re *cre2_new_common(const char *pat, int patlen, int64_t max_mem, bool longest) {
 	re2::StringPiece sp(pat, patlen);
 	RE2::Options opt;
 	opt.set_log_errors(false); // 别往 stderr 喷, 错误走 cre2_error 取
 	if (max_mem > 0) {
 		opt.set_max_mem(max_mem); // <=0 保持 RE2 默认 kDefaultMaxMem=8MB
+	}
+	if (longest) {
+		opt.set_longest_match(true); // leftmost-longest (POSIX) 而不是 leftmost-first (贪心)
 	}
 	cre2_re *h = new (std::nothrow) cre2_re();
 	if (h == nullptr) {
@@ -43,6 +49,14 @@ cre2_re *cre2_new_max_mem(const char *pat, int patlen, int64_t max_mem) {
 	h->rre = nullptr;
 	h->rprog = nullptr;
 	return h;
+}
+
+cre2_re *cre2_new_max_mem(const char *pat, int patlen, int64_t max_mem) {
+	return cre2_new_common(pat, patlen, max_mem, false);
+}
+
+cre2_re *cre2_new_longest_max_mem(const char *pat, int patlen, int64_t max_mem) {
+	return cre2_new_common(pat, patlen, max_mem, true);
 }
 
 cre2_re *cre2_new(const char *pat, int patlen) { return cre2_new_max_mem(pat, patlen, 0); }
@@ -74,13 +88,26 @@ int cre2_group_name(const cre2_re *h, int idx, char *buf, int buflen) {
 	return n;
 }
 
-int cre2_match_at(const cre2_re *h, const char *text, int textlen, int startpos, int *match, int nmatch) {
+static int cre2_match_at_common(const cre2_re *h, const char *text, int textlen, int startpos, int endpos,
+                                int *match, int nmatch, RE2::Anchor anchor) {
 	// 用非空 base: RE2 文档规定 text==NULL 时连 group0 的 data() 都返回 NULL (无法算偏移),
 	// 故空串也喂一个合法指针, 偏移一律相对 base 计算.
 	const char *base = text ? text : "";
 	re2::StringPiece full(base, textlen);
-	std::vector<re2::StringPiece> sub(nmatch);
-	bool ok = h->re->Match(full, (size_t)startpos, (size_t)textlen, RE2::UNANCHORED, sub.data(), nmatch);
+	// 🔴 小 nmatch 走栈上那块, 不要每次调用 new 一个 vector. 这条路是【按处命中调用】的
+	//    (MatchScanner 补端点每处一次), 一次 malloc/free 在那个量级上是能量出来的常数 ——
+	//    实测把它去掉之前, 路 A 在低命中密度语料上比走 set 的老路子慢 2%.
+	//    8 是随手够用的界: group0 + 7 个子组, 超了才落回 vector.
+	re2::StringPiece stackbuf[8];
+	std::vector<re2::StringPiece> heapbuf;
+	re2::StringPiece *sub = stackbuf;
+	if (nmatch > (int)(sizeof stackbuf / sizeof stackbuf[0])) {
+		heapbuf.resize(nmatch);
+		sub = heapbuf.data();
+	}
+	// full 是【整串】(context), 只有 [startpos,endpos) 这一段参与搜索 —— ^ / $ / \b 因此
+	// 看到的是真实邻字节. Go 侧已经保证 0 <= startpos <= endpos <= textlen.
+	bool ok = h->re->Match(full, (size_t)startpos, (size_t)endpos, anchor, sub, nmatch);
 	if (!ok) {
 		return 0;
 	}
@@ -95,6 +122,16 @@ int cre2_match_at(const cre2_re *h, const char *text, int textlen, int startpos,
 		}
 	}
 	return 1;
+}
+
+int cre2_match_at(const cre2_re *h, const char *text, int textlen, int startpos, int endpos, int *match, int nmatch) {
+	return cre2_match_at_common(h, text, textlen, startpos, endpos, match, nmatch, RE2::UNANCHORED);
+}
+
+// 与上面唯一的差别就是 anchor: 匹配必须从 startpos 起头. 配 longest handle 用, 给的就是
+// "从这一点起最长的那个匹配"; 而它走的是 RE2::Match 的完整回退链 (DFA → OnePass/BitState/NFA).
+int cre2_match_at_anchored(const cre2_re *h, const char *text, int textlen, int startpos, int endpos, int *match, int nmatch) {
+	return cre2_match_at_common(h, text, textlen, startpos, endpos, match, nmatch, RE2::ANCHOR_START);
 }
 
 // utf8WidthGo 复刻 Go utf8.DecodeRuneInString 返回的【宽度】, 仅供空匹配推进:
@@ -130,6 +167,202 @@ static int utf8WidthGo(const char *s, int n) {
 	return w;
 }
 
+/* cre2_match_all_step: 见 cre2.h 的契约。
+ *
+ * 循环体与 cre2_match_all 【逐字相同】(pos 推进 · 空匹配去重 · utf8WidthGo · 未参与组 -1,-1),
+ * 唯二的差别:
+ *   ① 结果写进调用方的 outBuf, 不进 std::vector, 收尾也不 malloc/拷贝;
+ *   ② 填满 outCapMatches 处就【挂起】返回 (done=0), 把 pos/prevEnd 交回给调用方下次传进来。
+ * 挂起不需要保存任何 native 状态 —— 每处匹配本来就是一次独立的 h->re->Match(full, pos, …),
+ * DFA 状态与 cache 锁都在那一次 Match 内部生灭, 循环切在哪一处都不影响结果。
+ *
+ * 🔴 这两份实现【没有】共用同一段代码, 而且两个都会长期留着 (分工见 cre2.h 里那段)。
+ *    让 cre2_match_all 绕道本函数会给它凭空加一次拷贝, 拿本函数绕道它则要先攒完整张表 ——
+ *    两个契约不同, 硬合成一份只会两头都变慢。防止语义漂移靠的是对拍门:
+ *    match_step_test.go 拿 batch=1/2/3 强制切在批边界上 (跨批携带的 pos/prevEnd 是唯一会
+ *    静默出错的地方), 与 FindAllStringSubmatchIndex 以及 stdlib regexp 三方逐处逐组对拍。 */
+cre2_match_step_result cre2_match_all_step(const cre2_re *h, const char *text, int textlen, int nmatch,
+                                           int maxn_left, int pos, int prevEnd,
+                                           int *outBuf, int outCapMatches) {
+	cre2_match_step_result res;
+	res.rc = 1;
+	res.nmatches = 0;
+	res.pos = pos;
+	res.prevEnd = prevEnd;
+	res.done = 1; /* 只有"缓冲填满而不是扫完"那一条出口才会改成 0 */
+	if (h == NULL || nmatch < 1 || outBuf == NULL || outCapMatches < 1 || textlen < 0 || pos < 0) {
+		res.rc = 0;
+		return res;
+	}
+	if (maxn_left == 0) {
+		return res; /* 额度已用尽: 一处不填, 且已经结束 */
+	}
+	const char *base = text ? text : "";
+	re2::StringPiece full(base, textlen);
+	std::vector<re2::StringPiece> sub(nmatch);
+	int end = textlen;
+	int count = 0; /* 本批已【接受】的匹配处数 */
+	int w = 0;     /* outBuf 写游标 (int 数) */
+	while (pos <= end) {
+		if (count >= outCapMatches) {
+			res.done = 0; /* 缓冲满 —— 正文还没扫完, 调用方要再 step 一次 */
+			break;
+		}
+		if (maxn_left > 0 && count >= maxn_left) {
+			break; /* 本次额度用尽; done 保持 1 */
+		}
+		bool ok = h->re->Match(full, (size_t)pos, (size_t)textlen, RE2::UNANCHORED, sub.data(), nmatch);
+		if (!ok) {
+			break;
+		}
+		/* group0 在成功匹配时必参与, data() 非 NULL. */
+		int m0 = (int)(sub[0].data() - base);
+		int m1 = m0 + (int)sub[0].size();
+		bool accept = true;
+		if (m1 == m0) {
+			/* 空匹配: 紧贴上一处匹配末尾的空匹配丢弃, 避免重复; 按 rune 宽度推进 pos. */
+			if (m0 == prevEnd) {
+				accept = false;
+			}
+			int width = utf8WidthGo(base + pos, end - pos);
+			if (width > 0) {
+				pos += width;
+			} else {
+				pos = end + 1;
+			}
+		} else {
+			pos = m1;
+		}
+		prevEnd = m1;
+		if (accept) {
+			for (int i = 0; i < nmatch; i++) {
+				if (sub[i].data() == nullptr) {
+					outBuf[w++] = -1;
+					outBuf[w++] = -1;
+				} else {
+					int b = (int)(sub[i].data() - base);
+					outBuf[w++] = b;
+					outBuf[w++] = b + (int)sub[i].size();
+				}
+			}
+			count++;
+		}
+	}
+	res.nmatches = count;
+	res.pos = pos;
+	res.prevEnd = prevEnd;
+	return res;
+}
+
+/* ── 实验中 (2026-08-26): 缓冲改由 C 侧持有, 见 cre2.h 的契约。 ──────────────────────
+ * 循环体与 cre2_match_all_step 逐字相同, 只在"第一次要写命中"处插了一句惰性 malloc。 */
+cre2_match_step_alloc_result cre2_match_all_step_alloc(const cre2_re *h, const char *text, int textlen, int nmatch,
+                                                       int maxn_left, int pos, int prevEnd,
+                                                       int *inBuf, int capMatches) {
+	cre2_match_step_alloc_result res;
+	res.rc = 1;
+	res.nmatches = 0;
+	res.pos = pos;
+	res.prevEnd = prevEnd;
+	res.done = 1;
+	res.buf = inBuf;
+	if (h == NULL || nmatch < 1 || capMatches < 1 || textlen < 0 || pos < 0) {
+		res.rc = 0;
+		return res;
+	}
+	if (maxn_left == 0) {
+		return res;
+	}
+	const char *base = text ? text : "";
+	re2::StringPiece full(base, textlen);
+	std::vector<re2::StringPiece> sub(nmatch);
+	int *out = inBuf;
+	int end = textlen;
+	int count = 0;
+	int w = 0;
+	while (pos <= end) {
+		if (count >= capMatches) {
+			res.done = 0;
+			break;
+		}
+		if (maxn_left > 0 && count >= maxn_left) {
+			break;
+		}
+		bool ok = h->re->Match(full, (size_t)pos, (size_t)textlen, RE2::UNANCHORED, sub.data(), nmatch);
+		if (!ok) {
+			break;
+		}
+		int m0 = (int)(sub[0].data() - base);
+		int m1 = m0 + (int)sub[0].size();
+		bool accept = true;
+		if (m1 == m0) {
+			if (m0 == prevEnd) {
+				accept = false;
+			}
+			int width = utf8WidthGo(base + pos, end - pos);
+			if (width > 0) {
+				pos += width;
+			} else {
+				pos = end + 1;
+			}
+		} else {
+			pos = m1;
+		}
+		prevEnd = m1;
+		if (accept) {
+			if (out == NULL) {
+				/* 惰性: 到这里才知道真的有命中。miss 路径一分钱不花。 */
+				out = (int *)malloc(sizeof(int) * (size_t)capMatches * 2 * (size_t)nmatch);
+				if (out == NULL) {
+					res.rc = 0;
+					return res;
+				}
+				res.buf = out;
+			}
+			for (int i = 0; i < nmatch; i++) {
+				if (sub[i].data() == nullptr) {
+					out[w++] = -1;
+					out[w++] = -1;
+				} else {
+					int b = (int)(sub[i].data() - base);
+					out[w++] = b;
+					out[w++] = b + (int)sub[i].size();
+				}
+			}
+			count++;
+		}
+	}
+	res.nmatches = count;
+	res.pos = pos;
+	res.prevEnd = prevEnd;
+	return res;
+}
+
+void cre2_step_buf_free(int *p) {
+	free(p);
+}
+
+void cre2_nop(void) {
+}
+
+void cre2_malloc_free_roundtrip(int n, int nbytes) {
+	volatile int sink = 0;
+	for (int i = 0; i < n; i++) {
+		void *p = malloc((size_t)nbytes);
+		if (p == NULL) {
+			return;
+		}
+		((char *)p)[0] = (char)i; /* 防止编译器把 malloc/free 对消掉 */
+		sink += ((char *)p)[0];
+		free(p);
+	}
+	(void)sink;
+}
+
+/* 保留 (不是待删除): 本函数服务 FindAll* 那个"一次吐完数组"的契约 —— 在 C 里数好个数再一次
+ * 精确 malloc, Go 侧据此一次精确 make, 是该契约下的最优解。用 step 物化反而 +17% CPU / 分配翻 4 倍
+ * (数字见 cre2.h 上面那段与 match_step_bench_test.go 的 BenchmarkFindAllSub_matAll_vs_step)。
+ * 不需要全部物化的调用方走 cre2_match_all_step。 */
 int cre2_match_all(const cre2_re *h, const char *text, int textlen, int nmatch, int maxn, int **out, int *nmatches) {
 	*out = NULL;
 	*nmatches = 0;
@@ -419,10 +652,74 @@ cre2_rev_match_result cre2_partial_match_reverse(const cre2_re *h, const char *t
 	return r;
 }
 
+// ── 单条正则的反向【锚定解析】────────────────────────────────────────────────
+// 给一个匹配右端, 求最靠左的那个左端。这一句就是 RE2::Match 自己求匹配左端时走的那一句
+// (re2_re2.cc 的 UNANCHORED 分支: 正向 DFA 找到右端之后, 反向程序 kAnchored+kLongestMatch
+// 从那个右端往左跑一趟)。这里只是把它接出来单独用。
+//
+// 🔴 走 SearchDFA 而不是 Prog::SpanResolve (set 那侧用的那个): 单条 Compile 会把 ^ / $ 从
+//    程序里【摘掉】记成 anchor_start_/anchor_end_ 两个标志 (re2_compile.cc 的 IsAnchorStart/
+//    IsAnchorEnd), 而只有 SearchDFA 会去检查这两个标志 —— 绕开它自己驱动 DFA 的话, `^foo`
+//    会在正文中间也认。set 那侧没有这个问题 (CompileSet 不摘, ^ / $ 留在程序里当指令)。
+// 🔴 kLongestMatch 而不是 kManyMatch: 单条不需要 id 表 (状态更小), 而且反向程序上
+//    GetDFA(kLongestMatch) 拿的是【整份】dfa_mem_ (Prog::GetDFA 里写着"RE2 从不做反向
+//    kFirstMatch 搜索"), 与 cre2_partial_match_reverse 用的 dfa_first_ 各占各的, 不打架。
+cre2_span_resolve_result cre2_resolve_span_reverse_r(const cre2_re *h, const char *text,
+                                                     int textlen, int from, int bound) {
+	cre2_span_resolve_result r;
+	r.rc = -1;
+	r.pos = 0;
+	if (h == nullptr || textlen < 0 || from < 0 || from > textlen) {
+		return r;
+	}
+	if (bound < 0) {
+		bound = 0;
+	} else if (bound > from) {
+		bound = from;
+	}
+	re2::Prog *prog = cre2_rev_prog(h);
+	if (prog == nullptr) {
+		return r; // 反向程序编不出来 —— 调用方那边当"这条走不了"处理
+	}
+	const char *base = text ? text : "";
+	// context 恒是【整篇正文】, region 只圈定"往左看到哪为止" —— 所以 \b / ^ / $ 判的是
+	// 它在整篇正文里的真实处境, bound 只会让答案变短, 不会让它变错。
+	re2::StringPiece context(base, (size_t)textlen);
+	re2::StringPiece region(base + bound, (size_t)(from - bound));
+	re2::StringPiece m;
+	bool failed = false;
+	if (!prog->SearchDFA(region, context, re2::Prog::kAnchored, re2::Prog::kLongestMatch,
+	                     &m, &failed, nullptr, nullptr)) {
+		r.rc = failed ? -1 : 0; // failed = DFA 放弃 (预算不够); 否则就是这个右端上真没有匹配
+		return r;
+	}
+	// 反向程序的 match0 是 StringPiece(ep, text.end()-ep) —— data() 就是走到的最左位置 = 左端。
+	r.rc = 1;
+	r.pos = (int32_t)(m.data() - base);
+	return r;
+}
+
+// cre2_rev_mem_info: 这条 pattern 的【反向程序】上那份 DFA 缓存的水位。
+// 没编过反向程序 / 没建过 DFA 就 Built=0 —— GetDFAMemInfo 不会因为查询而把 DFA 建出来,
+// 但 cre2_rev_prog 会把【程序】编出来, 所以这里先看 rprog 再决定问不问。
+void cre2_rev_mem_info(const cre2_re *h, cre2_set_mem *out) {
+	memset(out, 0, sizeof *out);
+	if (h == nullptr || h->rprog == nullptr) {
+		return; // 故意不调 cre2_rev_prog: 量具不该制造被量的东西
+	}
+	re2::DFAMemInfo mi;
+	h->rprog->GetDFAMemInfo(re2::Prog::kLongestMatch, &mi);
+	out->Built = mi.built ? 1 : 0;
+	out->StateBudget = mi.state_budget;
+	out->MemLeft = mi.mem_left;
+	out->States = mi.states;
+	out->ArenaCap = mi.arena_cap;
+	out->FlushesTotal = mi.flushes_total;
+	out->StatesBuiltTotal = mi.states_built_total;
+}
+
 // ── RE2::Set 包装 ────────────────────────────────────────────────────────────
-struct cre2_set {
-	RE2::Set *set;
-};
+// struct cre2_set 的定义在 cre2_internal.h (cre2_spanscan.cpp 也要用)。
 
 cre2_set *cre2_set_new_ex(int64_t max_mem, int reversed) {
 	RE2::Options opt;

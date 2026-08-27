@@ -162,23 +162,42 @@ func (rr *RegexpReverse) MatchStats(s string, st *ScanStats) bool {
 	return r.Matched != 0
 }
 
-// NewRegexpSetReverseMaxMem 同 NewRegexpSetMaxMem, 但整个 set 反向编译: Match 从正文末尾
-// 往前扫【原始 buffer】(不反转正文, 不复制正文)。命中集与正向逐位相同, 仍然只回答"哪几条命中"。
+// NewRegexpSetReverseMaxMem 建一张【反向编译】的多正则表 (类型 RegexpSetReverse, 与正向的
+// RegexpSet 是两个类型 —— 为什么必须拆开见 regexpset_reverse.go 的文件头)。Match 从正文末尾
+// 往前扫【原始 buffer】(不反转正文, 不复制正文), 命中集与正向逐条相同。
 // maxMem 的含义与 NewRegexpSetMaxMem 完全一样 (<=0 = RE2 默认 8MB) —— 反向 set 只有这一个
 // 构造函数: 会想反着扫的表通常就是正向撞过预算的那张, 建它的时候顺手把预算定了。
 //
-// ⚠ 方向是【整个 set 一个】的选择: 一条 pattern 反着便宜不等于另一条也便宜。
-// 实践做法是把表按方向拆成两个 set, 各扫一遍 —— 正文过两遍 DFA 仍然远比一张表在悬崖上跑便宜
-// (Match 的两份结果按下标并集即可; 注意 Match 返回的下标【无序】, 要比对得先排)。
+// ⚠ 方向是【整张表一个】的选择: 一条 pattern 反着便宜不等于另一条也便宜。
+// 实践做法是把表按方向拆成两张, 各扫一遍 —— 正文过两遍 DFA 仍然远比一张表在悬崖上跑便宜
+// (两份 Match 结果按下标并集即可; 注意 Match 返回的下标【无序】, 要比对得先排)。
 // 拆之前先量: 每条 pattern 各建一个单条的正向 set 和反向 set, 用同一批真语料跑一遍比
 // MemInfo().States, 小的那边就是它该去的那一组。
-func NewRegexpSetReverseMaxMem(patterns []string, maxMem int64) (*RegexpSet, error) {
-	return newRegexpSet(patterns, maxMem, true)
+func NewRegexpSetReverseMaxMem(patterns []string, maxMem int64) (*RegexpSetReverse, error) {
+	s, err := newRegexpSet(patterns, maxMem, true)
+	if err != nil {
+		return nil, err
+	}
+	return &RegexpSetReverse{s: s}, nil
 }
 
-// Reverse 报告这个 set 是不是反向编译的。
-func (s *RegexpSet) Reverse() bool {
-	rev := C.cre2_set_reversed(s.h) != 0
-	runtime.KeepAlive(s)
-	return rev
+// MemInfo 查这条 pattern 的【反向程序】当前那份 DFA 缓存的水位 (字段含义同
+// (*RegexpSet).MemInfo)。没走过反向 (程序还没惰性编出来 / DFA 还没建) 返回 Built=false ——
+// 量具不制造被量的东西, 查询【不会】把 DFA 建出来。
+//
+// 用途与 (*RegexpSet).MemInfo 一样: 标定这条 pattern 反着走到底花了多少状态。
+// 单条反向的意义正是把状态数从指数塌回线性, 所以这个数应该【很小】; 大了就是选错方向了。
+func (rr *RegexpReverse) MemInfo() SetMemInfo {
+	var mi C.cre2_set_mem
+	C.cre2_rev_mem_info(rr.re.h, &mi)
+	runtime.KeepAlive(rr.re)
+	return SetMemInfo{
+		Built:            mi.Built != 0,
+		StateBudget:      int64(mi.StateBudget),
+		MemLeft:          int64(mi.MemLeft),
+		States:           int64(mi.States),
+		ArenaCap:         int64(mi.ArenaCap),
+		FlushesTotal:     int64(mi.FlushesTotal),
+		StatesBuiltTotal: int64(mi.StatesBuiltTotal),
+	}
 }

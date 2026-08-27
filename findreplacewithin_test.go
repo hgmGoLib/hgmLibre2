@@ -55,3 +55,86 @@ func TestFindReplaceWithin(t *testing.T) {
 		}
 	}
 }
+
+// TestAppendFindReplaceWithin 把追加版钉在 FindReplaceWithin 上:
+//   ① changed ⟺ 结果与 src 逐字节不同 (不是"命中了没");
+//   ② changed=true 时 dst 末尾多出来的那一段 == FindReplaceWithin 的返回值;
+//   ③ changed=false 时 dst 一个字节都没动 (len 与内容都不变);
+//   ④ 追加语义: dst 里原有内容原样留在前面, 不被覆盖。
+// 用例复用上面那张表 (同一批形态), 另外每条都在一块非空 dst 上再跑一遍。
+func TestAppendFindReplaceWithin(t *testing.T) {
+	cases := []struct{ find, strip, repl, src string }{
+		{`(?i)i[\s._-]{0,2}g[\s._-]{0,2}n[\s._-]{0,2}o[\s._-]{0,2}r[\s._-]{0,2}e`, `[\s._-]`, "",
+			`please i-g-n-o-r-e the rest of this line`},
+		{`(?i)i[\s._-]{0,2}g[\s._-]{0,2}n[\s._-]{0,2}o[\s._-]{0,2}r[\s._-]{0,2}e`, `[\s._-]`, "",
+			`ignore the noise`}, // 命中但删 0 字符 → changed=false
+		{`(?i)i[\s._-]{0,2}g[\s._-]{0,2}n[\s._-]{0,2}o[\s._-]{0,2}r[\s._-]{0,2}e`, `[\s._-]`, "",
+			`version 1.2.3 and co-operate`}, // 无匹配
+		{`(?i)i[\s._-]{0,2}g[\s._-]{0,2}n[\s._-]{0,2}o[\s._-]{0,2}r[\s._-]{0,2}e`, `[\s._-]`, "", ``},
+		{`(?i)i[\s._-]{0,2}g[\s._-]{0,2}n[\s._-]{0,2}o[\s._-]{0,2}r[\s._-]{0,2}e`, `[\s._-]`, "",
+			`i.g.n.o.r.e then i_g_n_o_r_e twice`},
+		{`(?i)i[\s._-]{0,2}g[\s._-]{0,2}n[\s._-]{0,2}o[\s._-]{0,2}r[\s._-]{0,2}e`, `[\s._-]`, "", `i-g-n-o-r-e`},
+		{`\d+(?:-\d+)+`, `(\d+)`, `[\1]`, `id 12-34-56 end`},
+		{`(?i)o[\s\x{00ad}._-]{0,2}v[\s\x{00ad}._-]{0,2}e[\s\x{00ad}._-]{0,2}r`, `[\s\x{00ad}._-]`, "",
+			"o­v­e­r ride"},
+	}
+	const prefix = "PREFIX|"
+	for _, c := range cases {
+		find := MustCompile(c.find)
+		strip := MustCompile(c.strip)
+		want := find.FindReplaceWithin(strip, c.src, c.repl)
+		wantChanged := want != c.src
+
+		out, changed := find.AppendFindReplaceWithin(nil, strip, c.src, c.repl)
+		if changed != wantChanged {
+			t.Errorf("changed 不是 `结果 != src`\n src=%q got=%v want=%v", c.src, changed, wantChanged)
+		}
+		if changed && string(out) != want {
+			t.Errorf("追加出来的那一段与 FindReplaceWithin 不一致\n src=%q\n  got=%q\n want=%q", c.src, out, want)
+		}
+		if !changed && len(out) != 0 {
+			t.Errorf("changed=false 却往 dst 上写了 %d 字节 (src=%q)", len(out), c.src)
+		}
+
+		// 非空 dst: 前缀必须原样留着, 新内容只能追加在后面。
+		dst := append([]byte(nil), prefix...)
+		out2, changed2 := find.AppendFindReplaceWithin(dst, strip, c.src, c.repl)
+		if changed2 != wantChanged {
+			t.Errorf("非空 dst 上 changed 变了 (src=%q): got=%v want=%v", c.src, changed2, wantChanged)
+		}
+		if string(out2[:len(prefix)]) != prefix {
+			t.Errorf("dst 原有内容被覆盖了 (src=%q): %q", c.src, out2[:len(prefix)])
+		}
+		if changed2 {
+			if string(out2[len(prefix):]) != want {
+				t.Errorf("非空 dst 上追加的那一段不对 (src=%q)\n  got=%q\n want=%q", c.src, out2[len(prefix):], want)
+			}
+		} else if len(out2) != len(prefix) {
+			t.Errorf("changed=false 却动了 dst (src=%q): len=%d want=%d", c.src, len(out2), len(prefix))
+		}
+	}
+}
+
+// TestAppendFindReplaceWithinReusesBuf 钉住这套 API 存在的理由: 同一块底反复调, 稳态零 Go 堆分配
+// (FindReplaceWithin 那边每趟都要现开一个 string)。
+func TestAppendFindReplaceWithinReusesBuf(t *testing.T) {
+	find := MustCompile(`(?i)i[\s._-]{0,2}g[\s._-]{0,2}n[\s._-]{0,2}o[\s._-]{0,2}r[\s._-]{0,2}e`)
+	strip := MustCompile(`[\s._-]`)
+	src := ""
+	for i := 0; i < 2000; i++ {
+		src += "xxxx i-g-n-o-r-e yyyy "
+	}
+	buf := make([]byte, 0, len(src))
+	warm := func() {
+		out, changed := find.AppendFindReplaceWithin(buf[:0], strip, src, "")
+		if !changed {
+			t.Fatal("这份夹具应当有改动")
+		}
+		buf = out
+	}
+	warm() // 先把底喂到位
+	n := testing.AllocsPerRun(20, warm)
+	if n != 0 {
+		t.Errorf("同一块底反复调应当零 Go 堆分配, 实测 %.1f 次/趟", n)
+	}
+}

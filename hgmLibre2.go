@@ -77,11 +77,59 @@ func Compile(pattern string) (*Regexp, error) { return CompileMaxMem(pattern, 0)
 // 怎么标定: 拿一批【互不相同】的真语料单线程跑一遍, 看 RegexpReverse.MatchStats/ScanStats 的
 // Flushes 或进程级 DFAStats().Resets 增量; >0 就翻倍重来, 直到增量归零。
 func CompileMaxMem(pattern string, maxMem int64) (*Regexp, error) {
+	return compileMaxMem(pattern, maxMem, false)
+}
+
+// CompileLongest 同 Compile, 但这条 pattern 的匹配口径是 leftmost-longest (POSIX),
+// 而不是 RE2/PCRE 默认的 leftmost-first (贪心)。等价于 stdlib 的 re.Longest()。
+func CompileLongest(pattern string) (*Regexp, error) { return CompileLongestMaxMem(pattern, 0) }
+
+// CompileLongestMaxMem 同 CompileMaxMem, 但口径是 leftmost-longest。
+//
+// ── 两者差在哪 ───────────────────────────────────────────────────────────────
+// 起点【完全相同】(都是最靠左的那个能起头的位置), 只在终点上分歧: 贪心给的是 NFA 指令
+// 优先序先撞上的那个终点, longest 给的是同一起点上最长的那个。
+//
+//	abc|b     撞 "abc"   贪心 [0,3)   longest [0,3)   ← 同一起点, 这里恰好同解
+//	a|ab      撞 "ab"    贪心 [0,1)   longest [0,2)   ← 差在这儿
+//
+// ── 什么时候要它 ─────────────────────────────────────────────────────────────
+// 调用方要的是"从某处起【最长】的那个匹配"时。没有它就得两趟: 先贪心搜一次定起点, 再另找
+// 一条路 (锚定解析) 把终点重取成最长。有了它是一趟的事, 而且这一趟走的是 RE2::Match 那条
+// 完整的路 —— DFA 放弃了还能退到 OnePass/BitState/NFA, 不像 set 那侧的锚定解析是 DFA 独一条。
+//
+// 🔴 【截断是有后果的】: 变长 pattern 取到短的那个终点 = 把命中截断, 下游拿 text[Lo:Hi] 去过
+//    校验位 (身份证 · IBAN mod-97 · Luhn) 会失败, 整条真命中被自己毙掉 = 无声漏报。
+//    所以"要位置再拿去判"的调用方一律该用这一个。
+//
+// 🔴 longest 是【编译期】的事 (它定的是 RE2 内部搜索的 MatchKind), 所以它是另一个对象,
+//    不是某个方法上的开关。要两个口径就编两个对象。
+func CompileLongestMaxMem(pattern string, maxMem int64) (*Regexp, error) {
+	return compileMaxMem(pattern, maxMem, true)
+}
+
+// MustCompileLongest 同 CompileLongest, 失败 panic。
+func MustCompileLongest(pattern string) *Regexp {
+	re, err := CompileLongest(pattern)
+	if err != nil {
+		panic(`re2native: CompileLongest(` + strings.TrimSpace(pattern) + `): ` + err.Error())
+	}
+	return re
+}
+
+// compileMaxMem 是 CompileMaxMem 与 CompileLongestMaxMem 的同一份实现 —— 两者只差一个
+// 编译期 option。
+func compileMaxMem(pattern string, maxMem int64, longest bool) (*Regexp, error) {
 	if len(pattern) > maxCInt {
 		return nil, errors.New("re2native: pattern too large (>2GiB)")
 	}
 	p := strBytePtr(pattern)
-	h := C.cre2_new_max_mem(p, C.int(len(pattern)), C.int64_t(maxMem))
+	var h *C.cre2_re
+	if longest {
+		h = C.cre2_new_longest_max_mem(p, C.int(len(pattern)), C.int64_t(maxMem))
+	} else {
+		h = C.cre2_new_max_mem(p, C.int(len(pattern)), C.int64_t(maxMem))
+	}
 	runtime.KeepAlive(pattern)
 	if h == nil {
 		return nil, errors.New("re2native: out of memory")
@@ -156,16 +204,23 @@ func (re *Regexp) NumSubexp() int { return re.numSubexp }
 // SubexpNames 返回各捕获组的名字 (下标 0 为整体匹配, 恒为 "").
 func (re *Regexp) SubexpNames() []string { return re.subexpNames }
 
-// findFrom 返回从 pos 起【非锚定】下一处匹配的子组区间 (长度 2*(numSubexp+1) 的 [start,end) 对,
-// 未参与的组为 -1,-1), 无匹配返回 nil. 等价 stdlib doExecute(pos).
-func (re *Regexp) findFrom(s string, pos int) []int {
+// findWithin 返回在 s 的 [from,bound) 这一段里【非锚定】的下一处匹配的子组区间
+// (长度 2*(numSubexp+1) 的 [start,end) 对, 未参与的组为 -1,-1), 无匹配返回 nil.
+// from=0 · bound=len(s) 时等价 stdlib doExecute(0).
+//
+// 🔴 整串 s 始终喂给 RE2 当 context, from/bound 只圈定"在哪一段里找" —— ^ / $ /  看到的
+//    是真实邻字节, 而不是 s[from:bound] 切完之后的假邻居.
+func (re *Regexp) findWithin(s string, from, bound int) []int {
 	if len(s) > maxCInt { // 超 C.int 的输入直接当无匹配, 不让 len/pos 溢出成错偏移
+		return nil
+	}
+	if from < 0 || bound > len(s) || from > bound { // 越界一律当无匹配, 不让 C 侧拿到坏区间
 		return nil
 	}
 	nmatch := re.numSubexp + 1
 	cbuf := make([]C.int, 2*nmatch)
 	tp := strBytePtr(s)
-	ok := C.cre2_match_at(re.h, tp, C.int(len(s)), C.int(pos), &cbuf[0], C.int(nmatch)) != 0
+	ok := C.cre2_match_at(re.h, tp, C.int(len(s)), C.int(from), C.int(bound), &cbuf[0], C.int(nmatch)) != 0
 	runtime.KeepAlive(s)
 	runtime.KeepAlive(re)
 	if !ok {
@@ -203,7 +258,7 @@ func (re *Regexp) MatchString(s string) bool {
 
 // FindStringIndex 返回最左匹配的 [start,end), 无匹配返回 nil.
 func (re *Regexp) FindStringIndex(s string) []int {
-	m := re.findFrom(s, 0)
+	m := re.findWithin(s, 0, len(s))
 	if m == nil {
 		return nil
 	}
@@ -212,7 +267,7 @@ func (re *Regexp) FindStringIndex(s string) []int {
 
 // FindString 返回最左匹配的文本, 无匹配返回 "".
 func (re *Regexp) FindString(s string) string {
-	m := re.findFrom(s, 0)
+	m := re.findWithin(s, 0, len(s))
 	if m == nil {
 		return ""
 	}
@@ -221,7 +276,7 @@ func (re *Regexp) FindString(s string) string {
 
 // FindStringSubmatch 返回最左匹配 + 各子组文本, 无匹配返回 nil.
 func (re *Regexp) FindStringSubmatch(s string) []string {
-	m := re.findFrom(s, 0)
+	m := re.findWithin(s, 0, len(s))
 	if m == nil {
 		return nil
 	}
@@ -230,9 +285,15 @@ func (re *Regexp) FindStringSubmatch(s string) []string {
 
 // FindStringSubmatchIndex 返回最左匹配 + 各子组的 index 区间, 无匹配返回 nil.
 func (re *Regexp) FindStringSubmatchIndex(s string) []int {
-	return re.findFrom(s, 0)
+	return re.findWithin(s, 0, len(s))
 }
 
+// 保留 (2026-08-26 量过才决定的, 别再改回 step): 本函数服务 FindAll* 的"一次吐完"契约。
+// 曾试过把它换成"内部 step 到底、边走边物化", 结果是净亏 —— C 侧那笔 vector+malloc 是省了,
+// 但 Go 侧 append 阶梯累计收敛到 5N, 实测 20000 处命中 1.45MB/4 笔 → 5.70MB/26 笔, CPU +17%
+// (BenchmarkFindAllSub_matAll_vs_step)。要"不物化"的调用方请直接用 StepAll* (match_step.go),
+// 别为了统一形状把这条路也改了。
+//
 // matchAllFlat 跑批量全匹配 (单次 cgo), 把 C 返回的所有匹配 index 一次性拷进【单块】Go []int 返回:
 // 每处匹配 per=2*(numSubexp+1) 个 int (group0.start,group0.end, group1.start,...; 未参与组 -1,-1),
 // 顺序排布. 无匹配返回 nil,0.
@@ -240,7 +301,7 @@ func (re *Regexp) FindStringSubmatchIndex(s string) []int {
 // 两件事下沉/合并:
 //   1. 「逐处匹配」循环在 C 的 cre2_match_all 里一次跑完 → cgo 跨界从 O(匹配数) 压成 1 次.
 //   2. 结果只在这一块 flat 上分配一次; Find* 系列直接对它切片 (见各方法), 不再每匹配 make 小 slice
-//      → 分配次数从 O(匹配数) 压成 O(1). 大正文多命中时这是分配次数的大头 (defillage 等).
+//      → 分配次数从 O(匹配数) 压成 O(1). 大正文多命中时这是分配次数的大头 (大表凭据扫描等).
 //
 // 内存正确性: flat 是本次调用的局部块 (并发各自持有, 不挂 re); re.h 只读, RE2 Match 可并发.
 // cflat 是 C malloc 内存上的视图, 仅在 C.free 前一次性拷出, 拷完即 free, 不外泄 C 指针.
