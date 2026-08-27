@@ -21,11 +21,16 @@
 // "第三种口径"讲的就是这件事的代价。反向交出来的是【左端】= 起点, 而 leftmost/rightmost-longest
 // 这个口径本来就定义在起点上, 所以这一层【没有】"猜"这一步:
 //
-//	反向 set FindAllIndex                       → 匹配左端, 按扫描方向 (从右往左) 单调
-//	正向 set ResolveSpanWithin(from=左端, bound=游标) → 【最长】右端, 且绝不越过游标
+//	反向 set FindAllIndex                                  → 匹配左端, 按扫描方向 (从右往左) 单调
+//	正向【单条】FindStringIndexAtWithin(from=左端, bound=游标) → 【最长】右端, 且绝不越过游标
 //
 // 于是: 没有路 A / 路 B 之分, 没有 spanFast 这一档, 也不需要 maxL 窗口。每处命中恒等于
-// "一次锚定解析", 代价 = 这处命中有多长, 与正文长度无关。
+// "一趟锚定搜索", 代价 = 这处命中有多长, 与正文长度无关。
+//
+// 🔴 补右端那一趟走的是【这一条 pattern 自己的单条对象】(longest 口径编的), 不是"一条
+//    pattern 的 set" (2026-08-27 换掉的)。理由与正向那侧一字不差: 单条走 RE2::Match 那条
+//    带 NFA 回退的完整路 · 状态更小 · 不去冲刷整表那份 DFA 缓存。见 regexpset.go 的
+//    rev1/fwd1 那段。
 //
 // ── 为什么"从右往左"仍然一个字节都不用攒 ─────────────────────────────────────
 //
@@ -79,6 +84,8 @@ type MatchScannerReverse struct {
 	mode  []MatchScanMode_t // 每条要什么 (见 SetModes); nil = 全走默认档
 	hit   []bool
 	hits  []int32 // 上一遍命中过的下标 (= Set.Match 那张表), 去重且只含真命中
+	// findCtx 是补右端那一趟的复用 scratch (稳态零分配)。
+	findCtx *FindStringIndex_ctx_t
 	// scanErr 是本遍出的错 (回调里发现的, Scan 收尾时交出去)。与正向那个同解。
 	scanErr error
 	// out 是那块固定的输出缓冲 (长度恒为 matchScanBatch), outN 是已填几处。
@@ -96,7 +103,8 @@ type msrPat_t struct {
 	fixed    bool
 	started  bool  // 本遍这一条的游标已经置到正文末尾了
 	minL     int32
-	fwd      *RegexpSet // 这一条自己一条的【正向 set】, 惰性建; 拿它 ResolveSpanWithin 取最长右端
+	fwd      *Regexp // 这一条自己那条【正向 · longest】正则, 惰性建;
+	//                  拿它 FindStringIndexAtWithin (锚定在左端) 取最长右端
 	cur      int32      // 已吐出去那一处的【左端】: 新命中必须整个落在 [0, cur)
 	lastHi   int32      // 上一条游程的右端, 用来确认降序
 }
@@ -119,6 +127,8 @@ func (r *RegexpSetReverse) NewMatchScanner() (m *MatchScannerReverse, unsupporte
 		per:   make([]msrPat_t, r.s.size),
 		hit:   make([]bool, r.s.size),
 		out:   make([]SetMatch, matchScanBatch),
+
+		findCtx: NewFindStringIndex_ctx(),
 	}
 	for i := 0; i < r.s.size; i++ {
 		p := &m.per[i]
@@ -302,9 +312,12 @@ func (m *MatchScannerReverse) feed(i int, lo, hi int32) {
 		p.lastHi = p.cur
 	}
 	if !p.fixed && p.fwd == nil {
-		// 变长: 右端靠这一条自己那份【正向 set】锚定往右伸。定长不用建任何对象。
+		// 变长: 右端靠这一条自己那条【正向 · longest 单条】正则锚定往右伸。定长不用建任何对象。
 		// 惰性 —— 没被真问到位置的 pattern 一份都不占。
-		if p.fwd = m.set.s.forwardSetOne(i); p.fwd == nil {
+		// 🔴 单条而不是"一条 pattern 的 set": 与正向那侧同一条理由 (见 regexpset.go 的
+		//    rev1/fwd1 那段) —— 走 RE2::Match 那条带 NFA 回退的完整路, 状态更小,
+		//    也不去冲刷整表那份 DFA 缓存。
+		if p.fwd = m.set.s.forwardOne(i); p.fwd == nil {
 			m.failCompile(i)
 			return
 		}
@@ -332,18 +345,13 @@ func (m *MatchScannerReverse) feed(i int, lo, hi int32) {
 		}
 		// 🔴 bound = cur: 往右伸【绝不越过游标】。是正确性不是省钱, 见上面 ②。
 		// 顺带它把解析代价钉成"离游标多远", 与正文长度无关。
-		// 🔴 ResolveSpanWithin 给的是【最长】的那个右端 —— 取最短就是把命中截断,
-		//    下游拿去做定长校验会把真命中判成假 (见 spanresolve.go 那段红字)。
-		end, ok, err := p.fwd.ResolveSpanWithin(m.text, s, p.cur, 0)
-		if err != nil {
-			// DFA 放弃 (预算不够) —— 不是"没有匹配"。这一层不猜、不静默跳过, 整遍报错。
-			m.failResolve(i, err)
-			return
-		}
-		if !ok {
+		// 🔴 p.fwd 是 longest 口径编的, 所以"锚定在 s"这一句给的是【最长】的那个右端 ——
+		//    取最短就是把命中截断, 下游拿去做定长校验会把真命中判成假。
+		loc := m.findCtx.FindStringIndexAtWithin(p.fwd, m.text, int(s), int(p.cur))
+		if loc == nil {
 			continue // 这个左端在游标底下伸不出一个完整匹配
 		}
-		m.emit(i, s, end)
+		m.emit(i, s, int32(loc[1]))
 		p.cur = s
 	}
 }
@@ -357,20 +365,3 @@ func (m *MatchScannerReverse) Hit(i int) bool {
 	return i >= 0 && i < len(m.hit) && m.hit[i]
 }
 
-// ForwardSetOneStats 报【已经被建出来】的那些单条正向 set 的账: 几条 · 状态数合计 ·
-// 状态区实际字节合计。惰性建 ⟹ 没被问过位置的 pattern 一条都不占。
-// 与 (*RegexpSet).ReverseOneStats 是同一个用途 (量内存去哪了) 的镜像, 不制造状态。
-func (r *RegexpSetReverse) ForwardSetOneStats() (n int, states, arenaCap int64) {
-	r.s.fwdSet1Mu.Lock()
-	defer r.s.fwdSet1Mu.Unlock()
-	for _, f := range r.s.fwdSet1 {
-		if f == nil {
-			continue
-		}
-		mi := f.MemInfo()
-		n++
-		states += mi.States
-		arenaCap += mi.ArenaCap
-	}
-	return n, states, arenaCap
-}

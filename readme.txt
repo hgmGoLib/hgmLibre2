@@ -142,6 +142,34 @@
       把 x{2,19} 展成"必需拷贝在前", 反序之后可选嵌套跑到读取顺序前面, 活跃起点集合互相嵌套
       而不是任意子集。同一条语言同一串字节实测 17 状态 vs 手写反转 25247 状态。
       详见 README.md#scanning-backwards。
+    - CompileLongest / CompileLongestMaxMem / MustCompileLongest: 单条 Regexp 的
+      【leftmost-longest (POSIX) 口径】编译入口, 等价于 stdlib 的 re.Longest()。
+      与默认的 leftmost-first (贪心) 选【同一个起点】, 只在终点上分歧: a|ab 撞 "ab" 贪心给
+      [0,1), longest 给 [0,2)。
+      🔴 为什么要它: 调用方要"从某处起【最长】的那个匹配"时, 没有它就得两趟 (先贪心搜一次
+         定起点, 再另找一条锚定的路把终点重取成最长); 有了它是一趟的事。MatchScanner 的
+         默认档 2026-08-27 就是这么从两趟压成一趟的。
+      🔴 变长 pattern 上取到贪心那个短终点 = 把命中截断, 下游拿 text[Lo:Hi] 去过校验位
+         (身份证 · IBAN mod-97 · Luhn) 会失败, 整条真命中被自己毙掉 = 无声漏报。所以"要位置
+         再拿去判"的调用方一律该用这一个。
+      🔴 longest 是【编译期】的事 (它定的是 RE2 内部搜索的 MatchKind), 所以它是另一个对象,
+         不是某个方法上的开关 —— 与 Regexp / RegexpReverse 分家同一个道理。
+    - Regexp.FindStringIndexAtWithin(s, from, bound) (+ FindStringIndex_ctx_t 上的同名零分配版):
+      【锚定在 from】的一次搜索 —— 起点必须就是 from, 不是就返回 nil; 整个匹配不越过 bound。
+      与 FindStringIndexFrom 的差别只有"锚不锚": 那个是"起点不早于 pos", 这个是"起点就是 pos"。
+      参数都是【原串偏移】, 整串照样喂给 RE2 ⟹ \b / ^ / $ 看到的是真实邻字节, 不必自己切片。
+      配 CompileLongest* 的对象用, 给的就是"从 from 起、不越过 bound 的【最长】那个匹配"——
+      也就是 set 那侧 ResolveSpan 干的事, 只是走的是 RE2::Match 那条带 NFA 回退的完整路,
+      而且不需要一个 set (状态更小, 也不冲刷整表那份 DFA 缓存)。
+    - RegexpReverse.ResolveSpanWithin(text, from, bound): 【单条】的反向锚定解析 ——
+      给一个匹配右端 from(不含), 返回最靠左的那个左端(含), bound 是回看的左下界(负数=不限)。
+      语义与 RegexpSetReverse 上那个同名方法逐字相同, 差别只在对象是一条 pattern 还是一张表。
+      实现就是 RE2::Match 自己求匹配左端时走的那一句 (反向程序 + kAnchored + kLongestMatch)。
+      🔴 别拿"一条 pattern 的 set"去凑: 那是 kManyMatch 的 DFA (每个状态多背一张 id 表), 而且
+         set 与单条对 ^ / $ 的处理【不是同一条代码路】—— 单条 Compile 会把 ^ / $ 摘成两个
+         标志, 只有 SearchDFA 会去查它们。
+    - RegexpReverse.MemInfo(): 这条 pattern 的反向程序那份 DFA 缓存水位 (字段同 RegexpSet.MemInfo)。
+      没走过反向就 Built=false —— 量具不制造被量的东西。
     - CompileMaxMem(pattern, maxMem) / MaxMem(): 单条 Regexp 的内存预算 (以前只有 Set 能调,
       单条硬吃 RE2 默认 8MB)。同一个旋钮抬两条天花板 (编译期指令数上限 + 运行期 DFA 状态缓存额度),
       口径与 NewRegexpSetMaxMem 完全一致。实测同上那条 pattern × 60 份 16KB 语料:
@@ -290,17 +318,42 @@
          一个答案 (见下面"跨 pattern 一概不合并")。
       怎么做到的 (三条腿, 详见 doc/MatchScanner的leftmost-longest保证.md):
         定长 (min == max)  Lo = Hi - min, 一句减法, 不进正则引擎。起点唯一 ⟹ 可论证。
-        变长 (默认档)      从 max(游标, Hi-maxL) 起做一次【正向非锚定】搜索拿最左起点, 再从
-                           这个起点锚定取最长右端 —— 那就是 leftmost-longest 的定义本身,
-                           不挑 pattern 形状。整串 + startpos, 不切片 ⟹ \b / ^ / $ 看到的
-                           是真实邻字节。代价: 每处比 spanFast 贵约 1.6x, 无上界的条目还要
-                           走完空隙 (各轮窗口两两不交且递增, 累加封顶 = 多扫一遍正文, 2.00x)。
+        变长 (默认档)      【一趟】: 从 max(游标, Hi-maxL) 起做一次正向非锚定搜索, 直接拿到
+                           leftmost-longest 的整段区间。用的是这一条自己那条【longest 口径】
+                           的单条 Regexp (CompileLongestMaxMem) —— longest 与贪心【选同一个
+                           起点】, 只在终点上分歧, 所以换成 longest 口径就能起点终点一次给
+                           全, 不必再跑第二趟去重取最长终点。整串 + startpos, 不切片 ⟹
+                           \b / ^ / $ 看到的是真实邻字节。
+                           代价: 无上界的条目要走完空隙 (各轮窗口两两不交且递增, 累加封顶
+                           = 多扫一遍正文, 2.00x)。
         补不出来的         Scan 整遍报错, 请调用方整篇照老路 FindAll —— 宁可退回去也不给
                            "像是对的"答案。
 
+      ── 🔴 一条总规矩: 扫正文走 set, 补端点【全走单条对象】────────────────────
+      2026-08-27 定的。扫正文那一遍走整表 set (那正是这一层存在的理由), 之后补端点的每一趟
+      都走【这一条 pattern 自己的单条对象】, 一趟都不再回 set。三条理由:
+        ① 单条走的是 RE2::Match 那条完整的路 (DFA → OnePass/BitState/NFA 逐级回退), DFA
+           放弃了还有下家; set 那侧的锚定解析是 kManyMatch 的 DFA 独一条, 没有下家 ——
+           "DFA 放弃"在那边只能整遍失败。
+        ② 补端点的流量不再冲刷整表那份大 DFA 缓存 (真表 155 条那份), 两边互不干扰。
+        ③ 状态更小: 单条不必背 kManyMatch 每个状态那张 id 表。
+      各条路要几趟:
+        定长      0 趟 (一句减法)
+        默认档    1 趟  正向单条 longest 非锚定 (FindStringIndexFrom)
+        spanFast  2 趟  反向单条锚定 (RegexpReverse.ResolveSpanWithin) → 正向单条 longest
+                        锚定 (FindStringIndexAtWithin)
+        反向那侧  1 趟  正向单条 longest 锚定 (FindStringIndexAtWithin, bound 掐在游标上)
+      换掉之后【答案一字不差】(matchscan_paths_test.go: 两条路各 300 轮 AST 生成语料,
+      共对账 5.4 万处区间, 与旧的 set 路子逐字节相同)。价钱 (64KB 语料 · benchPats ·
+      BenchmarkMatchScanOldVsNew, 新旧两套在同一个二进制里对照):
+        命中密集  默认档 968µs → 618µs (-36%) · spanFast 614µs → 447µs (-27%)
+        命中稀疏  两条路持平 (那一档的时间全在走空隙上)
+        零命中    持平 (根本不补端点)
+
       ── spanFast: 什么时候才该挂 ──────────────────────────────────────────────
-      它强制走【游标启发式】那条路: 从右端往左锚定回推一次拿最靠左的起点, 代价与正文长度无关
-      (这是它比默认档便宜的全部原因)。给的是【第三种口径】, 既不是 leftmost-first 也不是
+      它强制走【游标启发式】那条路: 从右端往左锚定回推一次拿最靠左的起点 (反向单条), 再从那个
+      起点锚定取最长右端 (正向单条 longest) —— 两趟的代价都与正文长度无关, 这是它比默认档
+      便宜的全部原因 (默认档只要一趟, 贵在无上界的条目要走完空隙)。给的是【第三种口径】, 既不是 leftmost-first 也不是
       leftmost-longest: 随机撒 3000 条变长 pattern × 40 段正文 = 12 万处对账, 与 FindAll 相同
       119940, 与 Longest 相同 119972, 两个都不是 28。根子在这一遍扫描给的是【右端集合】,
       里面既没有 (起点,终点) 的配对也没有优先序 —— 要"所有右端"只能用 kManyMatch, 而它正是
@@ -333,7 +386,11 @@
                                          三种来由都是 maxMem 配小了:
                                            · 底下那遍 FindAllIndex 自己失败;
                                            · 补端点要的那个单条对象编不出来;
-                                           · 锚定解析时 DFA 放弃 (arena 撞到 maxMem)。
+                                           · spanFast 那一档反向锚定解析时 DFA 放弃。
+                                         🔴 最后这条 2026-08-27 之后【只剩 spanFast 会碰到】:
+                                            另外两趟改走单条 RE2::Match 了, 那条路 DFA 放弃
+                                            还能退到 OnePass/BitState/NFA。反向锚定 RE2 自己
+                                            也只有 DFA 一条路 (它内部求匹配左端就是这么干的)。
                                          另有一种"游程不按扫描方向单调" —— 那是【本库的
                                          不变量崩了】= bug, 也从这里以 err 交出来, 不吞。
 
@@ -350,9 +407,11 @@
       🔴 顺带一句为什么不能"退化成 NFA": set 这条路上【根本没有 NFA】。单条正则有回退
          (re2_re2.cc 里那一串 "Fall back to NFA below"), 但 RE2::Set::Match 自己就是 DFA-only
          (re2_set.cc:216, dfa_failed ⟹ 直接 return false) —— NFA 那套接口不回答"命中的是哪
-         一条", 而 set 用的 kManyMatch 的 id 是 DFA 状态里那串 id 列表给的。要给 set 的锚定
-         解析配 NFA, 只能给每条 pattern 单独编一个 \A(?:pat) 的 RE2 对象, 那正是 ResolveSpan
-         存在的全部理由被推翻。
+         一条", 而 set 用的 kManyMatch 的 id 是 DFA 状态里那串 id 列表给的。
+      🔴 2026-08-27 的做法就是【顺着这句话走】: 补端点那几趟本来就只关心【一条】pattern,
+         所以把它们全换成单条对象 —— 单条那侧 NFA 回退是现成的, 于是默认档那一趟和 spanFast
+         的第二趟, "DFA 放弃"这件事根本不再发生。剩下 spanFast 的第一趟 (反向锚定) 还是
+         DFA 独一条, 因为 RE2 自己求匹配左端也只有这一条路。
 
       (旧版: Scan 返回一张 unresolved 名单, 每条带 {Index, Reason, ResumeFrom} 断点。拆掉的
        理由就是上面那条 —— 断点是对的, 但它服务的是一个调用方永远验不了的分支。)
@@ -367,11 +426,12 @@
          能边扫边收口是因为同一条 pattern 的游程【跨批次也是升序】(正向扫本来就从左往右走;
          真表 196744 条游程 / 50 批, 乱序 0 处)。万一乱序, Scan 整遍报错 (那是库的 bug)。
 
-      🔴 反向必须是【一条一个 set】, 整表建一个反向 set 是死路 —— set 里状态数是相乘的
+      🔴 反向必须是【一条一个】, 整表建一个反向 set 是死路 —— set 里状态数是相乘的
          (doc/状态数为什么会相乘.txt): 155 条的真实规则表, 正向 6.4MB 上 18ms / 零 flush,
-         整表反向 65 秒 / arena 顶满 254MB 还在 flush。拆成一条一个就没有这个乘法; 而且这些
-         反向 set 【从不用来扫正文】, 只做锚定解析, 起点只有一个, 爆炸机制从根上不存在。
+         整表反向 65 秒 / arena 顶满 254MB 还在 flush。一条一个就没有这个乘法; 而且这些
+         反向对象【从不用来扫正文】, 只做锚定解析, 起点只有一个, 爆炸机制从根上不存在。
          惰性建 + 便宜得出奇: 真表上被问到的 32 条一共才 973 个状态 / 2.0MB (ReverseOneStats)。
+         (2026-08-27 起这些反向对象是【单条 RegexpReverse】而不是一条 pattern 的反向 set。)
 
       🔴 【只在同一条 pattern 内部去重, 跨 pattern 一概不合并】: 两条 pattern 撞在同一片正文上
          不是重复, 是两个问题各要一个答案 (带空格的和不带空格的两条, 下游正是靠"这段里有没有
@@ -403,8 +463,7 @@
         按正文长度: 真语料 8KB 以下打平 (1.0×) · 32KB 3.1× · 512KB 6.1× · 2MB 14×
         最坏 (每 38 字节一处命中的合成串): 0.94×, 即 6% 慢 —— 每处命中要两次 cgo 往返,
         正文短到几乎全是命中时这笔固定开销赢不了。真 base64 碎片不长这样 (打平)。
-    - RegexpSetReverse.NewMatchScanner + (*MatchScannerReverse).SetModes / Scan / HitIDs / Hit / Close
-      + RegexpSetReverse.ForwardSetOneStats:
+    - RegexpSetReverse.NewMatchScanner + (*MatchScannerReverse).SetModes / Scan / HitIDs / Hit / Close:
       【反向 MatchScanner】—— 与上面那个是镜像, 从正文末尾往前一遍扫, 同样一批一批交出不重叠的
       命中区间。用法逐字相同 (换成 rs.NewMatchScanner() 即可), 只有两处不一样:
         ① 交出来的区间按 Lo 【降序】(正向是升序);
@@ -431,10 +490,12 @@
       正向那一遍 DFA 交出来的是匹配【右端】, 起点得在 Go 这侧猜回去 (spanFast 那一整节的
       "第三种口径"讲的就是这件事的代价)。反向交出来的是【左端】= 起点, 而 leftmost/rightmost-
       longest 这个口径本来就定义在起点上 ⟹ 这一层【没有猜这一步】:
-        反向 set FindAllIndex                          → 匹配左端, 按扫描方向 (从右往左) 单调
-        正向 set ResolveSpanWithin(from=左端, bound=游标) → 【最长】右端, 且绝不越过游标
+        反向 set FindAllIndex                                     → 匹配左端, 按扫描方向 (从右往左) 单调
+        正向【单条】FindStringIndexAtWithin(from=左端, bound=游标) → 【最长】右端, 且绝不越过游标
       于是没有路 A / 路 B 之分, 没有 spanFast 这一档 (配了当场报错), 也不需要 maxL 窗口 ——
-      每处命中恒等于一次锚定解析, 代价 = 这处命中有多长, 与正文长度无关。
+      每处命中恒等于一趟锚定搜索, 代价 = 这处命中有多长, 与正文长度无关。
+      🔴 补右端那一趟走的是【这一条 pattern 自己的单条 longest 对象】, 不是"一条 pattern 的
+         set" (2026-08-27 换掉的, 理由见上面那条总规矩)。
       🔴 顺带解掉了正向那边接不了的一族: 正向默认档要 maxL 才框得出回看窗口, 【没有长度上限】
          的 pattern (邮箱那种) 框不出来; 反向这一侧根本不需要窗口。
 

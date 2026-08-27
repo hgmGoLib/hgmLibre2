@@ -51,8 +51,13 @@
 //	                                 想写回归测试就写 —— 扔一条 a* 进去必然报出它。
 //	Scan 的 err                      这一遍不算数, 整篇走老路 FindAll。三种来由都是
 //	                                 maxMem 配小了 (底下那遍 FindAllIndex 失败 / 单条对象
-//	                                 编不出来 / 锚定解析放弃), 另有一种"游程乱序"是本库
-//	                                 的 bug。
+//	                                 编不出来 / 路 A 的反向锚定解析放弃), 另有一种"游程乱序"
+//	                                 是本库的 bug。
+//
+// 🔴 2026-08-27 之后, 补端点这一步【只剩路 A 的第一趟】还会出 "DFA 放弃" 这种 err:
+//    另外两处 (路 B 的那一趟 · 路 A 的第二趟) 都改走单条对象的 RE2::Match 了, 那条路上
+//    DFA 放弃了还能退到 OnePass/BitState/NFA, 不会把"算不出来"冒出来。路 A 的第一趟是
+//    反向锚定, RE2 自己也只有 DFA 一条路 (它内部求匹配左端就是这么干的), 所以那一处留着。
 //
 // 🔴 为什么不做成"部分成功": 一个调用方【造不出来】的错误码, 不该出现在返回值里。它逼出
 //    的是这么一条链 —— 调用方必须写兜底 → 兜底跑不到 → 跑不到就没法测 → 没法测的代码基本
@@ -92,31 +97,54 @@
 //      Longest() 那个去对, 拿默认那个对会是【假红】。
 //   🔴 能匹配空串的 pattern 只能配 boolOnly, SetModes 当场报错 —— 不是运行时静默退化。
 //
-// ── 端点怎么补: 两条路 + 一句减法 ────────────────────────────────────────────
+// ── 端点怎么补: 一遍 set 扫完, 之后【全走单条对象】────────────────────────────
 //
-//	定长 (min == max)  Lo = Hi - min。【不进正则引擎】, 一句减法。两条路在定长上必然同解
-//	                   (起点唯一), 所以定长恒走这句, 档位对它不生效。
+// 🔴 一句话的规矩 (2026-08-27 定的): 【扫正文那一遍走 set, 之后补端点的每一趟都走这一条
+//    pattern 自己的单条对象, 一趟都不再回 set】。三条理由:
+//    ① 单条对象走的是 RE2::Match 那条完整的路 (DFA → OnePass/BitState/NFA 逐级回退),
+//       DFA 放弃了还有下家; set 那侧的锚定解析是 kManyMatch 的 DFA 独一条, 没有下家 ——
+//       "DFA 放弃"在那边只能整遍失败 (RE2::Set::Match 里 dfa_failed 就直接 return false,
+//       上游也是这么写的: re2_set.cc:216)。
+//    ② 补端点的流量不再冲刷整表那份大 DFA 缓存 (真表 155 条那份), 两边互不干扰。
+//    ③ 状态更小: 单条不必背 kManyMatch 每个状态那张 id 表。
 //
-//	路 B (默认档)      从 max(cur, Hi-maxL) 起做一次【正向非锚定】搜索拿最左起点 s, 再从 s
-//	                   锚定取最长右端。恒等于 leftmost-longest (那就是它的定义), 不挑
-//	                   pattern 形状。用的是【这一条自己一条】的正向 Regexp
-//	                   (RegexpSet.forwardOne → Regexp.FindStringIndexFrom, 整串 + startpos,
-//	                   不切片 ⟹ \b / ^ / $ 看到的是真实邻字节)。
-//	                   代价: 每处命中比路 A 贵约 1.6x, 外加无上界的条目要走完空隙 ——
-//	                   各轮窗口两两不交且递增, 累加封顶 = 多扫一遍正文 (2.00x)。
+//	定长 (min == max)  Lo = Hi - min。【不进正则引擎】, 一句减法, 一趟都不用。两条路在定长
+//	                   上必然同解 (起点唯一), 所以定长恒走这句, 档位对它不生效。
 //
-//	路 A (降级档)      从 Hi 往左【锚定】推一次, 用【这一条自己一条】的反向对象
-//	                   (RegexpSet.reverseOne → RegexpSetReverse.ResolveSpanWithin), 一次调用
-//	                   给最靠左的那个起点。代价 = 回看多远, 与正文长度【无关】—— 这是它比
-//	                   B 便宜的全部原因。给的口径见下面"第三种口径"那一节。
+//	路 B (默认档)      【一趟】: 从 max(cur, Hi-maxL) 起做一次正向非锚定搜索, 直接拿到
+//	                   leftmost-longest 的整段区间。用的是这一条自己那条【longest 口径】的
+//	                   正向 Regexp (RegexpSet.forwardOne → Regexp.FindStringIndexFrom,
+//	                   整串 + startpos, 不切片 ⟹ \b / ^ / $ 看到的是真实邻字节)。
+//	                   🔴 之所以是一趟而不是两趟: longest 与贪心【选同一个起点】, 只在终点
+//	                      上分歧 —— 所以把口径换成 longest, 起点和终点就在同一次搜索里
+//	                      一起给了, 不必再跑第二趟去重取最长终点。
+//	                   代价: 无上界的条目要走完空隙 —— 各轮窗口两两不交且递增, 累加封顶
+//	                   = 多扫一遍正文 (2.00x)。
 //
-//	两条路要的那个单条对象编译不出来 = maxMem 配小了, Scan 整遍报错 (见上面那一节)。
+//	路 A (降级档)      【两趟】: ① 反向单条 (RegexpSet.reverseOne → RegexpReverse.
+//	                   ResolveSpanWithin) 从 Hi 往左锚定推一次, 给最靠左的那个起点;
+//	                   ② 正向单条 (forwardOne → Regexp.FindStringIndexAtWithin) 锚定在那个
+//	                   起点上取最长右端。两趟的代价都 = 这处命中有多长 / 回看多远,
+//	                   与正文长度【无关】—— 这是它比 B 便宜的全部原因。
+//	                   给的口径见下面"第三种口径"那一节。
 //
-// 🔴 反向必须是【一条一个 set】。整表建一个反向 set 是死路: set 里状态数是相乘的
+//	要的那个单条对象编译不出来 = maxMem 配小了, Scan 整遍报错 (见上面那一节)。
+//
+// 🔴 反向必须是【一条一个】。整表建一个反向 set 是死路: set 里状态数是相乘的
 //    (doc/状态数为什么会相乘.txt), 155 条的反向表在 6.4MB 正文上实测 65 秒 / arena 顶满 254MB
-//    还在 flush, 而正向同一张表 18ms 零 flush。拆成一条一个就没有这个乘法; 而且这些反向 set
+//    还在 flush, 而正向同一张表 18ms 零 flush。一条一个就没有这个乘法; 而且这些反向对象
 //    【从不用来扫正文】, 只做锚定解析 —— 起点只有一个, 那套 `.*?` 前缀引起的状态爆炸机制
 //    从根上就不存在。再加上惰性: 只有真被问到的那几条才会被建出来。
+//
+// 🔴 老账 (2026-08-27 之前): 路 B 是"贪心单条定起点 + 整表 set.ResolveSpan 重取终点"两趟,
+//    路 A 是"一条一个的反向 set + 整表 set.ResolveSpan"两趟 —— 两条路的第二趟都回 set。
+//    换掉之后【答案一字不差】(TestMatchScanPathsSameAsSetRoute: 两条路各 300 轮 AST 生成的
+//    语料, 共对账 5.4 万处区间, 与旧的 set 路子逐字节相同), 价钱 (64KB 语料 · benchPats):
+//      命中密集 (most)  路 B 968µs → 618µs (-36%) · 路 A 614µs → 447µs (-27%)
+//      命中稀疏 (few)   两条路都是持平 (差价在噪声里, 那一档的时间全在走空隙上)
+//      零命中  (zero)   持平 (根本不补端点)
+//    对照跑在同一个二进制里: BenchmarkMatchScanOldVsNew, 旧那套是照着旧实现另写的一份
+//    (msOldScanner), 用的是【没删的】那几个 set 入口。
 //
 // ── 重复: 每条 pattern 一个游标, 一次左到右推进 ──────────────────────────────
 // 变长 pattern 在一片正文上会在每个可收的位置各报一个右端 (\p{Han}{2,4} 撞 "张三李四王五"
@@ -146,7 +174,8 @@
 //
 // ── 路 A 给的是"第三种口径" (挂 spanFast 之前必须读完这一节) ─────────────────
 //
-// 下面整节讲的都是【路 A】。默认档走 B, 没有这些坑 —— 代价是上一节那 1.6x / 2.00x。
+// 下面整节讲的都是【路 A】。默认档走 B, 没有这些坑 —— 代价见上一节那笔账
+// (benchPats/64KB: 命中密集档 B 是 A 的 1.38x, 命中稀疏档 2.94x, 差价几乎全在"走空隙"上)。
 // 🔴 挂 spanFast 要的那份凭据怎么跑 (语料必须从 pattern 自己的 AST 生成再交叉构造; 对拍要拿
 //    Longest() 当 oracle; 对拍自己先要有一道"已知反例必须红"的自检门), 见
 //    doc/MatchScanner的leftmost-longest保证.md 第 5 节 —— 少一件就是空转绿。
@@ -256,8 +285,9 @@ type msPat_t struct {
 	pathB    bool
 	minL     int32
 	maxL     int32             // PatternLenRange 的上界; <0 = 无上界 (窗口退化成"从游标起")
-	rev      *RegexpSetReverse // 路 A 用: 反向锚定回推起点, 惰性建
-	fwd      *Regexp           // 路 B 用: 这一条自己那条正向正则, 惰性建
+	rev      *RegexpReverse // 路 A 用: 这一条自己那条【反向】正则, 锚定回推起点, 惰性建
+	fwd      *Regexp        // 这一条自己那条【正向 · longest】正则, 惰性建。
+	//                         路 B 用它一趟拿整段区间; 路 A 用它从推出来的起点取最长右端。
 	cur      int32             // 已吐出去的最右字节
 	lastLo   int32             // 上一条游程的左端, 用来确认升序
 	done     bool              // 从游标起整篇再没有匹配了 —— 本遍这一条到此为止
@@ -325,8 +355,9 @@ const MatchScanMode_boolOnly MatchScanMode_t = "boolOnly"
 //    每一处也都是真匹配 (①), 同一条内部照样不重叠升序 (②)。少的只有③那一条。
 //
 // 这一档是给【自动分档判错了】的那种情况留的出口: 库这边只按 min/max 分, 判成变长就一律
-// 落到路 B (每处 1.6x, 走空档另加, 上限 2.00x)。可是"变长"不等于"有歧义" —— 两头带 \b 的
-// 变长条实测岔开【0 处】。这种条落在 B 上是白掏钱。
+// 落到路 B。B 每处命中只要一趟 (比 A 的两趟还少), 贵就贵在【无上界的条目要走完空隙】——
+// 实测 (benchPats/64KB) 命中密集时 B 是 A 的 1.38x, 命中稀疏时 2.94x, 差价几乎全在这上面。
+// 可是"变长"不等于"有歧义" —— 两头带 \b 的变长条实测岔开【0 处】。这种条落在 B 上是白掏钱。
 //
 // 🔴 挂之前先把凭据跑出来, 别凭感觉: 拿这条 pattern 自己 fuzz 一遍 (随机正文 × 两档对拍),
 //    数出岔开 0 处再挂。跑出来了就挂 —— 挂上之后它既是快的那条路, 又确实是 leftmost-longest。
@@ -467,7 +498,8 @@ func (m *MatchScanner) failCompile(i int) {
 		"; pattern=" + m.set.pats[i]))
 }
 
-// failResolve: 锚定解析时 DFA 放弃了。同样是 maxMem 的事 —— 这一层不猜、不静默跳过。
+// failResolve: 路 A 第一趟的反向锚定解析 DFA 放弃了。同样是 maxMem 的事 —— 这一层不猜、
+// 不静默跳过。🔴 只有这一处会走到: 另外两趟走的是单条 RE2::Match, 那条路有 NFA 兜底。
 func (m *MatchScanner) failResolve(i int, err error) {
 	m.fail(errors.New("re2native: match scanner pattern " + strconv.Itoa(i) +
 		" 锚定解析失败: " + err.Error() + "; pattern=" + m.set.pats[i]))
@@ -490,22 +522,19 @@ func (m *MatchScanner) feed(i int, lo, hi int32) {
 	}
 	// 分档 (定长 / 路 A / 路 B) 早在 NewMatchScanner + SetModes 里算完了, 这里只把那条路
 	// 要的对象补建出来 —— 惰性: 没被真问到位置的 pattern 一个对象都不占。
-	switch {
-	case p.fixed:
-		// 定长: 起点唯一 (e-minL), 一句减法, 不进正则引擎。什么对象都不用建。
-	case p.pathB:
-		// 路 B: 只要这一条自己那条【正向】正则 + 一个长度上界当窗口。
-		// 🔴 反向对象一个都不建 —— 这正是 B 相对 A 省下的那一半。
+	// 🔴 建出来的一律是【这一条 pattern 自己的单条对象】, 不是 set。扫正文那一遍之后,
+	//    补端点的每一趟都不再回 set —— 理由见 regexpset.go 里 rev1/fwd1 那段。
+	if !p.fixed {
+		// 定长不用建任何对象 (起点唯一, 一句减法)。其余两条路都要正向那条 longest 正则:
+		// 路 B 拿它一趟出整段区间, 路 A 拿它从推出来的起点取最长右端。
 		if p.fwd == nil {
 			if p.fwd = m.set.forwardOne(i); p.fwd == nil {
 				m.failCompile(i)
 				return
 			}
 		}
-	default:
-		// 路 A: 起点靠这一条自己的反向对象锚定回推。给出来的口径是第三种 ——
-		// 见文件头那一节, 选了 spanFast 的调用方自己举证。
-		if p.rev == nil {
+		if !p.pathB && p.rev == nil {
+			// 路 A 另加一条【反向】正则: 从右端锚定往左推那个起点。
 			if p.rev = m.set.reverseOne(i); p.rev == nil {
 				m.failCompile(i)
 				return
@@ -546,6 +575,9 @@ func (m *MatchScanner) feed(i int, lo, hi int32) {
 					from = w
 				}
 			}
+			// 🔴 这一趟【既定起点又定终点】: p.fwd 是 longest 口径编的 (forwardOne),
+			//    所以它给的就是 leftmost-longest 的整段区间 —— 不必再为终点跑第二趟。
+			//    (换成贪心口径就得两趟: 贪心与 longest 选同一个起点, 只在终点上分歧。)
 			loc := m.findCtx.FindStringIndexFrom(p.fwd, m.text, int(from))
 			if loc == nil {
 				// 从 from 起没有匹配 ⟹ 从任何 >= from 的位置起也没有 (后面的 from 只增不减)。
@@ -553,23 +585,14 @@ func (m *MatchScanner) feed(i int, lo, hi int32) {
 				return
 			}
 			start, end := int32(loc[0]), int32(loc[1])
-			// leftmost-first 与 leftmost-longest 选【同一个起点】, 只在终点上分歧 ——
-			// 所以终点这一下要重新取最长 (锚定, 代价 = 这处命中有多长)。
-			pos, ok, err := m.set.ResolveSpan(m.text, start, int32(i))
-			if err != nil {
-				m.failResolve(i, err)
-				return
-			}
-			if ok && pos > end {
-				end = pos
-			}
 			m.emit(i, start, end)
 			p.cur = end
 			continue
 		}
+		// 第二趟: 反向单条, 锚定在右端 e 往左推, 拿最靠左的那个起点。
 		// 🔴 bound = cur: 回看【绝不越过游标】。是正确性不是省钱, 见文件头 ②。
 		// 顺带它把回看代价钉成"离游标多远", 与正文长度无关。
-		start, ok, err := p.rev.ResolveSpanWithin(m.text, e, p.cur, 0)
+		start, ok, err := p.rev.ResolveSpanWithin(m.text, e, p.cur)
 		if err != nil {
 			// DFA 放弃 (预算不够) —— 不是"没有匹配"。这一层不猜、不静默跳过, 整遍报错。
 			m.failResolve(i, err)
@@ -578,16 +601,14 @@ func (m *MatchScanner) feed(i int, lo, hi int32) {
 		if !ok {
 			continue
 		}
-		// 从这个起点取【最长】右端 —— 变长 pattern 在同一起点上有一串长度都成立,
-		// 取最短就是把命中截断, 下游拿去做定长校验会把真命中判成假。
+		// 第三趟: 正向单条, 锚定在这个起点上取【最长】右端 —— 变长 pattern 在同一起点上有
+		// 一串长度都成立, 取最短就是把命中截断, 下游拿去做定长校验会把真命中判成假。
+		// p.fwd 是 longest 口径编的, 所以"锚定在 start"这一句给的就是最长的那个右端。
 		end := e
-		pos, ok, err := m.set.ResolveSpan(m.text, start, int32(i))
-		if err != nil {
-			m.failResolve(i, err)
-			return
-		}
-		if ok && pos > end {
-			end = pos
+		if loc := m.findCtx.FindStringIndexAtWithin(p.fwd, m.text, int(start), len(m.text)); loc != nil {
+			if pos := int32(loc[1]); pos > end {
+				end = pos
+			}
 		}
 		m.emit(i, start, end)
 		p.cur = end

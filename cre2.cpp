@@ -28,12 +28,17 @@ struct cre2_re {
 
 extern "C" {
 
-cre2_re *cre2_new_max_mem(const char *pat, int patlen, int64_t max_mem) {
+// cre2_new_common: cre2_new_max_mem 与 cre2_new_longest_max_mem 的同一份实现 ——
+// 两者只差 longest_match 一个 option, 而那个 option 是【编译期】的事 (它定的是搜索 kind)。
+static cre2_re *cre2_new_common(const char *pat, int patlen, int64_t max_mem, bool longest) {
 	re2::StringPiece sp(pat, patlen);
 	RE2::Options opt;
 	opt.set_log_errors(false); // 别往 stderr 喷, 错误走 cre2_error 取
 	if (max_mem > 0) {
 		opt.set_max_mem(max_mem); // <=0 保持 RE2 默认 kDefaultMaxMem=8MB
+	}
+	if (longest) {
+		opt.set_longest_match(true); // leftmost-longest (POSIX) 而不是 leftmost-first (贪心)
 	}
 	cre2_re *h = new (std::nothrow) cre2_re();
 	if (h == nullptr) {
@@ -44,6 +49,14 @@ cre2_re *cre2_new_max_mem(const char *pat, int patlen, int64_t max_mem) {
 	h->rre = nullptr;
 	h->rprog = nullptr;
 	return h;
+}
+
+cre2_re *cre2_new_max_mem(const char *pat, int patlen, int64_t max_mem) {
+	return cre2_new_common(pat, patlen, max_mem, false);
+}
+
+cre2_re *cre2_new_longest_max_mem(const char *pat, int patlen, int64_t max_mem) {
+	return cre2_new_common(pat, patlen, max_mem, true);
 }
 
 cre2_re *cre2_new(const char *pat, int patlen) { return cre2_new_max_mem(pat, patlen, 0); }
@@ -75,15 +88,26 @@ int cre2_group_name(const cre2_re *h, int idx, char *buf, int buflen) {
 	return n;
 }
 
-int cre2_match_at(const cre2_re *h, const char *text, int textlen, int startpos, int endpos, int *match, int nmatch) {
+static int cre2_match_at_common(const cre2_re *h, const char *text, int textlen, int startpos, int endpos,
+                                int *match, int nmatch, RE2::Anchor anchor) {
 	// 用非空 base: RE2 文档规定 text==NULL 时连 group0 的 data() 都返回 NULL (无法算偏移),
 	// 故空串也喂一个合法指针, 偏移一律相对 base 计算.
 	const char *base = text ? text : "";
 	re2::StringPiece full(base, textlen);
-	std::vector<re2::StringPiece> sub(nmatch);
+	// 🔴 小 nmatch 走栈上那块, 不要每次调用 new 一个 vector. 这条路是【按处命中调用】的
+	//    (MatchScanner 补端点每处一次), 一次 malloc/free 在那个量级上是能量出来的常数 ——
+	//    实测把它去掉之前, 路 A 在低命中密度语料上比走 set 的老路子慢 2%.
+	//    8 是随手够用的界: group0 + 7 个子组, 超了才落回 vector.
+	re2::StringPiece stackbuf[8];
+	std::vector<re2::StringPiece> heapbuf;
+	re2::StringPiece *sub = stackbuf;
+	if (nmatch > (int)(sizeof stackbuf / sizeof stackbuf[0])) {
+		heapbuf.resize(nmatch);
+		sub = heapbuf.data();
+	}
 	// full 是【整串】(context), 只有 [startpos,endpos) 这一段参与搜索 —— ^ / $ / \b 因此
 	// 看到的是真实邻字节. Go 侧已经保证 0 <= startpos <= endpos <= textlen.
-	bool ok = h->re->Match(full, (size_t)startpos, (size_t)endpos, RE2::UNANCHORED, sub.data(), nmatch);
+	bool ok = h->re->Match(full, (size_t)startpos, (size_t)endpos, anchor, sub, nmatch);
 	if (!ok) {
 		return 0;
 	}
@@ -98,6 +122,16 @@ int cre2_match_at(const cre2_re *h, const char *text, int textlen, int startpos,
 		}
 	}
 	return 1;
+}
+
+int cre2_match_at(const cre2_re *h, const char *text, int textlen, int startpos, int endpos, int *match, int nmatch) {
+	return cre2_match_at_common(h, text, textlen, startpos, endpos, match, nmatch, RE2::UNANCHORED);
+}
+
+// 与上面唯一的差别就是 anchor: 匹配必须从 startpos 起头. 配 longest handle 用, 给的就是
+// "从这一点起最长的那个匹配"; 而它走的是 RE2::Match 的完整回退链 (DFA → OnePass/BitState/NFA).
+int cre2_match_at_anchored(const cre2_re *h, const char *text, int textlen, int startpos, int endpos, int *match, int nmatch) {
+	return cre2_match_at_common(h, text, textlen, startpos, endpos, match, nmatch, RE2::ANCHOR_START);
 }
 
 // utf8WidthGo 复刻 Go utf8.DecodeRuneInString 返回的【宽度】, 仅供空匹配推进:
@@ -616,6 +650,72 @@ cre2_rev_match_result cre2_partial_match_reverse(const cre2_re *h, const char *t
 	r.FellBack = 1;
 	r.Matched = RE2::PartialMatch(sp, *h->re) ? 1 : 0;
 	return r;
+}
+
+// ── 单条正则的反向【锚定解析】────────────────────────────────────────────────
+// 给一个匹配右端, 求最靠左的那个左端。这一句就是 RE2::Match 自己求匹配左端时走的那一句
+// (re2_re2.cc 的 UNANCHORED 分支: 正向 DFA 找到右端之后, 反向程序 kAnchored+kLongestMatch
+// 从那个右端往左跑一趟)。这里只是把它接出来单独用。
+//
+// 🔴 走 SearchDFA 而不是 Prog::SpanResolve (set 那侧用的那个): 单条 Compile 会把 ^ / $ 从
+//    程序里【摘掉】记成 anchor_start_/anchor_end_ 两个标志 (re2_compile.cc 的 IsAnchorStart/
+//    IsAnchorEnd), 而只有 SearchDFA 会去检查这两个标志 —— 绕开它自己驱动 DFA 的话, `^foo`
+//    会在正文中间也认。set 那侧没有这个问题 (CompileSet 不摘, ^ / $ 留在程序里当指令)。
+// 🔴 kLongestMatch 而不是 kManyMatch: 单条不需要 id 表 (状态更小), 而且反向程序上
+//    GetDFA(kLongestMatch) 拿的是【整份】dfa_mem_ (Prog::GetDFA 里写着"RE2 从不做反向
+//    kFirstMatch 搜索"), 与 cre2_partial_match_reverse 用的 dfa_first_ 各占各的, 不打架。
+cre2_span_resolve_result cre2_resolve_span_reverse_r(const cre2_re *h, const char *text,
+                                                     int textlen, int from, int bound) {
+	cre2_span_resolve_result r;
+	r.rc = -1;
+	r.pos = 0;
+	if (h == nullptr || textlen < 0 || from < 0 || from > textlen) {
+		return r;
+	}
+	if (bound < 0) {
+		bound = 0;
+	} else if (bound > from) {
+		bound = from;
+	}
+	re2::Prog *prog = cre2_rev_prog(h);
+	if (prog == nullptr) {
+		return r; // 反向程序编不出来 —— 调用方那边当"这条走不了"处理
+	}
+	const char *base = text ? text : "";
+	// context 恒是【整篇正文】, region 只圈定"往左看到哪为止" —— 所以 \b / ^ / $ 判的是
+	// 它在整篇正文里的真实处境, bound 只会让答案变短, 不会让它变错。
+	re2::StringPiece context(base, (size_t)textlen);
+	re2::StringPiece region(base + bound, (size_t)(from - bound));
+	re2::StringPiece m;
+	bool failed = false;
+	if (!prog->SearchDFA(region, context, re2::Prog::kAnchored, re2::Prog::kLongestMatch,
+	                     &m, &failed, nullptr, nullptr)) {
+		r.rc = failed ? -1 : 0; // failed = DFA 放弃 (预算不够); 否则就是这个右端上真没有匹配
+		return r;
+	}
+	// 反向程序的 match0 是 StringPiece(ep, text.end()-ep) —— data() 就是走到的最左位置 = 左端。
+	r.rc = 1;
+	r.pos = (int32_t)(m.data() - base);
+	return r;
+}
+
+// cre2_rev_mem_info: 这条 pattern 的【反向程序】上那份 DFA 缓存的水位。
+// 没编过反向程序 / 没建过 DFA 就 Built=0 —— GetDFAMemInfo 不会因为查询而把 DFA 建出来,
+// 但 cre2_rev_prog 会把【程序】编出来, 所以这里先看 rprog 再决定问不问。
+void cre2_rev_mem_info(const cre2_re *h, cre2_set_mem *out) {
+	memset(out, 0, sizeof *out);
+	if (h == nullptr || h->rprog == nullptr) {
+		return; // 故意不调 cre2_rev_prog: 量具不该制造被量的东西
+	}
+	re2::DFAMemInfo mi;
+	h->rprog->GetDFAMemInfo(re2::Prog::kLongestMatch, &mi);
+	out->Built = mi.built ? 1 : 0;
+	out->StateBudget = mi.state_budget;
+	out->MemLeft = mi.mem_left;
+	out->States = mi.states;
+	out->ArenaCap = mi.arena_cap;
+	out->FlushesTotal = mi.flushes_total;
+	out->StatesBuiltTotal = mi.states_built_total;
 }
 
 // ── RE2::Set 包装 ────────────────────────────────────────────────────────────

@@ -180,7 +180,24 @@ as `regexp.Compile` (RE2's default Perl mode), *not* leftmost-longest — e.g.
 - `PatternLenRange` / `RegexpSet.PatternLenRange` / `PatLenUnbounded` — *not* in stdlib;
   the byte-length range a pattern can match; see [PatternLenRange](#patternlenrange) below
 - `RegexpSet.ReverseOneStats` — *not* in stdlib; how much the lazily built per-pattern
-  reverse sets (used to recover left edges) cost in states and bytes
+  reverse objects (used to recover left edges) cost in states and bytes
+- `CompileLongest` / `CompileLongestMaxMem` / `MustCompileLongest` — *not* in stdlib as
+  constructors (the stdlib spelling is the `re.Longest()` mutator); compile one pattern
+  under **leftmost-longest (POSIX)** semantics instead of the default leftmost-first.
+  Both pick the *same start*; they differ only on the end. Needed whenever you want
+  "the longest match starting here" in a single search instead of two, and required if
+  you feed the span into a checksum — a greedy short end truncates the hit
+- `Regexp.FindStringIndexAtWithin` (and the same method on `FindStringIndex_ctx_t`) —
+  *not* in stdlib; a search **anchored at `from`** and not crossing `bound`, with
+  offsets in the original string so `\b` / `^` / `$` still see the real neighbours.
+  Paired with a longest-mode object this is `ResolveSpan` for a single pattern — but
+  over `RE2::Match`, so it inherits the NFA fallback that the set path does not have
+- `RegexpReverse.ResolveSpanWithin` — *not* in stdlib; the single-pattern twin of
+  `RegexpSetReverse.ResolveSpanWithin`: given a match end, the leftmost start, bounded.
+  Implemented as the very call `RE2::Match` makes internally to find a match's left
+  edge (reverse program + `kAnchored` + `kLongestMatch`)
+- `RegexpReverse.MemInfo` — *not* in stdlib; the DFA cache high-water mark of that
+  pattern's reverse program, `Built=false` if it has never been walked (querying never builds it)
 - `DFAStats` / `DFAStatsZero` (`DFAStats_t`) — *not* in stdlib; process-wide counters for DFA
   state-cache flushes; the per-Set counters above are usually what you want instead;
   see [DFA cache thrashing](#dfa-cache-thrashing) below
@@ -638,9 +655,29 @@ How the endpoint is recovered, per pattern:
 | pattern shape | mode | how |
 |---|---|---|
 | `min == max` (fixed length) | any | `Lo = Hi - min`, one subtraction, the regex engine is never entered. Both paths agree here, so the mode does not apply. |
-| variable | `span` (default) | forward unanchored search from `max(cursor, Hi-maxLen)` for the leftmost start, then an anchored longest end. This *is* the definition of leftmost-longest, so it holds for any pattern shape. Costs ~1.6× path A per hit, plus walking the gaps for patterns with no length bound (bounded by one extra pass over the text). |
-| variable | `spanFast` | one anchored look-back from `Hi` using a reverse object built for **that one pattern**, bounded by the cursor. Cost is independent of text length — that is the whole reason it exists. Semantics: the third kind, below — equal to leftmost-longest in 119 972 of 120 000 measured spans, but not guaranteed. |
+| variable | `span` (default) | **one** forward unanchored search from `max(cursor, Hi-maxLen)`, using the **longest-mode** single-pattern object for that pattern, which yields the whole leftmost-longest span in a single call. This *is* the definition of leftmost-longest, so it holds for any pattern shape. Cost: walking the gaps for patterns with no length bound (bounded by one extra pass over the text). |
+| variable | `spanFast` | **two** calls, both independent of text length: an anchored look-back from `Hi` using the reverse object built for **that one pattern** (bounded by the cursor), then an anchored longest end from that start. That independence is the whole reason it exists. Semantics: the third kind, below — equal to leftmost-longest in 119 972 of 120 000 measured spans, but not guaranteed. |
 | — | — | if the single-pattern object will not compile, `maxMem` is too small and `Scan` fails the whole pass. |
+
+**One rule governs all of it (2026-08-27): the pass over the text uses the set; every
+endpoint-completion call after it uses that pattern's own single-pattern object, never
+the set.** Three reasons:
+
+1. A single-pattern object goes through `RE2::Match`, which falls back DFA →
+   OnePass/BitState/NFA. The set's anchored resolve is a `kManyMatch` DFA **and
+   nothing else** — upstream included (`re2_set.cc:216`: `dfa_failed` ⟹ `return
+   false`) — so "the DFA gave up" there can only fail the whole pass. After the
+   change only `spanFast`'s first call (the reverse look-back) can still hit that,
+   because RE2 itself has no other way to find a match's left edge.
+2. Endpoint traffic no longer churns the big shared DFA cache of the whole table.
+3. Smaller states: a single pattern does not carry `kManyMatch`'s per-state id list.
+
+The answers are byte-for-byte unchanged — `TestMatchScanPathsSameAsSetRoute` replays
+the old set-based route (using the set entry points, which are all still there) over
+300 AST-generated corpora per path, 54 000 spans, zero differences. Cost, measured
+old-vs-new in one binary (`BenchmarkMatchScanOldVsNew`, 64 KB corpus, `benchPats`):
+dense hits 968 µs → 618 µs for `span` and 614 µs → 447 µs for `spanFast`; sparse and
+zero-hit corpora are unchanged (their time is all in walking the gaps).
 
 #### `spanFast`: the third semantics (read this before hanging a pattern here)
 
@@ -882,12 +919,14 @@ reports match **starts**, and leftmost/rightmost-longest is *defined* on starts.
 there is no guess here:
 
 - reverse `FindAllIndex` → match starts, monotone in scan order (right to left);
-- forward `ResolveSpanWithin(from: start, bound: cursor)` → the **longest** end that
-  does not cross the cursor.
+- forward **single-pattern** `FindStringIndexAtWithin(from: start, bound: cursor)` →
+  the **longest** end that does not cross the cursor.
 
 Hence no path A/B split, no `spanFast` mode (passing it is an error), and no `maxL`
-window. Each span costs exactly one anchored resolve — proportional to the length of
-that match, not to the length of the input. It also picks up the family the forward
+window. Each span costs exactly one anchored search — proportional to the length of
+that match, not to the length of the input. (That call used to go through a
+one-pattern *set*; since 2026-08-27 it uses the pattern's own single-pattern
+longest-mode object, for the same three reasons listed under the forward scanner.) It also picks up the family the forward
 default tier cannot take: patterns with **no upper length bound** (email and friends),
 which forward needs `maxL` to bound a look-back window for.
 

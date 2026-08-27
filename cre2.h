@@ -20,6 +20,16 @@ cre2_re *cre2_new(const char *pat, int patlen);
  * 单条 pattern 撞上状态爆炸时, 默认 8MB 会让 DFA 反复整表清空 (结果仍对, 吞吐掉两个数量级),
  * 而调用方在 cre2_dfa_stats 之外拿不到任何按对象的读数 —— 所以先得能把预算调大. */
 cre2_re *cre2_new_max_mem(const char *pat, int patlen, int64_t max_mem);
+/* 同 cre2_new_max_mem, 但打开 RE2::Options::set_longest_match —— 这个 handle 的匹配口径从
+ * leftmost-first (贪心, RE2/PCRE 默认) 换成 leftmost-longest (POSIX):【同一个起点】上取最长的
+ * 那个匹配, 而不是 NFA 指令优先序先撞上的那个. 起点的选法两者完全相同 (都是最靠左的那个).
+ *
+ * 🔴 存在理由: 调用方要"从这一点起最长的那个匹配"时, 有了它就是【一次】搜索的事 —— 不必再
+ *    先用贪心搜一次定起点、再另找一条路把终点重取成最长. 而且这一次走的是 RE2::Match 那条
+ *    完整的路 (DFA → OnePass/BitState/NFA 逐级回退), DFA 放弃了还有下家; set 那侧的锚定解析
+ *    是 DFA 独一条, 没有下家.
+ * 🔴 longest 是【编译期】的事 (kind 由 options 决定), 所以它是另一个 handle, 不是调用上的开关. */
+cre2_re *cre2_new_longest_max_mem(const char *pat, int patlen, int64_t max_mem);
 /* 这个 handle 编译时用的 max_mem (字节). */
 int64_t cre2_max_mem(const cre2_re *h);
 /* 1=编译成功 0=失败. */
@@ -42,6 +52,14 @@ int cre2_group_name(const cre2_re *h, int idx, char *buf, int buflen);
  *    调用方不必自己 text[a:b] 切一刀, 切完两侧就是假邻居了.
  * 要"从 startpos 一直找到底"就传 endpos = textlen. */
 int cre2_match_at(const cre2_re *h, const char *text, int textlen, int startpos, int endpos, int *match, int nmatch);
+
+/* 同 cre2_match_at, 但匹配必须【从 startpos 起头】(RE2::ANCHOR_START). 其余逐字相同:
+ * text/textlen 仍是整串 (context), 只有 [startpos,endpos) 参与搜索, ^ / $ / \b 看到真实邻字节.
+ *
+ * 配 cre2_new_longest_max_mem 编出来的 handle 用, 这一句给的就是"从 startpos 起、不越过 endpos
+ * 的【最长】匹配"—— 也就是 cre2_set_resolve_span 在 set 那侧干的事, 只不过走的是 RE2::Match
+ * 那条带 NFA 回退的路, 且不需要一个 set. 配普通 handle 用给的是贪心那个终点. */
+int cre2_match_at_anchored(const cre2_re *h, const char *text, int textlen, int startpos, int endpos, int *match, int nmatch);
 
 /* cre2_match_step_result: cre2_match_all_step 的返回值。
  *   rc       : 1=正常; 0=参数不合法(当无匹配处理)。
@@ -334,6 +352,26 @@ typedef struct {
  * 放大 (实测 6.5 万个端点 = 6.5 万笔)。同一招见 cre2_match_all_r。 */
 cre2_span_resolve_result cre2_set_resolve_span_r(const cre2_set *h, const char *text,
                                                  int textlen, int from, int bound, int id);
+
+/* cre2_resolve_span_reverse_r: 【单条】正则的反向锚定解析 —— 不经过 set.
+ * from = 匹配右端 (不含), 返回【最靠左】的那个左端 (含), text[pos,from) 就是这条 pattern 的一个匹配.
+ * bound = 回看不越过它 (左下界), 负数 = 不限. 判定上下文恒是整篇正文, 所以 \b / ^ / $ 看到的
+ * 是真实邻居, 不是 bound 切出来的假边界.
+ *
+ * 实现就是 RE2::Match 自己求匹配【左端】时走的那一句: 反向程序 + kAnchored + kLongestMatch.
+ * 惰性编反向程序 (与 cre2_partial_match_reverse 共用同一份, 见 cre2_rev_prog).
+ * 返回 rc: 1 = 找到, 0 = 这个右端上伸不出匹配, -1 = 参数错 / 反向程序编不出来 / DFA 放弃.
+ *
+ * 🔴 为什么不能拿 cre2_set_resolve_span_r 套一条 pattern 的 set 凑: 那是 kManyMatch 的 DFA
+ *    (每个状态多背一张 id 表), 而且 set 那侧的 ^ / $ 是留在程序里的指令, 单条 Compile 却把
+ *    它们摘成 anchor_start_/anchor_end_ 两个标志 —— 只有 SearchDFA 会去检查那两个标志.
+ *    绕开它自己走 DFA 的话, `^foo` 会在正文中间也认. */
+cre2_span_resolve_result cre2_resolve_span_reverse_r(const cre2_re *h, const char *text,
+                                                     int textlen, int from, int bound);
+
+/* 查这条 pattern 的【反向程序】当前的 DFA 缓存水位 (字段同 cre2_set_mem).
+ * 没走过反向 (程序都没编 / DFA 没建) 就返回 Built=0, 【不会】因为查询而把它建出来. */
+void cre2_rev_mem_info(const cre2_re *h, cre2_set_mem *out);
 
 /* 建一个空 set, reversed!=0 时整个 set 反向编译 (Match 从末尾往前扫原始 buffer)。
  * cre2_set_new(mm) == cre2_set_new_ex(mm, 0)。其余 API (add/compile/match/stats/mem_info/attrib)

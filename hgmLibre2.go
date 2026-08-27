@@ -77,11 +77,59 @@ func Compile(pattern string) (*Regexp, error) { return CompileMaxMem(pattern, 0)
 // 怎么标定: 拿一批【互不相同】的真语料单线程跑一遍, 看 RegexpReverse.MatchStats/ScanStats 的
 // Flushes 或进程级 DFAStats().Resets 增量; >0 就翻倍重来, 直到增量归零。
 func CompileMaxMem(pattern string, maxMem int64) (*Regexp, error) {
+	return compileMaxMem(pattern, maxMem, false)
+}
+
+// CompileLongest 同 Compile, 但这条 pattern 的匹配口径是 leftmost-longest (POSIX),
+// 而不是 RE2/PCRE 默认的 leftmost-first (贪心)。等价于 stdlib 的 re.Longest()。
+func CompileLongest(pattern string) (*Regexp, error) { return CompileLongestMaxMem(pattern, 0) }
+
+// CompileLongestMaxMem 同 CompileMaxMem, 但口径是 leftmost-longest。
+//
+// ── 两者差在哪 ───────────────────────────────────────────────────────────────
+// 起点【完全相同】(都是最靠左的那个能起头的位置), 只在终点上分歧: 贪心给的是 NFA 指令
+// 优先序先撞上的那个终点, longest 给的是同一起点上最长的那个。
+//
+//	abc|b     撞 "abc"   贪心 [0,3)   longest [0,3)   ← 同一起点, 这里恰好同解
+//	a|ab      撞 "ab"    贪心 [0,1)   longest [0,2)   ← 差在这儿
+//
+// ── 什么时候要它 ─────────────────────────────────────────────────────────────
+// 调用方要的是"从某处起【最长】的那个匹配"时。没有它就得两趟: 先贪心搜一次定起点, 再另找
+// 一条路 (锚定解析) 把终点重取成最长。有了它是一趟的事, 而且这一趟走的是 RE2::Match 那条
+// 完整的路 —— DFA 放弃了还能退到 OnePass/BitState/NFA, 不像 set 那侧的锚定解析是 DFA 独一条。
+//
+// 🔴 【截断是有后果的】: 变长 pattern 取到短的那个终点 = 把命中截断, 下游拿 text[Lo:Hi] 去过
+//    校验位 (身份证 · IBAN mod-97 · Luhn) 会失败, 整条真命中被自己毙掉 = 无声漏报。
+//    所以"要位置再拿去判"的调用方一律该用这一个。
+//
+// 🔴 longest 是【编译期】的事 (它定的是 RE2 内部搜索的 MatchKind), 所以它是另一个对象,
+//    不是某个方法上的开关。要两个口径就编两个对象。
+func CompileLongestMaxMem(pattern string, maxMem int64) (*Regexp, error) {
+	return compileMaxMem(pattern, maxMem, true)
+}
+
+// MustCompileLongest 同 CompileLongest, 失败 panic。
+func MustCompileLongest(pattern string) *Regexp {
+	re, err := CompileLongest(pattern)
+	if err != nil {
+		panic(`re2native: CompileLongest(` + strings.TrimSpace(pattern) + `): ` + err.Error())
+	}
+	return re
+}
+
+// compileMaxMem 是 CompileMaxMem 与 CompileLongestMaxMem 的同一份实现 —— 两者只差一个
+// 编译期 option。
+func compileMaxMem(pattern string, maxMem int64, longest bool) (*Regexp, error) {
 	if len(pattern) > maxCInt {
 		return nil, errors.New("re2native: pattern too large (>2GiB)")
 	}
 	p := strBytePtr(pattern)
-	h := C.cre2_new_max_mem(p, C.int(len(pattern)), C.int64_t(maxMem))
+	var h *C.cre2_re
+	if longest {
+		h = C.cre2_new_longest_max_mem(p, C.int(len(pattern)), C.int64_t(maxMem))
+	} else {
+		h = C.cre2_new_max_mem(p, C.int(len(pattern)), C.int64_t(maxMem))
+	}
 	runtime.KeepAlive(pattern)
 	if h == nil {
 		return nil, errors.New("re2native: out of memory")

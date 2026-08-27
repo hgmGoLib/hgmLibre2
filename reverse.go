@@ -180,3 +180,24 @@ func NewRegexpSetReverseMaxMem(patterns []string, maxMem int64) (*RegexpSetRever
 	}
 	return &RegexpSetReverse{s: s}, nil
 }
+
+// MemInfo 查这条 pattern 的【反向程序】当前那份 DFA 缓存的水位 (字段含义同
+// (*RegexpSet).MemInfo)。没走过反向 (程序还没惰性编出来 / DFA 还没建) 返回 Built=false ——
+// 量具不制造被量的东西, 查询【不会】把 DFA 建出来。
+//
+// 用途与 (*RegexpSet).MemInfo 一样: 标定这条 pattern 反着走到底花了多少状态。
+// 单条反向的意义正是把状态数从指数塌回线性, 所以这个数应该【很小】; 大了就是选错方向了。
+func (rr *RegexpReverse) MemInfo() SetMemInfo {
+	var mi C.cre2_set_mem
+	C.cre2_rev_mem_info(rr.re.h, &mi)
+	runtime.KeepAlive(rr.re)
+	return SetMemInfo{
+		Built:            mi.Built != 0,
+		StateBudget:      int64(mi.StateBudget),
+		MemLeft:          int64(mi.MemLeft),
+		States:           int64(mi.States),
+		ArenaCap:         int64(mi.ArenaCap),
+		FlushesTotal:     int64(mi.FlushesTotal),
+		StatesBuiltTotal: int64(mi.StatesBuiltTotal),
+	}
+}

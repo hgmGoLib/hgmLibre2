@@ -11,7 +11,9 @@
 //    偏移】, 整串照样喂给 RE2。
 //
 // 谁在用: ① MatchScanner 的 B 路 (matchscan.go 的 MatchScanMode_t) —— 它要"起点 >= 游标的
-// 最左匹配", 正是这个形状。② 拿到整段区间之后回头补捕获组偏移的调用方 (下面那个 Within 版)。
+// 最左匹配", 正是这个形状 (拿的是 longest 口径的对象, 所以一趟就是整段区间)。
+// ② 拿到整段区间之后回头补捕获组偏移的调用方 (下面那个 Within 版)。
+// 🔴 锚定版 (起点必须【就是】pos) 在 find_at.go: FindStringIndexAtWithin。
 package hgmLibre2
 
 /*
@@ -24,8 +26,11 @@ import "runtime"
 // FindStringIndexFrom 返回【起点 >= pos】的最左匹配 [start,end), 无匹配返回 nil。
 // pos 越界 (<0 或 >len(s)) 当无匹配。
 //
-// 非锚定, leftmost-first —— 与 leftmost-longest 选【同一个起点】, 只在终点上分歧, 所以拿它
-// 定起点、再用 ResolveSpan 取最长终点, 得到的就是 leftmost-longest。
+// 非锚定。口径跟着 re 这个对象走: 默认编的是 leftmost-first (贪心), CompileLongest* 编的是
+// leftmost-longest。
+// 🔴 两者【选同一个起点】, 只在终点上分歧 —— 所以要 leftmost-longest 的整段区间, 用一个
+//    longest 对象调这一句就够了 (一趟)。拿贪心对象定起点、再另跑一趟锚定解析重取最长终点
+//    也对, 但那是两趟; MatchScanner 的默认档 2026-08-27 就是这么从两趟压成一趟的。
 func (re *Regexp) FindStringIndexFrom(s string, pos int) []int {
 	if pos < 0 || pos > len(s) {
 		return nil

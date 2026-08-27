@@ -117,3 +117,46 @@ func resolveSpanWithin(s *RegexpSet, text string, from, bound, id int32) (pos in
 	return 0, false, errors.New("re2native: resolve span failed (DFA gave up); patterns=" +
 		strconv.Itoa(s.size) + "; 用 NewRegexpSetMaxMem 把 maxMem 调大")
 }
+
+// ── 单条 (非 set) 的反向锚定解析 ─────────────────────────────────────────────
+
+// ResolveSpanWithin 求【左端】: 给一个匹配右端 from (不含), 返回最靠左的那个左端 pos (含),
+// text[pos:from] 就是这条 pattern 的一个匹配。bound 是回看的左下界 (负数 = 不限)。
+// ok=false 表示这条 pattern 在这个右端上根本伸不出匹配 (或者伸不到 bound 以内)。
+//
+// 判定用的上下文恒是【整篇正文】, 所以 \b / ^ / $ 看到的永远是真实邻居; 掐 bound 只会让
+// 答案变短, 不会让它变错。代价 = 实际回看了多远, 与正文长度无关。
+//
+// 🔴 给的是【最靠左】的那个左端, 不是碰到的第一个。反向走到死状态才知道还能不能更靠左;
+//    "撞到第一个 match 状态就收工"给的是最短匹配 = 把命中截断。
+//
+// ── 它和 (*RegexpSetReverse).ResolveSpanWithin 的关系 ────────────────────────
+// 语义逐字相同, 差别只在【对象是谁】: 那个是一张表 (要一个 id 说是哪条), 这个是一条 pattern。
+// 一条 pattern 就该用这一个 —— 套一条 pattern 的 set 去凑要多背一张 id 表 (kManyMatch 的
+// 状态更大), 而且 set 与单条对 ^ / $ 的处理方式不同, 走的根本不是同一条代码路。
+//
+// 无状态、只读; 反向程序首次调用时惰性编出来 (线程安全)。编不出来 / DFA 放弃都返回 err ——
+// 这一层不猜、不静默退回, 因为"没有匹配"和"算不出来"对调用方是两件完全不同的事。
+func (rr *RegexpReverse) ResolveSpanWithin(text string, from, bound int32) (pos int32, ok bool, err error) {
+	re := rr.re
+	if len(text) > maxCInt {
+		return 0, false, errors.New("re2native: resolve span text too large (>2GiB)")
+	}
+	if from < 0 || int(from) > len(text) {
+		return 0, false, errors.New("re2native: resolve span bad offset " + strconv.Itoa(int(from)))
+	}
+	// 走【按值返回】的 _r 孪生, 理由同上面那个: 出参版每次调用一笔 4 字节堆分配, 而这个
+	// 方法在"每个端点问一次"的用法上会按端点数放大。
+	r := C.cre2_resolve_span_reverse_r(re.h, strBytePtr(text), C.int(len(text)),
+		C.int(from), C.int(bound))
+	runtime.KeepAlive(text)
+	runtime.KeepAlive(re)
+	switch r.rc {
+	case 1:
+		return int32(r.pos), true, nil
+	case 0:
+		return 0, false, nil
+	}
+	return 0, false, errors.New("re2native: reverse resolve span failed (反向程序编不出来, 或 DFA 放弃)" +
+		"; 用 CompileReverseMaxMem 把 maxMem 调大; pattern=" + re.expr)
+}

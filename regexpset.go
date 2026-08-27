@@ -37,42 +37,42 @@ type RegexpSet struct {
 	// 不复制内容。
 	pats   []string
 	maxMem int64
-	// rev1[i] = 第 i 条 pattern 【自己一条】的反向 set, 惰性建 —— MatchScanner 补左端时
-	// 用它的 ResolveSpanWithin(锚定, 从右端往左推)。
+	// ── 补端点用的【单条】对象, 两份, 都惰性建 ──────────────────────────────
 	//
-	// 🔴 为什么是"一条一个 set"而不是"整表一个反向 set": set 里的状态数是【相乘】的
-	//    (doc/状态数为什么会相乘.txt), 155 条的反向 set 会把每条各自反向的最坏情况乘到一起 ——
-	//    实测 6.4MB 正文上要 65 秒、arena 顶满 254MB 还在 flush, 而正向同一张表 18ms 零 flush。
-	//    拆成一条一个就没有这个乘法; 而且这些 set 只用来【锚定解析】、从不用来扫正文,
-	//    那条 .*? 前缀引起的状态爆炸机制从根上就不存在。
-	//    再加上惰性: 只有真命中过的那几条才会被建出来。
-	rev1   []*RegexpSetReverse
+	// 🔴 一句话: 扫正文那一遍走 set, 之后补端点的每一趟都走【这一条 pattern 自己的单条对象】,
+	//    一趟都不再回 set。理由三条:
+	//    ① 单条对象走的是 RE2::Match 那条完整的路 (DFA → OnePass/BitState/NFA 逐级回退),
+	//       DFA 放弃了还有下家; set 那侧的锚定解析是 kManyMatch 的 DFA 独一条, 没有下家 ——
+	//       "DFA 放弃"在那边只能整遍失败。
+	//    ② 补端点的流量不再冲刷整表那份大 DFA 缓存 (155 条那份), 两者互不干扰。
+	//    ③ 状态更小: 单条不需要 kManyMatch 每个状态背的那张 id 表。
+	//    代价是每条 pattern 各一份缓存 —— 靠惰性压住: 只有真被问到位置的那几条才建得出来。
+	//
+	// rev1[i] = 第 i 条 pattern 自己那条【反向】正则 (RegexpReverse), 路 A 用:
+	//           ResolveSpanWithin(锚定在右端, 往左推) 给最靠左的那个起点。
+	//
+	// 🔴 反向必须是【一条一个】: set 里的状态数是【相乘】的 (doc/状态数为什么会相乘.txt),
+	//    155 条的反向表实测 6.4MB 正文 65 秒 / arena 顶满 254MB 还在 flush, 而正向同一张表
+	//    18ms 零 flush。一条一个就没有这个乘法; 而且它只做锚定解析、从不扫正文, 那条 `.*?`
+	//    前缀引起的状态爆炸机制从根上就不存在。
+	rev1   []*RegexpReverse
 	rev1No []bool // 第 i 条试过且【建不出来】—— 记下来免得每遍扫描重编一次
 	rev1Mu sync.Mutex
-	// fwd1[i] = 第 i 条 pattern 【自己一条】的正向 Regexp, 惰性建 —— 是 rev1 的镜像,
-	// 给 MatchScanner 的 B 路 (MatchScanMode_t) 做"从游标起的非锚定搜索"用。
+	// fwd1[i] = 第 i 条 pattern 自己那条【正向】Regexp, 且是 longest 口径编的
+	// (CompileLongestMaxMem)。两处都用它:
+	//   路 B —— FindStringIndexFrom(整串+startpos): 一趟给出 leftmost-longest 的整段区间;
+	//   路 A —— FindStringIndexAtWithin(锚定在起点): 从路 A 推出来的起点取最长右端。
 	//
-	// 🔴 为什么不能拿 set 那份程序去搜: set 是整表合编的一份 DFA, 它只回答"哪几条命中"
-	//    与"右端在哪", 给不出【单条】的非锚定入口 —— 要"这一条自己从 pos 起的最左匹配",
-	//    只能有一个单条对象。这一条不会有 rev1 那种状态相乘的问题 (本来就是单条),
-	//    但它【会】走 .*? 前缀那条路, 所以它的代价是"扫过的那段正文", 不是常数。
+	// 🔴 为什么必须是 longest 口径: 贪心给的是 NFA 指令优先序先撞上的那个终点, 变长 pattern
+	//    上那是【把命中截断】—— 下游拿 text[Lo:Hi] 去过校验位 (身份证 · IBAN · Luhn) 会失败,
+	//    整条真命中被自己毙掉 = 无声漏报。而 longest 与贪心选【同一个起点】, 所以换成它
+	//    不改变"哪一处命中", 只把终点取对。
 	fwd1   []*Regexp
 	fwd1No []bool // 第 i 条试过且【建不出来】(与 rev1No 同解)
 	fwd1Mu sync.Mutex
-	// fwdSet1[i] = 第 i 条 pattern 【自己一条】的正向 set, 惰性建 —— 给【反向】MatchScanner
-	// (matchscan_reverse.go) 补右端用: 它拿到的是左端, 要的是 ResolveSpanWithin(锚定, 从左端
-	// 往右伸, 且不越过游标), 而那个方法在 *RegexpSet 上。
-	//
-	// 🔴 为什么不能用上面那个 fwd1: 单条 Regexp 【没有】ResolveSpan —— 那是 set 那侧的入口
-	//    (spanresolve.go 走的是 cre2_set_resolve_span_r)。所以这里另存一份"一条一个的正向 set"。
-	//    两份的成本不重复: fwd1 是给正向 B 路的非锚定搜索用的, fwdSet1 只做锚定解析, 一张表
-	//    只会走到其中一条路。
-	fwdSet1   []*RegexpSet
-	fwdSet1No []bool // 第 i 条试过且【建不出来】(与 rev1No 同解)
-	fwdSet1Mu sync.Mutex
 }
 
-// ReverseOneStats 报【已经被建出来】的那些单条反向 set 的账: 几条 · 状态数合计 ·
+// ReverseOneStats 报【已经被建出来】的那些单条反向对象的账: 几条 · 状态数合计 ·
 // 状态区实际字节合计。惰性建 ⟹ 没被问过位置的 pattern 一条都不占。
 // 与 MemInfo 同一个用途 (量内存去哪了), 不制造状态。
 func (s *RegexpSet) ReverseOneStats() (n int, states, arenaCap int64) {
@@ -90,16 +90,16 @@ func (s *RegexpSet) ReverseOneStats() (n int, states, arenaCap int64) {
 	return n, states, arenaCap
 }
 
-// reverseOne 返回第 i 条 pattern 自己一条的反向 set (惰性建, 建不出来返回 nil)。
-// 只读用途 (ResolveSpan*), 并发安全。
-func (s *RegexpSet) reverseOne(i int) *RegexpSetReverse {
+// reverseOne 返回第 i 条 pattern 自己那条【反向】正则 (惰性建, 建不出来返回 nil)。
+// 只读用途 (ResolveSpanWithin), 并发安全。
+func (s *RegexpSet) reverseOne(i int) *RegexpReverse {
 	if i < 0 || i >= len(s.pats) {
 		return nil
 	}
 	s.rev1Mu.Lock()
 	defer s.rev1Mu.Unlock()
 	if s.rev1 == nil {
-		s.rev1 = make([]*RegexpSetReverse, len(s.pats))
+		s.rev1 = make([]*RegexpReverse, len(s.pats))
 		s.rev1No = make([]bool, len(s.pats))
 	}
 	if r := s.rev1[i]; r != nil {
@@ -108,7 +108,7 @@ func (s *RegexpSet) reverseOne(i int) *RegexpSetReverse {
 	if s.rev1No[i] {
 		return nil // 上次就没建出来, 别再重编一遍
 	}
-	r, err := NewRegexpSetReverseMaxMem([]string{s.pats[i]}, s.maxMem)
+	r, err := CompileReverseMaxMem(s.pats[i], s.maxMem)
 	if err != nil {
 		// 建不出来不是错: 调用方把这一条照老路跑 FindAll。记下来避免每遍扫描重试 ——
 		// 反向编译是要钱的, 而失败是【确定性】的, 重试一万次也还是失败。
@@ -119,8 +119,9 @@ func (s *RegexpSet) reverseOne(i int) *RegexpSetReverse {
 	return r
 }
 
-// forwardOne 返回第 i 条 pattern 自己一条的【正向】Regexp (惰性建, 建不出来返回 nil)。
-// 只读用途 (FindStringIndexFrom), 并发安全。是 reverseOne 的镜像, 理由见 fwd1 那段注释。
+// forwardOne 返回第 i 条 pattern 自己那条【正向 · longest 口径】的 Regexp (惰性建,
+// 建不出来返回 nil)。只读用途 (FindStringIndexFrom / FindStringIndexAtWithin), 并发安全。
+// 是 reverseOne 的镜像, 理由见 fwd1 那段注释。
 func (s *RegexpSet) forwardOne(i int) *Regexp {
 	if i < 0 || i >= len(s.pats) {
 		return nil
@@ -137,7 +138,8 @@ func (s *RegexpSet) forwardOne(i int) *Regexp {
 	if s.fwd1No[i] {
 		return nil // 上次就没建出来, 别再重编一遍
 	}
-	r, err := CompileMaxMem(s.pats[i], s.maxMem)
+	// 🔴 longest 口径, 不是默认那个贪心 —— 见 fwd1 那段注释里的红字。
+	r, err := CompileLongestMaxMem(s.pats[i], s.maxMem)
 	if err != nil {
 		s.fwd1No[i] = true
 		return nil
@@ -146,37 +148,6 @@ func (s *RegexpSet) forwardOne(i int) *Regexp {
 	return r
 }
 
-// forwardSetOne 返回第 i 条 pattern 自己一条的【正向 set】(惰性建, 建不出来返回 nil)。
-// 只读用途 (ResolveSpanWithin), 并发安全。是 reverseOne 的镜像 —— 那边是"反向 MatchScanner
-// 之外的人要补左端", 这边是"反向 MatchScanner 要补右端"。
-//
-// 🔴 与 reverseOne 同一条理由: 一条一个, 不建整表。这些 set 【从不用来扫正文】, 只做锚定
-//    解析 (起点是给定的那一个), 所以 `.*?` 前缀那套状态爆炸机制从根上不存在;
-//    惰性 ⟹ 只有真被问到位置的那几条才会被建出来。
-func (s *RegexpSet) forwardSetOne(i int) *RegexpSet {
-	if i < 0 || i >= len(s.pats) {
-		return nil
-	}
-	s.fwdSet1Mu.Lock()
-	defer s.fwdSet1Mu.Unlock()
-	if s.fwdSet1 == nil {
-		s.fwdSet1 = make([]*RegexpSet, len(s.pats))
-		s.fwdSet1No = make([]bool, len(s.pats))
-	}
-	if r := s.fwdSet1[i]; r != nil {
-		return r
-	}
-	if s.fwdSet1No[i] {
-		return nil // 上次就没建出来, 别再重编一遍 (失败是确定性的)
-	}
-	r, err := NewRegexpSetMaxMem([]string{s.pats[i]}, s.maxMem)
-	if err != nil {
-		s.fwdSet1No[i] = true
-		return nil
-	}
-	s.fwdSet1[i] = r
-	return r
-}
 
 // DefaultSetMaxMem 是 RE2 的默认内存预算 (RE2::Options::kDefaultMaxMem = 8MB)。
 // NewRegexpSet 用的就是它; NewRegexpSetMaxMem 传 <=0 也回落到它。

@@ -81,20 +81,29 @@ Lo = Hi - min
 
 ### (b) 变长 —— 路 B 就是 leftmost-longest 的定义本身
 
-拿到一个右端 `Hi` 之后:
-
-1. 从 `from = max(游标, Hi-maxL)` 起做一次**正向非锚定**搜索 ⟹ 得到 `from` 之后**最靠左**的起点 `s`;
-2. 从 `s` 起**锚定**取**最长**右端。
+拿到一个右端 `Hi` 之后, 从 `from = max(游标, Hi-maxL)` 起做**一次**正向非锚定搜索, 直接拿到
+整段区间。
 
 "最靠左的起点, 该起点上最长的匹配" —— 这就是 leftmost-longest 的定义。它**不挑 pattern 形状**,
 不需要对 pattern 做任何静态判断, 也没有"某些形状会漏"的口子。
 
-🔴 关键实现约束: 那两次搜索都传的是**整串 + startpos**(`Regexp.FindStringIndexFrom` /
-`RegexpSet.forwardOne`), **不切片**。切片会让 `\b` / `^` / `$` 在两个切口上看到假的邻字节 ——
-`re.FindStringIndex(s[lo:hi])` 是错的写法, 别这么补。
+🔴 **为什么是一趟而不是两趟**(2026-08-27 之前是两趟)。leftmost-first(贪心)与
+leftmost-longest **选同一个起点**, 只在终点上分歧。所以旧写法是"贪心搜一次定起点 → 再锚定
+一次把终点重取成最长"; 现在直接用 **longest 口径编的那条单条正则**
+(`RegexpSet.forwardOne` → `CompileLongestMaxMem`), 起点和终点在同一次搜索里一起给了。
+答案一字不差 —— 钉在 `matchscan_paths_test.go`(与旧的两趟 set 路子逐字节对账)。
 
-代价: 每处命中比 `spanFast` 贵约 **1.6x**; 没有长度上界的条目还要走完空隙(各轮窗口两两不交
-且递增, 累加封顶 = 多扫一遍正文, **2.00x**)。
+🔴 关键实现约束: 那次搜索传的是**整串 + startpos**(`Regexp.FindStringIndexFrom`), **不切片**。
+切片会让 `\b` / `^` / `$` 在两个切口上看到假的邻字节 —— `re.FindStringIndex(s[lo:hi])` 是错的
+写法, 别这么补。
+
+代价: 每处命中只要一趟(比走两趟的 `spanFast` 还少); 贵在**没有长度上界的条目要走完空隙**
+(各轮窗口两两不交且递增, 累加封顶 = 多扫一遍正文, **2.00x**)。实测 `benchPats`/64KB:
+命中密集时 B 是 A 的 1.38x, 命中稀疏时 2.94x, 差价几乎全在走空隙上。
+
+🔴 顺带的一件大事: 这一趟走的是 `RE2::Match` 那条**完整的路**(DFA → OnePass/BitState/NFA
+逐级回退)。旧写法的第二趟走的是 set 的锚定解析, 那是 kManyMatch 的 DFA **独一条**, DFA 放弃
+就只能整遍失败。换掉之后, 默认档这一档的 "DFA 放弃" 分支**根本不再发生**。
 
 钉在 `TestMatchScanSpanIsLongest`: 语料就是路 A 的已知反例, 默认档必须逐字节等于
 `re.Longest().FindAllStringIndex`。这个测试还**同时**数了路 A 岔开几条 —— 岔开 0 条就报错,
@@ -148,6 +157,56 @@ DFA-only (`re2_set.cc:216`, `dfa_failed` ⟹ 直接 `return false`) —— NFA �
 
 ---
 
+### (d) 一条总规矩: 扫正文走 set, 补端点**全走单条对象**
+
+2026-08-27 定的。扫正文那一遍走整表 set(那正是这一层存在的理由), 之后**补端点的每一趟都走
+这一条 pattern 自己的单条对象**, 一趟都不再回 set。
+
+| | 趟数 | 走谁 |
+|---|---|---|
+| 定长 | 0 | 一句减法, 不进引擎 |
+| 默认档 | 1 | 正向单条 longest 非锚定 `FindStringIndexFrom` |
+| `spanFast` | 2 | 反向单条锚定 `RegexpReverse.ResolveSpanWithin` → 正向单条 longest 锚定 `FindStringIndexAtWithin` |
+| 反向 MatchScanner | 1 | 正向单条 longest 锚定 `FindStringIndexAtWithin`(bound 掐在游标上) |
+
+**三条理由**:
+
+1. 单条走的是 `RE2::Match` 那条完整的路(DFA → OnePass/BitState/NFA 逐级回退), DFA 放弃了
+   还有下家; set 那侧的锚定解析是 kManyMatch 的 DFA **独一条**, 没有下家 —— "DFA 放弃"在
+   那边只能整遍失败(`re2_set.cc:216`, `dfa_failed` ⟹ 直接 `return false`, 上游也是这么写的)。
+   换掉之后, 只剩 `spanFast` 的第一趟(反向锚定)还会碰到这件事 —— 因为 RE2 自己求匹配左端
+   也只有 DFA 一条路。
+2. 补端点的流量不再冲刷整表那份大 DFA 缓存(真表 155 条那份), 两边互不干扰。
+3. 状态更小: 单条不必背 kManyMatch 每个状态那张 id 表。
+
+**答案一字不差**: `matchscan_paths_test.go` 的 `TestMatchScanPathsSameAsSetRoute` ——
+两条路各 300 轮 AST 生成的语料, 共对账 5.4 万处区间, 与旧的 set 路子逐字节相同。
+参照实现故意用**没删的那几个 set 入口**重算一遍, 所以这份钉子长期有效: 它钉的是"单条那条路
+与 set 那条路同解"这件事本身, 不是某一次改动的快照。
+
+**价钱**(64KB 语料 · `benchPats` · `BenchmarkMatchScanOldVsNew`, 新旧两套在同一个二进制里
+同一次运行对照):
+
+| 语料 | 默认档 旧→新 | `spanFast` 旧→新 |
+|---|---|---|
+| 命中密集 (`most`) | 968µs → 618µs (**-36%**) | 614µs → 447µs (**-27%**) |
+| 命中稀疏 (`few`) | 持平 | 持平 |
+| 零命中 (`zero`) | 持平 | 持平 |
+
+稀疏档持平是对的: 那一档的时间全在"走空隙"上, 补端点那几趟本来就没跑几次。
+
+🔴 顺带记一笔实现坑: `cre2_match_at` 原本每次调用 `std::vector<StringPiece> sub(nmatch)`,
+即**每处命中一次 malloc/free**。补端点是按处命中调用的, 这笔常数在低命中密度上能量出来
+(实测慢 2%)。改成 nmatch≤8 走栈上那块之后打平。
+
+**缺的那个 API 是怎么补的**: 这条路上原本缺三样, 都补进 cre2 了 ——
+`cre2_new_longest_max_mem`(longest 口径编译)· `cre2_match_at_anchored`(锚定在 startpos 的
+`RE2::ANCHOR_START` 搜索)· `cre2_resolve_span_reverse_r`(单条的反向锚定解析, 实现就是
+`RE2::Match` 自己求匹配左端时走的那一句: 反向程序 + `kAnchored` + `kLongestMatch`)。
+最后那个**不能**拿"一条 pattern 的 set" 去凑: 单条 `Compile` 会把 `^` / `$` 从程序里摘成
+`anchor_start_`/`anchor_end_` 两个标志, 而只有 `SearchDFA` 会去查这两个标志 —— 绕开它自己
+驱动 DFA 的话 `^foo` 会在正文中间也认(钉在 `TestReverseResolveSpanWithinAnchorPattern`)。
+
 ## 3. 对拍要拿 `Longest()` 当 oracle
 
 最容易踩的一个坑, 单独拎出来:
@@ -168,9 +227,13 @@ locs := want.FindAllStringIndex(text, -1)
 
 ## 4. `spanFast`: 它是什么, 什么时候才该挂
 
-`spanFast` 强制走**游标启发式**那条路: 从右端往左**锚定回推一次**(用这一条 pattern 自己的反向
-对象, 回看窗口掐在游标上)拿最靠左的起点。代价与**正文长度无关** —— 这是它比默认档便宜的
-全部原因。
+`spanFast` 强制走**游标启发式**那条路, 两趟:
+
+1. **反向单条**锚定回推一次(`RegexpReverse.ResolveSpanWithin`, 回看窗口掐在游标上)拿最靠左的起点;
+2. **正向单条 longest** 锚定在那个起点上取最长右端(`Regexp.FindStringIndexAtWithin`)。
+
+两趟的代价都与**正文长度无关**(= 这处命中有多长 / 回看多远)—— 这是它比默认档便宜的全部原因。
+默认档只要一趟, 可它那一趟是**非**锚定的, 没有长度上界的条目要一路走完空隙。
 
 ### 它给的是"第三种口径", 而且这是结构性的
 
@@ -213,7 +276,8 @@ x{1,3}[a-c]?(?:ab|cd)?   撞 "xab"        路A [0,3)="xab"      Longest [0,2)="x
 `\b(?:…)\b` 之后 **0 处**)。word boundary 把起点钉死, 回看窗口里合法起点只剩一个,
 "挑哪个"根本不发生。
 
-这种条落在默认档上是**白掏 1.6x~2.00x 的钱**。`spanFast` 就是给它们留的出口。
+这种条落在默认档上是**白掏那笔走空隙的钱**(实测 `benchPats`/64KB: 命中密集时默认档是
+`spanFast` 的 1.38x, 命中稀疏时 2.94x)。`spanFast` 就是给它们留的出口。
 
 🔴 **挂之前先把凭据跑出来, 别凭感觉。** 跑出 0 岔开再挂 —— 挂上之后它既是快的那条路,
 **又确实是 leftmost-longest**(只是这句由调用方的 fuzz 背书, 不由库背书)。
@@ -390,15 +454,15 @@ ASCP 的敏感数据门(`asc/engine/`)把整张规则表接到了 `MatchScanner`
 这个口径本来就定义在起点上, 所以这一层**没有"猜"这一步**:
 
 ```
-反向 set FindAllIndex                            → 匹配左端, 按扫描方向(从右往左)单调
-正向 set ResolveSpanWithin(from=左端, bound=游标)  → 【最长】右端, 且绝不越过游标
+反向 set FindAllIndex                                      → 匹配左端, 按扫描方向(从右往左)单调
+正向【单条】FindStringIndexAtWithin(from=左端, bound=游标)  → 【最长】右端, 且绝不越过游标
 ```
 
 于是:
 
 - 没有路 A / 路 B 之分;
 - 没有 `spanFast` 这一档(配了 `SetModes` **当场报错**, 不是静默忽略);
-- 不需要 `maxL` 窗口 —— 每处命中恒等于一次锚定解析, 代价 = 这处命中有多长, 与正文长度无关。
+- 不需要 `maxL` 窗口 —— 每处命中恒等于一趟锚定搜索, 代价 = 这处命中有多长, 与正文长度无关。
 
 🔴 顺带解掉了正向那边接不了的一族: 正向默认档要 `maxL` 才框得出回看窗口, **没有长度上限**
 的 pattern(邮箱那种)框不出来; 反向这一侧根本不需要窗口。
