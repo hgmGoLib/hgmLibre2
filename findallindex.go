@@ -30,7 +30,8 @@
 //
 // 🔴 顺序【不保证】全局按位置升序。一段游程要等"这条 pattern 再次命中且与上次不连号"或者
 //    "整篇扫完"才收口, 所以不同 pattern 的游程会交错, 最后一批还会在扫完时集中吐出来。
-//    但【同一条 pattern 内部】是升序的 (扫的方向本来就是单向的), 上面那层的游标就靠这条。
+//    但【同一条 pattern 内部】按【扫描方向】单调 —— 正向 set 升序, 反向 set 【降序】
+//    (扫的方向本来就是单向的)。上面那两层的游标就靠这条 (matchscan.go / matchscan_reverse.go)。
 //
 // 🔴 语义不是 FindAllStringIndex。FindAll 给的是 leftmost-first 的【不重叠】匹配序列;
 //    这里给的是"所有 pattern 的所有匹配端点", 重叠的也在里面 (`abcd|bc` 撞 "abcd" 两条都报)。

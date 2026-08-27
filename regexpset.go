@@ -59,6 +59,17 @@ type RegexpSet struct {
 	fwd1   []*Regexp
 	fwd1No []bool // 第 i 条试过且【建不出来】(与 rev1No 同解)
 	fwd1Mu sync.Mutex
+	// fwdSet1[i] = 第 i 条 pattern 【自己一条】的正向 set, 惰性建 —— 给【反向】MatchScanner
+	// (matchscan_reverse.go) 补右端用: 它拿到的是左端, 要的是 ResolveSpanWithin(锚定, 从左端
+	// 往右伸, 且不越过游标), 而那个方法在 *RegexpSet 上。
+	//
+	// 🔴 为什么不能用上面那个 fwd1: 单条 Regexp 【没有】ResolveSpan —— 那是 set 那侧的入口
+	//    (spanresolve.go 走的是 cre2_set_resolve_span_r)。所以这里另存一份"一条一个的正向 set"。
+	//    两份的成本不重复: fwd1 是给正向 B 路的非锚定搜索用的, fwdSet1 只做锚定解析, 一张表
+	//    只会走到其中一条路。
+	fwdSet1   []*RegexpSet
+	fwdSet1No []bool // 第 i 条试过且【建不出来】(与 rev1No 同解)
+	fwdSet1Mu sync.Mutex
 }
 
 // ReverseOneStats 报【已经被建出来】的那些单条反向 set 的账: 几条 · 状态数合计 ·
@@ -132,6 +143,38 @@ func (s *RegexpSet) forwardOne(i int) *Regexp {
 		return nil
 	}
 	s.fwd1[i] = r
+	return r
+}
+
+// forwardSetOne 返回第 i 条 pattern 自己一条的【正向 set】(惰性建, 建不出来返回 nil)。
+// 只读用途 (ResolveSpanWithin), 并发安全。是 reverseOne 的镜像 —— 那边是"反向 MatchScanner
+// 之外的人要补左端", 这边是"反向 MatchScanner 要补右端"。
+//
+// 🔴 与 reverseOne 同一条理由: 一条一个, 不建整表。这些 set 【从不用来扫正文】, 只做锚定
+//    解析 (起点是给定的那一个), 所以 `.*?` 前缀那套状态爆炸机制从根上不存在;
+//    惰性 ⟹ 只有真被问到位置的那几条才会被建出来。
+func (s *RegexpSet) forwardSetOne(i int) *RegexpSet {
+	if i < 0 || i >= len(s.pats) {
+		return nil
+	}
+	s.fwdSet1Mu.Lock()
+	defer s.fwdSet1Mu.Unlock()
+	if s.fwdSet1 == nil {
+		s.fwdSet1 = make([]*RegexpSet, len(s.pats))
+		s.fwdSet1No = make([]bool, len(s.pats))
+	}
+	if r := s.fwdSet1[i]; r != nil {
+		return r
+	}
+	if s.fwdSet1No[i] {
+		return nil // 上次就没建出来, 别再重编一遍 (失败是确定性的)
+	}
+	r, err := NewRegexpSetMaxMem([]string{s.pats[i]}, s.maxMem)
+	if err != nil {
+		s.fwdSet1No[i] = true
+		return nil
+	}
+	s.fwdSet1[i] = r
 	return r
 }
 

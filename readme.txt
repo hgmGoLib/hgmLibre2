@@ -4,7 +4,8 @@
 本库 vs Go 标准库 regexp 怎么选 看 doc/与标准库regexp怎么选.md —— 哪种形状谁更快 (含实测表)、
 本库缺哪些 stdlib API、一页判据。数据出自 stdlib_compare_test.go, 换机器重跑一遍就知道还成不成立。
 一遍扫一张表要"命中在哪" (MatchScanner) 看 doc/MatchScanner的leftmost-longest保证.md ——
-默认档凭什么敢说 leftmost-longest、对拍要拿哪个当 oracle、怎么用 fuzz 把更多条拉进 spanFast 快档。
+默认档凭什么敢说 leftmost-longest、对拍要拿哪个当 oracle、怎么用 fuzz 把更多条拉进 spanFast 快档,
+以及【反向 MatchScanner】那一侧的 rightmost-longest (§8): 什么时候该反着扫、两种口径差在哪。
 
 要点速记 (详见 README.md):
 * 【默认用本库】。标准库 regexp 的匹配是从零重写的 NFA 模拟, 只有提得出【字面量前缀】时才走
@@ -127,8 +128,9 @@
       反向线性。实测 [A-Za-z][A-Za-z0-9]{2,19}key × 120 份 8KB 语料: 正向 35149 状态 / 5.35MB,
       反向 45 状态 / 0.01MB, 命中集一致。
       ⚠ Match 只回答"命中没有 / 哪几条命中", 不回答"在哪"。要位置别再走"命中之后正向
-      FindStringIndex 重扫整篇"那条老路 —— 用 FindAllIndex (见下), 反向 set 直接给匹配左端,
-      再用正向 set 的 ResolveSpan 取右端, 第二遍只碰命中那一段。
+      FindStringIndex 重扫整篇"那条老路 —— 用 RegexpSetReverse.NewMatchScanner (见下面
+      "反向 MatchScanner"): 一遍扫就直接给不重叠的命中区间, 口径 rightmost-longest。
+      只想自己拼的, 底座也在: FindAllIndex 给匹配左端, 正向 set 的 ResolveSpan 取右端。
       🔴 正向 RegexpSet 和反向 RegexpSetReverse 是【两个类型】, 不是一个类型上的 Reverse() 开关
       (2026-08-25 拆的; 单条那边 Regexp / RegexpReverse 本来就是两个)。理由三条: 两份完全不同的
       DFA 状态缓存混在一个对象里 MemInfo() 说不清是哪份; 两边贵法差三个数量级 (155 条表扫 6.4MB:
@@ -357,6 +359,56 @@
         按正文长度: 真语料 8KB 以下打平 (1.0×) · 32KB 3.1× · 512KB 6.1× · 2MB 14×
         最坏 (每 38 字节一处命中的合成串): 0.94×, 即 6% 慢 —— 每处命中要两次 cgo 往返,
         正文短到几乎全是命中时这笔固定开销赢不了。真 base64 碎片不长这样 (打平)。
+    - RegexpSetReverse.NewMatchScanner + (*MatchScannerReverse).SetModes / Scan / HitIDs / Hit / Close
+      + RegexpSetReverse.ForwardSetOneStats:
+      【反向 MatchScanner】—— 与上面那个是镜像, 从正文末尾往前一遍扫, 同样一批一批交出不重叠的
+      命中区间。用法逐字相同 (换成 rs.NewMatchScanner() 即可), 只有两处不一样:
+        ① 交出来的区间按 Lo 【降序】(正向是升序);
+        ② 去重叠的口径是 【rightmost-longest】(正向是 leftmost-longest)。
+      🔴 两种口径没有本质区别, 只是结果不一样 —— 同一片正文上"谁先占坑"从左边换到了右边。
+         两边都保证: text[Lo:Hi] 是真匹配 · 同一条 pattern 内部互不相交 · 有匹配的地方不静默。
+         只在【两个真匹配互相交叠】的地方才分家, 不交叠的正文上两者逐处相同:
+           a|ab  撞 "abab"   最左最长 [[0,2) [2,4)]   最右最长 [[2,4) [0,2)]   同一批, 顺序反
+           ab|b  撞 "aab"    最左最长 [[1,3)="ab"]    最右最长 [[2,3)="b"]     ← 这里才真差
+         要跟 stdlib 的 re.Longest().FindAllStringIndex 逐字节对上就用正向那个; 只是要"把这片
+         正文里的东西都框出来"(脱敏 · 定位 · 计数), 两个都行。
+
+      ── 什么时候该用它 ────────────────────────────────────────────────────────
+      表里有【正着扫爆状态、反着读塌回线性】的 pattern 的时候 —— `S B{m,n} L` 里起始类严格
+      窄于重复类那一族 (doc/状态数为什么会相乘.txt §3)。实测 [A-Za-z][A-Za-z0-9]{2,19}key
+      × 120 份 8KB 语料: 正向 66572 状态 / 8.39MB, 反向 42 状态 / 0.07MB。
+      在这一层补上之前, 这种表反着扫只能当【门】(Match 回答哪几条命中), 要位置还得正向再扫
+      一遍全文 —— 而"把 1+k 遍压成 1 遍"正是 MatchScanner 存在的全部意义。
+      🔴 方向是【每条 pattern 各自】的决定, 不是一张表的属性: 各建一个单条正/反向 set, 拿真
+         语料比 MemInfo().States, 小的那边就是它该去的那一组。反向 set 本身仍然必须【一条一个
+         或者很小一张表】—— set 里状态数是相乘的, 155 条的反向表在 6.4MB 上是 65 秒。
+
+      ── 为什么反向【更好】做, 不是更难做 ──────────────────────────────────────
+      正向那一遍 DFA 交出来的是匹配【右端】, 起点得在 Go 这侧猜回去 (spanFast 那一整节的
+      "第三种口径"讲的就是这件事的代价)。反向交出来的是【左端】= 起点, 而 leftmost/rightmost-
+      longest 这个口径本来就定义在起点上 ⟹ 这一层【没有猜这一步】:
+        反向 set FindAllIndex                          → 匹配左端, 按扫描方向 (从右往左) 单调
+        正向 set ResolveSpanWithin(from=左端, bound=游标) → 【最长】右端, 且绝不越过游标
+      于是没有路 A / 路 B 之分, 没有 spanFast 这一档 (配了当场报错), 也不需要 maxL 窗口 ——
+      每处命中恒等于一次锚定解析, 代价 = 这处命中有多长, 与正文长度无关。
+      🔴 顺带解掉了正向那边接不了的一族: 正向默认档要 maxL 才框得出回看窗口, 【没有长度上限】
+         的 pattern (邮箱那种) 框不出来; 反向这一侧根本不需要窗口。
+
+      ── 为什么"从右往左"仍然一个字节都不用攒 ──────────────────────────────────
+      因为口径也跟着翻了。硬要在反向扫描上给 leftmost-longest 才要攒: 手上这一处随时可能被更
+      靠左、还没扫到的那一处整个吃掉 —— 有上界的还能靠一个 maxL 宽的延迟缓冲兜住, 无上界的
+      得攒到整篇扫完, 内存跟着正文长, 正是这一层存在的理由被赔掉。
+      改成 rightmost-longest 这件事就没了: 从右往左走,【第一个见到的起点就是最终答案】, 左边
+      不可能再来一个把它顶掉 —— 与正向"第一个见到的就是最终答案"是同一句话照镜子。
+      所以游标照样在回调里当场推完, 输出照样写进那块固定的 12KB 缓冲。
+
+      ── 正确性怎么钉的 ────────────────────────────────────────────────────────
+      matchscan_reverse_test.go: 语料按每条 pattern 自己的 AST 生成 (随机字节撞不出真匹配 =
+      空转绿), 判据是与本库无关的【穷举 rightmost-longest】(stdlib \A(?:pat)\z 逐 (s,e) 试)。
+      名单里前五条正是把【正向路 A】搞岔的那几个反例 (abc|b · a|ab · x{1,3}[a-c]?(?:ab|cd)? ·
+      (?:ab)?[bc]{1,2} · (?:ab)*b{1,3}) —— 反向这一侧一处都不岔, 因为没有"猜"这一步。
+      判据自身有一道自检: ab|b 撞 "aab" 两种口径必须给出不同答案, 否则整套对拍是空转。
+
     - 性能 (spanscan_bench_test.go · 64KiB 正文 · 10 条通用 pattern · Ryzen 5900X · 稳态复用):
       对照的"旧实现"就是今天调用方那一套 —— set.Match 当门 + 逐条命中 pattern 在整篇正文上
       FindAllStringIndex (命中 k 条 = 1+k 遍全文扫描, 而且后面那 k 遍是最贵的非锚定扫描)。

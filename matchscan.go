@@ -4,6 +4,10 @@
 //    怎么用 · 这句保证怎么兑现的 · 怎么用 fuzz 把更多条拉进 spanFast 快档:
 //    doc/MatchScanner的leftmost-longest保证.md。
 //
+// 🔴 镜像那一半在 matchscan_reverse.go: RegexpSetReverse.NewMatchScanner —— 从末尾往前扫,
+//    口径 rightmost-longest, 区间按 Lo 【降序】。表里有"正着扫爆状态、反着读塌回线性"的
+//    pattern (S B{m,n} L 那一族) 才用它; 两种口径的差别见那份 doc 第 8 节。
+//
 // ── 它替掉的是哪段路 ────────────────────────────────────────────────────────
 // 调用方今天的写法是"两段式": 先 Set.Match 扫一遍拿到"哪几条命中"(一张 bool 表), 然后为了知道
 // 【命中在哪】, 把这几条各自的 Regexp 拿出来对整篇正文再跑一遍 FindAllStringIndex。命中 k 条

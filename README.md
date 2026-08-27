@@ -168,6 +168,11 @@ as `regexp.Compile` (RE2's default Perl mode), *not* leftmost-longest — e.g.
   above: one pass giving the hit table **and** de-duplicated match spans, replacing
   `Match` + one `FindAllStringIndex` per hit pattern;
   see [Where a set matched](#where-a-set-matched-matchscanner) below
+- `RegexpSetReverse.NewMatchScanner` (`MatchScannerReverse`, same method set) — *not* in
+  stdlib; the same thing from the other end: one backwards pass giving de-duplicated
+  spans under **rightmost-longest**, for tables whose patterns are cheap in reverse and
+  explosive forwards; see
+  [Where a reverse set matched](#where-a-reverse-set-matched-matchscannerreverse) below
 - `RegexpSet.ResolveSpan` / `ResolveSpanWithin` / `ResolveSpanBytes` (the same three on
   `RegexpSetReverse`, in the opposite direction) — *not* in stdlib; complete one end
   point into a whole span with a single anchored question whose cost does not depend on
@@ -792,6 +797,85 @@ Patterns that RE2 accepts but Go's parser rejects return `(0, PatLenUnbounded)` 
 conservative in the safe direction, i.e. it can only push a pattern onto the fallback
 path, never produce a wrong start.
 
+### Where a reverse set matched: `MatchScannerReverse`
+
+The mirror of `MatchScanner`: one pass from the **end** of the input, handing back
+de-duplicated, non-overlapping spans in batches. The API is identical — open it on a
+`*RegexpSetReverse` instead of a `*RegexpSet`:
+
+```go
+rs, _ := hgmLibre2.NewRegexpSetReverseMaxMem(patterns, hgmLibre2.DefaultSetMaxMem)
+ms, _ := rs.NewMatchScanner()       // reusable workspace; not concurrency-safe
+defer ms.Close()
+
+unresolved, _ := ms.Scan(body, func(batch []hgmLibre2.SetMatch) {
+    for _, m := range batch { _ = body[m.Lo:m.Hi] }   // a real match of pattern m.Index
+})
+```
+
+Two things differ from the forward scanner, and only two:
+
+1. spans come back in **descending** `Lo` order (forward: ascending);
+2. the de-overlap rule is **rightmost-longest** (forward: leftmost-longest).
+
+Both directions guarantee the same three things: every span is a real match, spans of
+the *same* pattern never overlap, and no region containing a match is silently skipped.
+The two rules differ only where two real matches actually overlap — everywhere else
+they agree span for span:
+
+| input | pattern | leftmost-longest | rightmost-longest |
+|---|---|---|---|
+| `abab` | `a\|ab` | `[0,2) [2,4)` | `[2,4) [0,2)` — same set, reversed order |
+| `aab` | `ab\|b` | `[1,3)` = `"ab"` | `[2,3)` = `"b"` — genuinely different |
+
+If you need to match `re.Longest().FindAllStringIndex` byte for byte, use the forward
+scanner. If you just need everything in the text framed (masking, locating, counting),
+either rule does.
+
+**When to reach for it.** When the table contains patterns that explode forwards and
+collapse in reverse — the `S B{m,n} L` shape of
+[Scanning backwards](#scanning-backwards). Before this layer existed, such a table
+could only be scanned backwards as a *gate*: `Match` said which patterns hit, and
+getting positions meant a second forward pass over the whole body — which is exactly
+the `1 + k` passes `MatchScanner` exists to collapse.
+
+**Reverse is the easier direction, not the harder one.** A forward DFA pass reports
+match **ends**, so the start has to be guessed back on the Go side — that guess is
+what the whole `spanFast` "third semantics" discussion above is about. A reverse pass
+reports match **starts**, and leftmost/rightmost-longest is *defined* on starts. So
+there is no guess here:
+
+- reverse `FindAllIndex` → match starts, monotone in scan order (right to left);
+- forward `ResolveSpanWithin(from: start, bound: cursor)` → the **longest** end that
+  does not cross the cursor.
+
+Hence no path A/B split, no `spanFast` mode (passing it is an error), and no `maxL`
+window. Each span costs exactly one anchored resolve — proportional to the length of
+that match, not to the length of the input. It also picks up the family the forward
+default tier cannot take: patterns with **no upper length bound** (email and friends),
+which forward needs `maxL` to bound a look-back window for.
+
+**Why scanning right-to-left still keeps nothing.** Only because the rule flipped with
+it. Insisting on leftmost-longest *while* scanning backwards is what would force
+buffering: the span in your hand can still be swallowed by one further left that you
+have not reached yet — bounded patterns could ride a `maxL`-wide delay buffer, but
+unbounded ones would have to accumulate until the scan ends, and memory tracking input
+length is precisely what this layer exists to avoid. Under rightmost-longest the
+problem does not arise: going right to left, **the first start you see is final**,
+because nothing further left can outrank it — the same sentence as the forward
+scanner's, in a mirror. So the cursor still advances inside the callback and output
+still goes into the same fixed 12 KB buffer.
+
+**How it is pinned.** `matchscan_reverse_test.go` generates its corpus from each
+pattern's own `regexp/syntax` AST (random bytes never produce real matches — that is a
+vacuously green test) and checks against an exhaustive rightmost-longest oracle written
+against stdlib alone. The first five patterns in that list are exactly the
+counterexamples that break the forward `spanFast` path (`abc|b`, `a|ab`,
+`x{1,3}[a-c]?(?:ab|cd)?`, `(?:ab)?[bc]{1,2}`, `(?:ab)*b{1,3}`); reverse diverges on
+none of them, because there is no guess to get wrong. The oracle carries its own
+self-check: `ab|b` against `"aab"` must produce different answers under the two rules,
+or the whole comparison is vacuous.
+
 ### Scanning backwards
 
 `S B{m,n} L` — a counted repeat whose **start class is strictly narrower than
@@ -830,13 +914,16 @@ attributable:
 | forward | 35 149 | 5.35 MB | 16 |
 | reverse | 45 | 0.01 MB | 16 |
 
-**What it costs you.** A reverse `RegexpReverse` answers "is there a match", not
-"where". There is no `Find` on it and none is planned: a reverse scan stops at the
-left edge of a match and never learns the right one, and it meets the *last* match in
-the input first — so a reverse `Find` could only ever be rightmost, which is a
-different semantics from the forward leftmost-first one. Use reverse as the cheap gate
-and run `FindStringIndex` on a forward `Regexp` for the few inputs that hit; positions
-keep the forward semantics.
+**What it costs you (single `RegexpReverse`).** A `RegexpReverse` answers "is there a
+match", not "where". There is no `Find` on it: a reverse scan meets the *last* match in
+the input first, so a reverse `Find` could only ever be rightmost — a different
+semantics from the forward leftmost-first one. Use reverse as the cheap gate and run
+`FindStringIndex` on a forward `Regexp` for the few inputs that hit.
+
+On the **set** side that objection is answered rather than avoided: rightmost is a
+perfectly good de-overlap rule as long as it is the declared one, so
+[`MatchScannerReverse`](#where-a-reverse-set-matched-matchscannerreverse) gives spans
+under **rightmost-longest** and says so.
 
 `RegexpSetReverse` does report positions, in its own direction:
 [`FindAllIndex`](#findallindex-the-raw-end-point-runs) gives match **starts**
