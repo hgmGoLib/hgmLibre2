@@ -165,6 +165,14 @@ int RE2::Set::ResolveSpan(const char* text, int textlen, int from, int bound,
   return prog_->SpanResolve(size_, text, textlen, from, bound, id, out);
 }
 
+// ── hgmLibre2 追加 ── 见 set.h / re2_dfa_spanscan.inc。id 与 Match 返回的下标同一套。
+int RE2::Set::ViableStarts(const char* text, int textlen, int from, int bound,
+                           int id, int32_t* out, int outcap) const {
+  if (!compiled_ || prog_ == NULL)
+    return -1;
+  return prog_->SpanViableStarts(size_, text, textlen, from, bound, id, out, outcap);
+}
+
 // 没扫过就没有 DFA —— 这时候【不建】, 直接报 built=false。
 void RE2::Set::MemInfo(DFAMemInfo* out) const {
   memset(out, 0, sizeof *out);

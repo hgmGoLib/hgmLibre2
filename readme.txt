@@ -274,6 +274,23 @@
       代价 = 这处命中能延伸多远, 1KB 和 6.4MB 的正文上一样贵; 反向扫全表在 6.4MB 上是 65 秒
       (正向 18ms), 拆成一条一条反着扫倒是便宜, 可命中 k 条就是 k 遍全文 —— 正好是 FindAllIndex
       存在的意义 (把 1+k 遍压成 1 遍) 原样赔回去。两个 API 长得对称, 用途不对称。
+    - RegexpSetReverse.ViableStarts(text, from, bound, id, out) (spanviable.go):
+      【可行前缀回推】—— 给一个匹配右端 from, 把 [bound, from) 里【全部候选起点】一次收齐:
+      即那些位置 s 使 text[s, from) 是第 id 条的一个【可行前缀】(还能被某个后缀补成真匹配,
+      不一定当场就是匹配)。写进 out 的是【降序】, 返回找到的总条数 (可能 > len(out),
+      那就是缓冲不够, 换大的重来一次)。
+      🔴 与 ResolveSpan 的差别只有一处, 但是决定性的: ResolveSpan 的反向机器只种【accept】,
+         所以只认"正好在 from 结束"的那些左端; 这个种【全部状态】, 连"路过 from 的更长匹配"
+         的起点也认。前者是后者的子集, 而【leftmost 到底在哪】只有问后者才问得对 ——
+         \b(?:ab cd ef|cd)\b 撞 "ab cd ef": 门给的最小右端是 "cd" 那处 (偏移 5), 只种 accept
+         只能回推到 3, 而真正的最左起点是 0 (text[0:5)="ab cd" 不是匹配, 但是可行前缀)。
+         这正是 spanFast (路 A) 那条"第三种口径"的病根。
+      🔴 这一步与 ResolveSpan 一样【只能在库里做】: 种全部状态要的是 DFA 起始状态的构造权
+         (re2_dfa.cc 的 start_[kStartViable]), 从外面够不着。种的是【锚定入口的可达闭包】,
+         不是"程序里 1..size 全塞" —— set 程序还挂着一截 .*? 非锚定前缀, 种上它机器永远死不掉,
+         而且回答的会变成另一个问题。
+      代价 = 这处命中能往回够多远 (可行前缀集合空了机器就死), 与正文长度无关 —— 与 ResolveSpan
+      同一个量级、同一个道理。上面那层 MatchScanner2 就是靠它换来严格 leftmost-longest。
     - RegexpSet.NewMatchScanner + (*MatchScanner).SetModes / Scan / HitIDs / Hit / Close
       + RegexpSet.PatternLenRange / ReverseOneStats:
       【一遍扫, 直接给不重复的命中区间】—— 把上面两件 (游程扫 + 锚定解析) 拼成调用方真正要的
@@ -463,6 +480,51 @@
         按正文长度: 真语料 8KB 以下打平 (1.0×) · 32KB 3.1× · 512KB 6.1× · 2MB 14×
         最坏 (每 38 字节一处命中的合成串): 0.94×, 即 6% 慢 —— 每处命中要两次 cgo 往返,
         正文短到几乎全是命中时这笔固定开销赢不了。真 base64 碎片不长这样 (打平)。
+    - RegexpSet.NewMatchScanner2 + (*MatchScanner2).SetModes / Scan / HitIDs / Hit / Stats / Close
+      + RegexpSet.ViableOneStats (matchscan2.go):
+      【第三条补端点的路 (路 D2)】—— 用法与 MatchScanner 逐字相同 (换成 set.NewMatchScanner2()),
+      对外那三条保证也【一字不差】(真匹配 · 同条不相交升序 · 严格 leftmost-longest)。
+      🔴 MatchScanner 一个字都没动。这是【另一个类型】, 两者可以同时存在各扫各的。
+      差别只在补端点怎么走:
+        路 B (MatchScanner 默认档)  从 max(cur, e-maxL) 起正向【非锚定】搜一趟。
+                                    贵在 maxL 没上界时下界塌回游标, 要走完整段空隙。
+        路 A (spanFast)             反向【只种 accept】回推一个起点 + 正向锚定取最长右端。
+                                    便宜, 但给的是第三种口径 (见上)。
+        路 D2 (MatchScanner2)       反向【种全部状态】(ViableStarts) 把 [cur,e) 的候选起点一次
+                                    收齐, 再【从小到大】逐个拿正向锚定 longest 去验, 第一个
+                                    验过的就是答案 —— 升序试 ⟹ 必然 leftmost, longest 口径的
+                                    锚定搜索 ⟹ 必然最长。严格 leftmost-longest, 且不需要 maxL。
+      为什么对 (两条都要, 证明见 matchscan2.go 文件头):
+        ① 候选集不漏: 真答案 [s,E) 若 s ∈ [cur,e), 则 E >= e (e 是 >cur 的最小右端) ⟹
+           text[s,e) 是可行前缀 ⟹ s 必在候选里。
+        ② 一个都没验过 ⟹ [cur,e) 里根本没有起点 (①的逆否) ⟹ 游标可以直接推到 e。
+      价钱 (benchPats 10 条 × 64KiB · 同一批 set 对象 · matchscan2_bench_test.go 的
+      TestMatchScan2PerfTable, 取 7 轮最小值):
+        语料       A(快档)    B(默认)      D2      B/D2   D2/A
+        零命中     90.7µs    90.7µs    90.8µs    1.00   1.00
+        命中稀疏   96.9µs   281.4µs    96.4µs    2.92   0.99
+        最坏输入  430.2µs   603.7µs   450.4µs    1.34   1.05
+        常驻: 路 A 的反向单条 8 条 / 97 状态 / 0.50MB · D2 的反向单条 set 8 条 / 108 状态 / 0.50MB
+        分配: 三条路都是 24 B/op · 2 allocs/op (那 2 笔是 Scan 那个闭包本身, 与路无关);
+              回推那一步稳态零分配, TestMatchScan2NoAlloc 钉着。
+      🔴 一句话: 真表形状上 D2 【拿到了路 A 的价钱和默认档的口径】, 而且常驻内存几乎一样。
+      🔴 但它【不是无条件更好】。最坏形状上多出来的那笔是"验了几个假候选"
+        (TestMatchScan2PerfHard, 单条 × 8KiB 对抗正文):
+          a|a+b                 A 47.7ms  B 47.9ms  D2 47.6ms   (三条都是二次, 打平)
+          a|[ab]+c              A 24.0ms  B 23.8ms  D2 47.4ms   ← 每个右端两个候选, D2 慢一倍
+          err|err[a-z ]*fatal   A 12.0ms  B 11.2ms  D2 11.9ms
+          AAA-[A-Za-z0-9]{8,16} A 108µs   B  96µs   D2  98µs
+        用 Stats() 量这笔: Tries/Emits 就是"平均验了几次才中"。真表上是 0.85~1.00 (基本一次就中),
+        a|[ab]+c 上是 2.00。挂之前先量, 别凭感觉。
+      档位: 复用 MatchScanMode_t, 但这里只有 boolOnly / span 两态有意义 ——
+      spanFast 在这里【当 span 处理】(这条路整个存在的理由就是拿严格口径换路 A 的价钱,
+      再挂一个不准的档就自相矛盾了)。
+      ViableOneStats() 报 D2 多出来的那笔常驻 (每条 pattern 一份反向 set 的 DFA 缓存, 惰性建),
+      与 ReverseOneStats 同一个用途。
+      回归: matchscan2_test.go —— 已知反例逐条对 Longest() (同一批语料上路 A 岔开 4 条, 证明
+      语料有牙齿) · 14 条 pattern × 400 轮随机正文 5600 条对账 5733 处命中岔开 0 ·
+      与路 B 在 benchPats × 三档语料上逐字节相同。
+
     - RegexpSetReverse.NewMatchScanner + (*MatchScannerReverse).SetModes / Scan / HitIDs / Hit / Close:
       【反向 MatchScanner】—— 与上面那个是镜像, 从正文末尾往前一遍扫, 同样一批一批交出不重叠的
       命中区间。用法逐字相同 (换成 rs.NewMatchScanner() 即可), 只有两处不一样:

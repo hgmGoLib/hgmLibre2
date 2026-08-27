@@ -102,6 +102,15 @@ class RE2::Set {
   int ResolveSpan(const char* text, int textlen, int from, int bound,
                   int id, int32_t* out) const;
 
+  // ── hgmLibre2 追加 (非上游 re2) ──
+  // 【反向 set 专用】给一个匹配右端 from, 把 [bound, from) 里全部【候选起点】收下来
+  // (text[s, from) 是第 id 条的可行前缀)。写进 out 的是降序, 返回找到的总条数
+  // (可能 > outcap, 此时只写了前 outcap 个); -1 = 参数错 / 不是反向 set / DFA 放弃。
+  // 这是 ResolveSpan 的"超集版": 那个只认【正好是匹配】的左端, 这个连"路过这个右端的
+  // 更长匹配"的起点也认 —— leftmost 到底在哪, 只有问这一个才问得对。
+  int ViableStarts(const char* text, int textlen, int from, int bound,
+                   int id, int32_t* out, int outcap) const;
+
   // 查这个 Set 的 DFA 缓存水位 + 生涯累计 (没扫过则 out->built=false)。
   // 只读, 短暂拿 DFA 的读锁, 可以和扫描并发调。
   void MemInfo(DFAMemInfo* out) const;

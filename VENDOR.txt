@@ -15,14 +15,15 @@ cre2.h / cre2.cpp      : 我们自己写的极小 C 包装 (不算改 RE2)
 cre2_internal.h        : cre2 各 .cpp 之间共用的句柄定义 (struct cre2_set), 不对外
 cre2_dfastats.cpp      : 进程级 DFA 计数的 hook 安装 (挂 re2::hooks)
 cre2_spanscan.cpp      : "命中在哪"的 C 门面 —— 流式游程扫描 (sqlite3_step 式轮询)
-                         + 锚定解析 (cre2_set_resolve_span 及其按值返回孪生 _r)。
+                         + 锚定解析 (cre2_set_resolve_span 及其按值返回孪生 _r)
+                         + 可行前缀回推 (cre2_set_viable_starts)。
                          🔴 Go 侧一律调 _r 那个: 出参版要把 &out 这个 Go 指针交给 C, 逃逸分析
                          据此每次调用把它搬上堆 —— 一次解析一笔 4 字节, 在"每个端点解析一次"
                          的用法上按端点数放大 (实测 6.5 万个端点 = 6.5 万笔)。同一招见
                          cre2_match_all_r; 有 TestSpanPerf_NoAlloc 钉着不许退回去。
 internal_include/re2/dfa_stats.h : 本库追加的观测结构体 (ScanStats / MemInfo / AttribInfo)
 internal_include/re2/span_scan.h : 流式游程扫描 + 锚定解析的对内声明 + 全部语义说明
-re2_dfa_spanscan.inc   : 流式游程扫描与锚定解析的实现。【不是独立编译单元】—— 由 re2_dfa.cc 末尾
+re2_dfa_spanscan.inc   : 流式游程扫描 · 锚定解析 · 可行前缀回推的实现。【不是独立编译单元】—— 由 re2_dfa.cc 末尾
                          #include 进去, 因为 class DFA 整个定义就在 re2_dfa.cc 里,
                          别的编译单元看不见 State / RWLocker / StateSaver / RunStateOnByteUnlocked。
                          cgo 不编 .inc, 所以扩展名必须留着 (改成 .cc 会被当成第二份实现编两遍)。
@@ -38,12 +39,23 @@ re2_dfa.cc             : ①转移表槽位 8 字节 State* → 4 字节 arena �
                            SpanDFA), 文件末尾 #include "re2_dfa_spanscan.inc"。除这两处外
                            【一个字没动】—— 热循环是另写的一份, 不往 InlinedSearchLoop 里塞
                            分支 (它是全库最热的)。
+                         ⑤可行前缀回推 (MatchScanner2 / 路 D2 用): 私有 enum 里加一个
+                           kStartViable = 8 并把 kMaxStart 从 8 抬到 16 —— 就这一处。
+                           start_[base|kStartViable] 存的是"种【全部指令】"的那个起始状态,
+                           实现全在 re2_dfa_spanscan.inc (SpanDFA::ViableStart/ViableStarts)。
+                           🔴 摆进 start_[] 是为了白拿三样东西: arena 搬家时的重定位 ·
+                           ResetCache 的清空 · 内存归因那趟 BFS 的起点 —— 三处都是
+                           for (i < kMaxStart) 的循环, 抬上限就自动覆盖, 一行都不用改。
+                           🔴 这【不是】给 Prog 加第三个入口 (那必须同时改 Flatten, 见下面
+                           re2_compile.cc 那条的红字)。它是在【Flatten 之后】从现有的
+                           prog_->start() 做一趟可达性遍历把活指令收齐, 用的全是新编号。
 internal_include/re2/prog.h : 追加 SearchDFA 的可选出参 + GetDFAMemInfo / GetDFAAttribInfo 声明
                          + Prog::CompileSet 追加 reversed 参数 (默认 false, 上游调用点不受影响)
                          + Prog::NewSpanScan / Prog::SpanResolve (见 re2/span_scan.h)
+                         + Prog::SpanViableStarts (可行前缀回推, 见 re2_dfa_spanscan.inc)
 internal_include/re2/set.h  : 追加 Match 的可选出参 + MemInfo / AttribInfo 声明
                          + RE2::Set 三参构造 (reversed) 与 reversed() 访问器
-                         + RE2::Set::NewSpanScan / RE2::Set::ResolveSpan
+                         + RE2::Set::NewSpanScan / RE2::Set::ResolveSpan / RE2::Set::ViableStarts
 re2_set.cc             : 上面那两个声明的实现 (转发给 Prog); 反向模式下 Add() 把 HaveMatch
                          节点【前置】而不是后置 (反序编译会把 concat 翻过来, 后置的 Match
                          会跑到 pattern 前面 → 一进门就命中);

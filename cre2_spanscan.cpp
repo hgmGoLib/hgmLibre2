@@ -79,6 +79,15 @@ int cre2_set_resolve_span(const cre2_set *h, const char *text, int textlen,
 	return h->set->ResolveSpan(base, textlen, from, bound, id, out);
 }
 
+int cre2_set_viable_starts(const cre2_set *h, const char *text, int textlen,
+                           int from, int bound, int id, int32_t *out, int outcap) {
+	if (h == nullptr || h->set == nullptr || out == nullptr) {
+		return -1;
+	}
+	const char *base = text ? text : "";
+	return h->set->ViableStarts(base, textlen, from, bound, id, out, outcap);
+}
+
 cre2_span_resolve_result cre2_set_resolve_span_r(const cre2_set *h, const char *text,
                                                  int textlen, int from, int bound, int id) {
 	cre2_span_resolve_result r;

@@ -353,6 +353,23 @@ typedef struct {
 cre2_span_resolve_result cre2_set_resolve_span_r(const cre2_set *h, const char *text,
                                                  int textlen, int from, int bound, int id);
 
+/* cre2_set_viable_starts: 【反向 set 专用】给一个匹配右端 from, 把 [bound, from) 里全部
+ * 【候选起点】收下来 —— 即那些位置 s 使 text[s, from) 是第 id 条 pattern 的一个
+ * 【可行前缀】(还能被某个后缀补成真匹配, 不一定当场就是匹配).
+ *
+ * 与 cre2_set_resolve_span_r 的差别只有一处, 但是决定性的: 那个的反向机器只种 accept,
+ * 所以只认"正好是匹配"的左端; 这个种【全部指令】, 连"路过这个右端的更长匹配"的起点也认.
+ * 前者是后者的子集, 而"leftmost 到底在哪"只有问后者才问得对 ——
+ *   (?:ab cd ef|cd) 撞 "ab cd ef": 门给的最小右端是 "cd" 那一处的右端, 只种 accept
+ *   只能回推到 "cd" 的左端, 种全部状态才能回推到 "ab" 那个真正的最左起点.
+ *
+ * out 里是【降序】(机器从右往左走). 返回【找到的总条数】, 可能 > outcap —— 此时只写了
+ * 前 outcap 个 (也就是最大的那几个, 恰好最没用), 调用方该换个更大的缓冲重来一次.
+ * -1 = 参数错 / 不是反向 set / DFA 放弃.
+ * 代价 = 这处命中能往回够多远 (机器走到死就收工), 与正文长度无关. */
+int cre2_set_viable_starts(const cre2_set *h, const char *text, int textlen,
+                           int from, int bound, int id, int32_t *out, int outcap);
+
 /* cre2_resolve_span_reverse_r: 【单条】正则的反向锚定解析 —— 不经过 set.
  * from = 匹配右端 (不含), 返回【最靠左】的那个左端 (含), text[pos,from) 就是这条 pattern 的一个匹配.
  * bound = 回看不越过它 (左下界), 负数 = 不限. 判定上下文恒是整篇正文, 所以 \b / ^ / $ 看到的

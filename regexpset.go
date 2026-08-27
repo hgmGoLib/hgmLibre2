@@ -70,6 +70,18 @@ type RegexpSet struct {
 	fwd1   []*Regexp
 	fwd1No []bool // 第 i 条试过且【建不出来】(与 rev1No 同解)
 	fwd1Mu sync.Mutex
+	// vp1[i] = 第 i 条 pattern 自己那条【反向 · 只装这一条的 set】, MatchScanner2 (路 D2) 用:
+	//          ViableStarts(锚定在右端往左, 种全部状态) 给【全部候选起点】。
+	//
+	// 🔴 为什么这一份是 set 而不是 rev1 那种单条 RegexpReverse: ViableStarts 是自己驱动
+	//    kManyMatch 的 DFA 走的 (与 ResolveSpan 同一条路), 而单条 Compile 会把 ^ / $ 从程序里
+	//    【摘掉】记成 anchor_start_/anchor_end_ 两个标志 —— 只有 SearchDFA 会去查那两个标志,
+	//    自己驱动 DFA 就查不到, `^foo` 会在正文中间也认。CompileSet 不摘, ^ / $ 留在程序里
+	//    当指令, 所以这条路必须走 set。
+	// 🔴 仍然是【一条一个】, 理由与 rev1 那段一字不差 (反向 set 的状态数是相乘的)。
+	vp1   []*RegexpSetReverse
+	vp1No []bool // 第 i 条试过且【建不出来】(与 rev1No 同解)
+	vp1Mu sync.Mutex
 }
 
 // ReverseOneStats 报【已经被建出来】的那些单条反向对象的账: 几条 · 状态数合计 ·

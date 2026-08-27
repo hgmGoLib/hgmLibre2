@@ -81,6 +81,13 @@ struct SpanDFA {
 
   static int Resolve(DFA* dfa, bool run_forward, const char* text, int textlen,
                      int from, int bound, int id, int32_t* out);
+
+  // ── 可行前缀回推 (MatchScanner2 / 路 D2 用) ────────────────────────────────
+  // ViableStart  : 拿"种全部指令"的那个起始状态 (按 flags 缓存在 start_[base|kStartViable])。
+  // ViableStarts : 从 from 往左走一趟, 沿途把每一个【候选起点】收下来。
+  static DFA::State* ViableStart(DFA* dfa, int base, uint32_t flags);
+  static int ViableStarts(DFA* dfa, const char* text, int textlen,
+                          int from, int bound, int id, int32_t* out, int outcap);
 };
 
 class DFASpanScan {
@@ -562,6 +569,204 @@ int Prog::SpanResolve(int nid, const char* text, int textlen,
   if (dfa == NULL || !dfa->ok())
     return -1;
   return SpanDFA::Resolve(dfa, !reversed_, text, textlen, from, bound, id, out);
+}
+
+// ── 可行前缀回推 (SpanDFA::ViableStart / ViableStarts) ─────────────────────
+//
+// 回答的问题: 给一个匹配【右端】e, 在 [bound, e) 里, 哪些位置 s 满足
+//   "text[s, e) 是第 id 条 pattern 的一个【可行前缀】" —— 即存在某个 w 使
+//   text[s, e) + w 能被这条 pattern 匹配。
+//
+// 🔴 与 Resolve 的差别只有一处, 但是决定性的: Resolve 的反向机器只种【accept】, 所以它
+//    回答的是"哪些 s 使 text[s,e) 【正好】是一个匹配"; 这里种的是【全部指令】, 回答的是
+//    "哪些 s 起头的匹配【路过】了 e"。后者是前者的超集, 而且正是"leftmost 到底在哪"
+//    这个问题唯一问得对的形状 ——
+//      \b(?:ab cd ef|cd)\b 撞 "ab cd ef": 门给的最小右端是 "cd" 那处的右端,
+//      只种 accept 只能回推到 "cd" 的左端; 种全部状态才能回推到 "ab" 那个真正的最左起点
+//      (text["ab cd ef" 的 0 : "cd" 右端) 是可行前缀, 但不是匹配)。
+//
+// 🔴 为什么"种全部指令"就等于可行前缀 (证明):
+//    反向 set 的程序 R 认的是 reverse(L) —— 它不是"把正向程序的箭头掉个头", 而是从
+//    倒过来的 pattern 树重新编的一台机器 (CompileSet 的 reversed_), 但认的语言就是 reverse(L)。
+//    这一趟从 e 往左吃字节, 吃进去的串正好是 reverse(text[s,e)); 种子是【R 的全部活状态】,
+//    终点是 R 的 accept。于是:
+//      走到 accept ⟺ 存在某个活状态 q, 从 q 出发吃 reverse(text[s,e)) 能到 accept
+//                  ⟺ reverse(text[s,e)) 是 reverse(L) 里某个词的【后缀】
+//                  ⟺ text[s,e) 是 L 里某个词的【前缀】 = 可行前缀。∎
+//    (两个方向都要活状态: 只有从 start 可达的状态才配当种子 —— 见下面那道"可达闭包"的闸;
+//     而到不了 accept 的状态种上也白种, 它一个候选都变不出来。)
+//
+// 出参 out 里的候选起点是【降序】的 (机器从右往左走, 先看见的位置更大)。调用方要 leftmost
+// 就倒着遍历。返回值是【找到的总条数】, 可能 > outcap —— 此时只写了前 outcap 个 (也就是
+// 最大的那几个, 恰好是最没用的那几个), 调用方该换个更大的缓冲重来一次。
+//
+// 代价: 每步吃掉一个字节, 位置严格递减, 所以最多 (from - bound) 步; 而常态是机器自己先死
+// (可行前缀集合空了) —— 与 Resolve 一样, 与正文长度无关, 只与"这处命中能往回够多远"有关。
+
+DFA::State* SpanDFA::ViableStart(DFA* dfa, int base, uint32_t flags) {
+  DFA::StartInfo* info = &dfa->start_[base | DFA::kStartViable];
+  DFA::State* s = info->start.load(std::memory_order_acquire);
+  if (s != NULL)
+    return s;
+  MutexLock l(&dfa->mutex_);
+  s = info->start.load(std::memory_order_relaxed);
+  if (s != NULL)
+    return s;
+  // 🔴 这里是与 AnalyzeSearchHelper 唯一的差别: 那边只 AddToQueue 一个入口指令
+  // (start 或 start_unanchored), 这里把【锚定入口能到达的每一条指令】都塞进去。
+  //
+  // 🔴 是"锚定入口的可达闭包", 不是图省事的 "1..size 全塞"。set 程序里除了锚定入口
+  //    还挂着一截 `.*?` 非锚定前缀 (start_unanchored 那条路), 那截也在 1..size 里 ——
+  //    种上它机器就【永远死不掉】, 而且"走到 accept"回答的会变成另一个问题
+  //    ("存在某个 s' >= s 使 text[s',from) 是可行前缀"), 那不是调用方要的东西。
+  //    实测: `b` 撞 "abc" 问 from=3, 全塞会多报一个 1 出来 —— text[1:3)="bc" 根本
+  //    不是 `b` 的前缀。只种锚定闭包就没有这一路。
+  //
+  // 可达闭包【就是】那个自动机的全部状态, 所以这一步不多不少: 走不到的指令连 Match
+  // 都够不着, 种上它一个候选也多不出来。
+  int n = dfa->prog_->size();
+  std::vector<bool> seen(n, false);
+  std::vector<int> stk;
+  stk.push_back(dfa->prog_->start());
+  while (!stk.empty()) {
+    int id = stk.back();
+    stk.pop_back();
+    if (id <= 0 || id >= n || seen[id])
+      continue;
+    seen[id] = true;
+    Prog::Inst* ip = dfa->prog_->inst(id);
+    if (!ip->last())
+      stk.push_back(id + 1);   // 同一条 list 里的下一支 (交替的另一条路)
+    switch (ip->opcode()) {
+      case kInstAlt:
+      case kInstAltMatch:
+        stk.push_back(ip->out1());
+        stk.push_back(ip->out());
+        break;
+      case kInstByteRange:
+      case kInstCapture:
+      case kInstNop:
+      case kInstEmptyWidth:
+        stk.push_back(ip->out());
+        break;
+      default:   // kInstMatch / kInstFail: 到头了
+        break;
+    }
+  }
+  dfa->q0_->clear();
+  for (int id = 1; id < n; id++) {
+    if (seen[id])
+      dfa->AddToQueue(dfa->q0_, id, flags);
+  }
+  s = dfa->WorkqToCachedState(dfa->q0_, NULL, flags);
+  if (s == NULL)
+    return NULL;   // 预算不够 —— 调用方 ResetCache 之后再试一次
+  info->start.store(s, std::memory_order_release);
+  return s;
+}
+
+int SpanDFA::ViableStarts(DFA* dfa, const char* text, int textlen,
+                          int from, int bound, int id, int32_t* out, int outcap) {
+  if (text == NULL || out == NULL || textlen < 0 || from < 0 || from > textlen ||
+      id < 0 || outcap < 0)
+    return -1;
+  if (bound < 0)
+    bound = 0;
+  if (bound > from)
+    bound = from;
+
+  DFA::RWLocker l(&dfa->cache_mutex_);
+
+  // 起始 flags 按【反向搜索】那一套取 —— 与 AnalyzeSearch 的 !run_forward 分支逐字一致:
+  // 反着走的"起点"是区间的右端 text+from, 看的是它右边那个【真实邻居字节】,
+  // 所以 \b / ^ / $ 判的是整篇正文里的真实处境, bound 只让答案变短不让它变错。
+  int base;
+  uint32_t flags;
+  if (from == textlen) {
+    base = DFA::kStartBeginText;
+    flags = kEmptyBeginText | kEmptyBeginLine;
+  } else if (text[from] == '\n') {
+    base = DFA::kStartBeginLine;
+    flags = kEmptyBeginLine;
+  } else if (Prog::IsWordChar(text[from] & 0xFF)) {
+    base = DFA::kStartAfterWordChar;
+    flags = DFA::kFlagLastWord;
+  } else {
+    base = DFA::kStartAfterNonWordChar;
+    flags = 0;
+  }
+
+  DFA::State* s = ViableStart(dfa, base, flags);
+  if (s == NULL) {
+    dfa->ResetCache(&l, NULL);
+    s = ViableStart(dfa, base, flags);
+    if (s == NULL)
+      return -1;
+  }
+  if (s <= SpanSpecialMax())
+    return 0;   // 只可能是 DeadState (kManyMatch 不出 FullMatchState, 见文件头)
+
+  const uint8_t* bp = reinterpret_cast<const uint8_t*>(text);
+  const uint8_t* p = bp + from;     // 反着走: p 从右往左
+  const uint8_t* ep = bp + bound;
+  const uint8_t* bytemap = dfa->prog_->bytemap();
+  int n = 0;
+
+  while (p != ep) {
+    int c = *--p;
+    DFA::State* ns = dfa->NextOf(s, bytemap[c]);
+    if (ns == NULL) {
+      if (!Advance(dfa, &l, &s, c, static_cast<int>(p - bp), textlen))
+        return -1;
+    } else {
+      s = ns;
+    }
+    if (s <= SpanSpecialMax()) {
+      // DeadState: 可行前缀集合空了 —— 再往左一个候选都不可能有。收工。
+      s = NULL;
+      break;
+    }
+    if (s->IsMatch()) {
+      // 匹配晚一个字节才被看见 (与 Resolve 那一句同一个口径): 反向 p+1 = 候选起点。
+      int32_t pos = static_cast<int32_t>(p + 1 - bp);
+      if (pos < from && HasId(s, id)) {   // pos == from 是空的可行前缀, 没有意义
+        if (n < outcap)
+          out[n] = pos;
+        n++;
+      }
+    }
+  }
+
+  if (s != NULL) {
+    // 最后喂一个"边界符号", 把落在 bound 那一格上的候选冲出来。区间左端正好是正文开头
+    // 才是 kByteEndText, 否则喂【真实的邻居字节】—— 同 Resolve 末尾那一段。
+    int lastbyte = (ep == bp) ? DFA::kByteEndText : (ep[-1] & 0xFF);
+    if (!Advance(dfa, &l, &s, lastbyte, static_cast<int>(p - bp), textlen))
+      return -1;
+    if (s > SpanSpecialMax() && s->IsMatch()) {
+      int32_t pos = static_cast<int32_t>(p - bp);   // = bound
+      if (pos < from && HasId(s, id)) {
+        if (n < outcap)
+          out[n] = pos;
+        n++;
+      }
+    }
+  }
+  return n;
+}
+
+// ── hgmLibre2 追加 ── 见上面 ViableStarts 的头注。只对【反向】程序有意义:
+// 正向程序上"种全部状态往右走"回答的是另一个问题 (后缀), 不是调用方要的东西。
+int Prog::SpanViableStarts(int nid, const char* text, int textlen,
+                           int from, int bound, int id, int32_t* out, int outcap) {
+  if (out == NULL || id < 0 || id >= nid)
+    return -1;
+  if (!reversed_)
+    return -1;
+  DFA* dfa = GetDFA(kManyMatch);
+  if (dfa == NULL || !dfa->ok())
+    return -1;
+  return SpanDFA::ViableStarts(dfa, text, textlen, from, bound, id, out, outcap);
 }
 
 void DFASpanScanFree(DFASpanScan* ss) { delete ss; }

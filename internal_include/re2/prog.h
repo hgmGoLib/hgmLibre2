@@ -311,6 +311,15 @@ class Prog {
   int SpanResolve(int nid, const char* text, int textlen,
                   int from, int bound, int id, int32_t* out);
 
+  // ── hgmLibre2 追加 (非上游 re2) ──
+  // 给定匹配【右端】from, 把 [bound, from) 里全部【候选起点】收下来 —— 即那些位置 s
+  // 使 text[s, from) 是第 id 条 pattern 的一个【可行前缀】(能被某个后缀补成真匹配)。
+  // 只对【反向】程序有意义 (非反向程序返回 -1)。写进 out 的是【降序】, 返回值是找到的
+  // 总条数 (可能 > outcap, 此时只写了前 outcap 个)。-1 = 参数错 / DFA 放弃。
+  // 语义与"为什么种全部指令就等于可行前缀"见 re2_dfa_spanscan.inc 里那段头注。
+  int SpanViableStarts(int nid, const char* text, int textlen,
+                       int from, int bound, int id, int32_t* out, int outcap);
+
   // 查这个 Prog 上某一 kind 的 DFA 缓存水位 (没建出来则 out->built=false)。
   // 只读, 会短暂拿 DFA 的读锁; 可以在扫描并发进行时调。
   void GetDFAMemInfo(MatchKind kind, DFAMemInfo* out);
