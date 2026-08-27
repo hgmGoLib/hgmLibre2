@@ -189,7 +189,12 @@ func TestMatchScanStrictVsFindAll(t *testing.T) {
 	std := make([]*regexp.Regexp, len(pats))
 	anch := make([]*regexp.Regexp, len(pats))
 	for i, p := range pats {
+		// 🔴 定长档对 FindAllStringIndex (leftmost-first), 变长档对 Longest() ——
+		//    默认档走的是路 B, 它的口径是 leftmost-longest, 拿默认那个去对是【假红】。
 		std[i] = regexp.MustCompile(p)
+		if !fixed[i] {
+			std[i].Longest()
+		}
 		anch[i] = regexp.MustCompile(`\A(?:` + p + `)\z`)
 	}
 	ms, err := set.NewMatchScanner()
@@ -235,25 +240,12 @@ func TestMatchScanStrictVsFindAll(t *testing.T) {
 				prev = f[k+1]
 			}
 			old := std[id].FindAllStringIndex(text, -1)
+			// 两档都是【逐字节相同】, 只是对的那个 oracle 不同 (见上面建 std 那段)。
 			if !fixed[id] {
-				// 变长档: 只要 FindAll 的每一处都被覆盖到 (不整段静默), 边界允许不同。
-				for _, loc := range old {
-					hit := false
-					for k := 0; k+1 < len(f); k += 2 {
-						if int(f[k]) < loc[1] && loc[0] < int(f[k+1]) {
-							hit = true
-							break
-						}
-					}
-					if !hit {
-						t.Fatalf("轮 %d: #%d FindAll 的 [%d,%d)=%q 没被覆盖到; 给的是 %v",
-							round, id, loc[0], loc[1], text[loc[0]:loc[1]], f)
-					}
-				}
 				nLoose += len(old)
-				continue
+			} else {
+				nStrict += len(old)
 			}
-			// 定长档: 逐字节相同。
 			if len(f) != 2*len(old) {
 				t.Fatalf("轮 %d: #%d %q 处数不同: 新 %d 处 %v · FindAll %d 处 %v\n正文 %q",
 					round, id, pats[id], len(f)/2, f, len(old), old, text)
@@ -265,10 +257,9 @@ func TestMatchScanStrictVsFindAll(t *testing.T) {
 						old[k][0], old[k][1], text[old[k][0]:old[k][1]], text)
 				}
 			}
-			nStrict += len(old)
 		}
 	}
-	t.Logf("400 轮: 逐字节对齐 %d 处 · 覆盖口径 %d 处", nStrict, nLoose)
+	t.Logf("400 轮: 定长档对 FindAll %d 处 · 变长档对 Longest %d 处", nStrict, nLoose)
 }
 
 // TestMatchScanEmptyCapableFallback —— 能匹配空串的 pattern 必须落进"补不出左端"那一档,
@@ -290,9 +281,9 @@ func TestMatchScanEmptyCapableFallback(t *testing.T) {
 	}
 }
 
-// TestMatchScanWanted —— 没进 SetWanted 的那几条: 位照样亮 (Hit/HitIDs), 但一处区间都不收口、
-// 一次左端都不补, 一处都不交出来 (也【不】进 unresolved —— 那是调用方自己关掉的)。
-func TestMatchScanWanted(t *testing.T) {
+// TestMatchScanBoolOnly —— 配了 boolOnly 的那几条: 位照样亮 (Hit/HitIDs), 但一处区间都不收口、
+// 一次端点都不补, 一处都不交出来 (也【不】进 unresolved —— 那是调用方自己关掉的)。
+func TestMatchScanBoolOnly(t *testing.T) {
 	set, err := NewRegexpSet([]string{`[A-Z]\d{3}`, `[a-f]{2,6}`})
 	if err != nil {
 		t.Fatal(err)
@@ -302,19 +293,102 @@ func TestMatchScanWanted(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ms.Close()
-	ms.SetWanted([]bool{false, true})
+	if err := ms.SetModes([]MatchScanMode_t{MatchScanMode_boolOnly, MatchScanMode_span}); err != nil {
+		t.Fatal(err)
+	}
 	byPat, bad := scanByPat(t, ms, "A123 beef")
 	if !ms.Hit(0) || !ms.Hit(1) {
 		t.Fatalf("两条都该命中: %v", ms.HitIDs())
 	}
 	if len(byPat[0]) != 0 {
-		t.Errorf("第 0 条没在 wanted 里, 不该交出任何区间, 却给了 %v", byPat[0])
+		t.Errorf("第 0 条配的是 boolOnly, 不该交出任何区间, 却给了 %v", byPat[0])
 	}
 	if bad[0] || bad[1] {
-		t.Errorf("没在 wanted 里不等于补不出来, 不该进 unresolved: %v", bad)
+		t.Errorf("配 boolOnly 不等于补不出来, 不该进 unresolved: %v", bad)
 	}
 	got := byPat[1]
 	if fmt.Sprint(got) != fmt.Sprint([]int32{5, 9}) {
 		t.Fatalf("得到 %v, 要 [5 9] (%q)", got, "beef")
+	}
+}
+
+// TestMatchScanSpanIsLongest —— 默认档 (MatchScanMode_span, 走路 B) 的那条【无条件保证】:
+// 逐字节等于 stdlib 的 re.Longest().FindAllStringIndex。
+//
+// 语料就是 matchscan.go 文件头列的那几个已知反例 —— 它们正是路 A 岔开的地方。测试同时把
+// 同一批 pattern 用 spanUnsafeCursor (路 A) 再跑一遍并数出岔开了几条: 这一数不是为了钉住
+// A 的答案 (那是"第三种口径", 本来就不该被钉), 是为了证明【这几条语料真的有牙齿】——
+// 要是哪天 A 也全对了, 说明选的反例失效了, 该换一批。
+func TestMatchScanSpanIsLongest(t *testing.T) {
+	cases := []struct{ pat, text string }{
+		{`abc|b`, "abc"},                       // 文件头那个最小反例
+		{`x{1,3}[a-c]?(?:ab|cd)?`, "xab"},      // 12 万处对账里差出来的三条
+		{`(?:ab)?[bc]{1,2}`, "axbabbyxx"},      //
+		{`(?:ab)*b{1,3}`, "yaxyabbbb"},         //
+		{`a|ab`, "abab"},                       // 贪心 ≠ 最长 的最小例
+		{`[a-f]{2,6}`, "beefcafebabe"},         // 变长但无歧义: 两条路都该对
+		{`\b[A-Z][12]\d{8}\b`, "x A123456780"}, // 定长: 档位对它不生效
+	}
+	divergedA := 0
+	for _, c := range cases {
+		set, err := NewRegexpSet([]string{c.pat})
+		if err != nil {
+			t.Fatalf("%q: %v", c.pat, err)
+		}
+		want := regexp.MustCompile(c.pat)
+		want.Longest()
+		var flat []int32
+		for _, loc := range want.FindAllStringIndex(c.text, -1) {
+			flat = append(flat, int32(loc[0]), int32(loc[1]))
+		}
+		for _, mode := range []MatchScanMode_t{MatchScanMode_span, MatchScanMode_spanUnsafeCursor} {
+			ms, err := set.NewMatchScanner()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := ms.SetModes([]MatchScanMode_t{mode}); err != nil {
+				t.Fatal(err)
+			}
+			byPat, bad := scanByPat(t, ms, c.text)
+			ms.Close()
+			if bad[0] {
+				t.Fatalf("%q 档 %q: 意外进了 unresolved", c.pat, mode)
+			}
+			got := byPat[0]
+			same := fmt.Sprint(got) == fmt.Sprint(flat)
+			if mode == MatchScanMode_span {
+				if !same {
+					t.Errorf("%q 撞 %q: 默认档给 %v, Longest 给 %v", c.pat, c.text, got, flat)
+				}
+				continue
+			}
+			if !same {
+				divergedA++
+				t.Logf("(预期内) %q 撞 %q: 路 A 给 %v, Longest 给 %v", c.pat, c.text, got, flat)
+			}
+		}
+	}
+	if divergedA == 0 {
+		t.Errorf("一条都没岔开 —— 这批反例已经失效, 换一批, 否则这个测试是空的")
+	}
+}
+
+// TestMatchScanSetModesRejectsEmptyCapable —— 能匹配空串的 pattern 想要区间, SetModes 当场
+// 报错 (不是等到扫描时静默退回老路); 配成 boolOnly 则放行。
+func TestMatchScanSetModesRejectsEmptyCapable(t *testing.T) {
+	set, err := NewRegexpSet([]string{`a*`, `b+`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ms, err := set.NewMatchScanner()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ms.Close()
+	if err := ms.SetModes([]MatchScanMode_t{MatchScanMode_span, MatchScanMode_span}); err == nil {
+		t.Fatalf("a* 能匹配空串却要区间, SetModes 必须报错")
+	}
+	if err := ms.SetModes([]MatchScanMode_t{MatchScanMode_boolOnly, MatchScanMode_span}); err != nil {
+		t.Fatalf("配成 boolOnly 应当放行: %v", err)
 	}
 }

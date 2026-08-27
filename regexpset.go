@@ -49,6 +49,16 @@ type RegexpSet struct {
 	rev1   []*RegexpSetReverse
 	rev1No []bool // 第 i 条试过且【建不出来】—— 记下来免得每遍扫描重编一次
 	rev1Mu sync.Mutex
+	// fwd1[i] = 第 i 条 pattern 【自己一条】的正向 Regexp, 惰性建 —— 是 rev1 的镜像,
+	// 给 MatchScanner 的 B 路 (MatchScanMode_t) 做"从游标起的非锚定搜索"用。
+	//
+	// 🔴 为什么不能拿 set 那份程序去搜: set 是整表合编的一份 DFA, 它只回答"哪几条命中"
+	//    与"右端在哪", 给不出【单条】的非锚定入口 —— 要"这一条自己从 pos 起的最左匹配",
+	//    只能有一个单条对象。这一条不会有 rev1 那种状态相乘的问题 (本来就是单条),
+	//    但它【会】走 .*? 前缀那条路, 所以它的代价是"扫过的那段正文", 不是常数。
+	fwd1   []*Regexp
+	fwd1No []bool // 第 i 条试过且【建不出来】(与 rev1No 同解)
+	fwd1Mu sync.Mutex
 }
 
 // ReverseOneStats 报【已经被建出来】的那些单条反向 set 的账: 几条 · 状态数合计 ·
@@ -95,6 +105,33 @@ func (s *RegexpSet) reverseOne(i int) *RegexpSetReverse {
 		return nil
 	}
 	s.rev1[i] = r
+	return r
+}
+
+// forwardOne 返回第 i 条 pattern 自己一条的【正向】Regexp (惰性建, 建不出来返回 nil)。
+// 只读用途 (FindStringIndexFrom), 并发安全。是 reverseOne 的镜像, 理由见 fwd1 那段注释。
+func (s *RegexpSet) forwardOne(i int) *Regexp {
+	if i < 0 || i >= len(s.pats) {
+		return nil
+	}
+	s.fwd1Mu.Lock()
+	defer s.fwd1Mu.Unlock()
+	if s.fwd1 == nil {
+		s.fwd1 = make([]*Regexp, len(s.pats))
+		s.fwd1No = make([]bool, len(s.pats))
+	}
+	if r := s.fwd1[i]; r != nil {
+		return r
+	}
+	if s.fwd1No[i] {
+		return nil // 上次就没建出来, 别再重编一遍
+	}
+	r, err := CompileMaxMem(s.pats[i], s.maxMem)
+	if err != nil {
+		s.fwd1No[i] = true
+		return nil
+	}
+	s.fwd1[i] = r
 	return r
 }
 
