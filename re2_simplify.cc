@@ -9,12 +9,12 @@
 #include <algorithm>
 #include <string>
 
-#include "util/util.h"
-#include "util/logging.h"
-#include "util/utf.h"
-#include "re2/pod_array.h"
-#include "re2/regexp.h"
-#include "re2/walker-inl.h"
+#include "util_util.h"
+#include "util_logging.h"
+#include "util_utf.h"
+#include "re2_pod_array.h"
+#include "re2_regexp.h"
+#include "re2_walker-inl.h"
 
 namespace re2 {
 

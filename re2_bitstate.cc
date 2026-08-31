@@ -23,10 +23,10 @@
 #include <limits>
 #include <utility>
 
-#include "util/logging.h"
-#include "re2/pod_array.h"
-#include "re2/prog.h"
-#include "re2/regexp.h"
+#include "util_logging.h"
+#include "re2_pod_array.h"
+#include "re2_prog.h"
+#include "re2_regexp.h"
 
 namespace re2 {
 

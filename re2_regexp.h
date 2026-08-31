@@ -92,10 +92,10 @@
 #include <set>
 #include <string>
 
-#include "util/util.h"
-#include "util/logging.h"
-#include "util/utf.h"
-#include "re2/stringpiece.h"
+#include "util_util.h"
+#include "util_logging.h"
+#include "util_utf.h"
+#include "re2_stringpiece.h"
 
 namespace re2 {
 

@@ -1,14 +1,14 @@
 // cre2.cpp — cre2.h 的实现, 直接调 vendored RE2 (2023-03-01, 无 abseil).
 #include "cre2.h"
 #include "cre2_internal.h"
-#include "re2/re2.h"
-#include "re2/set.h"
+#include "re2_re2.h"
+#include "re2_set.h"
 // 反着扫要直接用 re2 的内部件: Regexp::Parse + Regexp::CompileToReverseProg + Prog::SearchDFA。
 // 走 RE2 对象本身不行 —— 它的 rprog_ 是从【剥掉必需前缀之后】的 suffix_regexp_ 编的,
 // 只在"已经知道匹配右端在哪"的场景下用, 拿来当整篇非锚定搜索会漏。
-#include "re2/prog.h"
-#include "re2/regexp.h"
-#include "re2/stringpiece.h"
+#include "re2_prog.h"
+#include "re2_regexp.h"
+#include "re2_stringpiece.h"
 #include <cstdlib>
 #include <cstring>
 #include <map>

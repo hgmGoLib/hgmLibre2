@@ -4,8 +4,8 @@
 #ifndef CRE2_INTERNAL_H
 #define CRE2_INTERNAL_H
 
-#include "re2/re2.h"
-#include "re2/set.h"
+#include "re2_re2.h"
+#include "re2_set.h"
 
 struct cre2_set {
 	re2::RE2::Set *set;

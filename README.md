@@ -1511,9 +1511,9 @@ The vendored DFA is **not** byte-for-byte upstream. `re2_dfa.cc` stores each
 transition-table slot as a 4-byte offset into an arena of states instead of an
 8-byte `State*`, and grows that arena on demand instead of reserving the whole
 budget up front. Three other vendored files carry small *additive*
-changes for the counters above — `re2_set.cc` and the `re2/prog.h` / `re2/set.h`
+changes for the counters above — `re2_set.cc` and the `re2_prog.h` / `re2_set.h`
 headers gain optional out-parameters and accessors — plus one new header,
-`re2/dfa_stats.h`, which is not upstream at all. Every other `.cc` file is
+`re2_dfa_stats.h`, which is not upstream at all. Every other `.cc` file is
 stock. `VENDOR.txt` lists the same set — that is the list to re-apply when the
 vendored RE2 is upgraded.
 

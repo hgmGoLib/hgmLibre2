@@ -306,7 +306,7 @@ cre2_rev_match_result cre2_partial_match_reverse(const cre2_re *h, const char *t
  * 恒 lo <= hi (原文坐标)。顺序【不保证】全局按位置升序 —— 游程要等"这条再次命中且不连号"
  * 或"整篇扫完"才收口, 所以不同 pattern 的游程会交错。要有序自己排 (条数是游程数, 很少)。
  *
- * 语义细节和"为什么是轮询不是回调/不是一次吐完"见 internal_include/re2/span_scan.h。 */
+ * 语义细节和"为什么是轮询不是回调/不是一次吐完"见 re2_span_scan.h。 */
 typedef struct cre2_spanscan cre2_spanscan;
 
 /* 开一个流式扫描工作区 (set 必须已 cre2_set_compile)。OOM / 没编译返回 NULL。
@@ -334,7 +334,7 @@ int cre2_spanscan_step(cre2_spanscan *ss, const char *text, int textlen,
  * bound = 最远看到哪 (正向是上界, 反向是下界), 负数 = 不限; 判定用的上下文恒是整篇正文,
  * 所以 \b / ^ / $ 看到的永远是真实邻居, 不是 bound 切出来的假边界。
  * 返回 1 = 找到, 0 = 这条 pattern 在这个端点上不匹配, -1 = 参数错 / DFA 放弃。
- * 无状态、只读, 可以与扫描并发调。为什么这一步得在库里做见 internal_include/re2/span_scan.h。 */
+ * 无状态、只读, 可以与扫描并发调。为什么这一步得在库里做见 re2_span_scan.h。 */
 int cre2_set_resolve_span(const cre2_set *h, const char *text, int textlen,
                           int from, int bound, int id, int32_t *out);
 

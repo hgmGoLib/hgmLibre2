@@ -17,13 +17,13 @@
 #include <vector>
 #include <type_traits>
 
-#include "util/util.h"
-#include "util/logging.h"
-#include "re2/dfa_stats.h"
-#include "re2/pod_array.h"
-#include "re2/re2.h"
-#include "re2/sparse_array.h"
-#include "re2/sparse_set.h"
+#include "util_util.h"
+#include "util_logging.h"
+#include "re2_dfa_stats.h"
+#include "re2_pod_array.h"
+#include "re2_re2.h"
+#include "re2_sparse_array.h"
+#include "re2_sparse_set.h"
 
 namespace re2 {
 
@@ -316,7 +316,7 @@ class Prog {
   // 使 text[s, from) 是第 id 条 pattern 的一个【可行前缀】(能被某个后缀补成真匹配)。
   // 只对【反向】程序有意义 (非反向程序返回 -1)。写进 out 的是【降序】, 返回值是找到的
   // 总条数 (可能 > outcap, 此时只写了前 outcap 个)。-1 = 参数错 / DFA 放弃。
-  // 语义与"为什么种全部指令就等于可行前缀"见 re2_dfa_spanscan.inc 里那段头注。
+  // 语义与"为什么种全部指令就等于可行前缀"见 re2_dfa_spanscan_inl.h 里那段头注。
   int SpanViableStarts(int nid, const char* text, int textlen,
                        int from, int bound, int id, int32_t* out, int outcap);
 

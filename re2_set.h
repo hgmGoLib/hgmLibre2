@@ -12,8 +12,8 @@
 #include <utility>
 #include <vector>
 
-#include "re2/dfa_stats.h"
-#include "re2/re2.h"
+#include "re2_dfa_stats.h"
+#include "re2_re2.h"
 
 namespace re2 {
 class DFASpanScan;   // ── hgmLibre2 追加 ── 见 re2/span_scan.h

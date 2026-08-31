@@ -37,16 +37,16 @@
 #include <utility>
 #include <vector>
 
-#include "util/logging.h"
-#include "util/mix.h"
-#include "util/mutex.h"
-#include "util/strutil.h"
-#include "re2/pod_array.h"
-#include "re2/prog.h"
-#include "re2/span_scan.h"   // ── hgmLibre2 追加 ── 流式游程扫描 (实现见文件末尾的 .inc)
-#include "re2/re2.h"
-#include "re2/sparse_set.h"
-#include "re2/stringpiece.h"
+#include "util_logging.h"
+#include "util_mix.h"
+#include "util_mutex.h"
+#include "util_strutil.h"
+#include "re2_pod_array.h"
+#include "re2_prog.h"
+#include "re2_span_scan.h"   // ── hgmLibre2 追加 ── 流式游程扫描 (实现见文件末尾 include 的 _inl.h)
+#include "re2_re2.h"
+#include "re2_sparse_set.h"
+#include "re2_stringpiece.h"
 
 // Silence "zero-sized array in struct/union" warning for DFA::State::next_.
 #ifdef _MSC_VER
@@ -202,7 +202,7 @@ static const bool ExtraDebug = false;
 
 class DFA {
  public:
-  // ── hgmLibre2 追加 ── 流式游程扫描的工作区 (re2_dfa_spanscan.inc)。它要用 State /
+  // ── hgmLibre2 追加 ── 流式游程扫描的工作区 (re2_dfa_spanscan_inl.h)。它要用 State /
   // RWLocker / StateSaver / RunStateOnByteUnlocked 这些只在本编译单元里可见的东西。
   friend class DFASpanScan;
   // 上面那个和"锚定解析"共用的几行 (推一个字节 / 查状态里有没有某条 pattern)。
@@ -361,7 +361,7 @@ class DFA {
     kStartAfterNonWordChar = 6,   // text follows non-word character
 
     // ── hgmLibre2 追加 ── 种【全部指令】的那个起始状态 (可行前缀回推用, 见
-    // re2_dfa_spanscan.inc 的 SpanDFA::ViableStarts)。与上面四个 base 或起来用
+    // re2_dfa_spanscan_inl.h 的 SpanDFA::ViableStarts)。与上面四个 base 或起来用
     // (8/10/12/14)。它与 kStartAnchored 不是一回事, 也不冲突: 那个选的是"从 start
     // 还是 start_unanchored 进", 这个是"锚定入口可达的每一条指令都是起点"。
     // 摆进 start_[] 里是为了白拿三样东西 —— arena 搬家时的重定位 · ResetCache 的清空 ·
@@ -3329,4 +3329,4 @@ bool Prog::PossibleMatchRange(std::string* min, std::string* max, int maxlen) {
 
 // ── hgmLibre2 追加 ── 流式游程扫描 (自带 namespace re2)。放文件末尾是因为它要用到
 // 上面所有 DFA 内部件, 而 class DFA 整个定义就在本文件里, 外面的编译单元看不见。
-#include "re2_dfa_spanscan.inc"
+#include "re2_dfa_spanscan_inl.h"

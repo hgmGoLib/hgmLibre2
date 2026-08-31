@@ -1,12 +1,17 @@
-// re2_dfa_spanscan.inc — ── hgmLibre2 追加 (非上游 re2) ──
+// re2_dfa_spanscan_inl.h — ── hgmLibre2 追加 (非上游 re2) ──
 // RE2::Set "命中在哪"的实现, 两件事:
 //   · DFASpanScan  : 流式游程扫描 —— 一遍扫正文, 吐每条 pattern 的命中【端点】;
 //   · SpanDFA::Resolve : 锚定解析 —— 给定一个端点, 求同一条 pattern 的【另一端】。
-// 两者的语义/为什么这么设计见 re2/span_scan.h。
+// 两者的语义/为什么这么设计见 re2_span_scan.h。
 //
-// 这份文件被 re2_dfa.cc 在文件末尾 #include 进来 (不是独立编译单元): class DFA 整个定义
-// 就在 re2_dfa.cc 里, 外面看不见 State / RWLocker / StateSaver / RunStateOnByteUnlocked,
-// 所以只能同编译单元。拆成单独文件是为了不让 re2_dfa.cc 再长 400 行。
+// 🔴 这不是普通头文件, 是"只给 re2_dfa.cc 末尾 #include 一次"的实现片段 (没有 include
+// guard, 里面全是函数体, 被第二个编译单元 include 就是重复定义)。名字用 -inl.h 是跟着上游
+// 的 re2_walker-inl.h 走的。为什么只能这么摆: class DFA 整个定义就在 re2_dfa.cc 里, 外面
+// 看不见 State / RWLocker / StateSaver / RunStateOnByteUnlocked, 所以只能同编译单元;
+// 拆成单独文件是为了不让 re2_dfa.cc 再长 400 行。
+// 🔴 扩展名【必须是 .h】, 不能用 .inc: go build 的缓存只哈希包目录里它认得的扩展名
+// (.go/.c/.cc/.cpp/.h/.s...), .inc 对 go 完全不存在 —— 只改这个文件的话 go build 会直接
+// 复用旧目标文件, 编出来的是旧二进制, 而且一声不吭。也不能叫 .cc (那会被当成第二个编译单元)。
 //
 // 🔴 热循环是【另写的一份】, 不往 InlinedSearchLoop 里塞 if。两者要回答的问题不同:
 //    老的一路只管把 id 塞进 SparseSet (每个 id 塞一次就够, 位置无所谓, 塞完还能 early-out);

@@ -1,7 +1,7 @@
 // cre2_spanscan.cpp — RE2::Set "命中在哪"的 C 门面: 流式游程扫描 (sqlite3_step 式轮询)
 // + 锚定解析 (cre2_set_resolve_span)。
 //
-// 语义 (吐什么 / 为什么是游程 / 为什么是轮询) 全在 internal_include/re2/span_scan.h,
+// 语义 (吐什么 / 为什么是游程 / 为什么是轮询) 全在 re2_span_scan.h,
 // 这里只做句柄包装和参数守卫。用法:
 //
 //   cre2_spanscan *ss = cre2_set_spanscan_new(set);
@@ -17,7 +17,7 @@
 
 #include "cre2.h"
 #include "cre2_internal.h"
-#include "re2/span_scan.h"
+#include "re2_span_scan.h"
 
 #include <new>
 

@@ -621,7 +621,7 @@
   要编原版对照: CGO_CXXFLAGS="-O2 -DRE2_DFA_NEXT_BITS=64 -DRE2_DFA_ARENA=0"。详见 README.md。
   其余几处是【纯追加】: prog.h / set.h / re2_set.cc 上的观测出参与访问器, 外加
   re2_compile.cc / re2_set.cc 上给 Prog::CompileSet 和 RE2::Set 加的 reversed (反着扫, 见上),
-  以及流式游程扫描 + 锚定解析 (re2/span_scan.h + re2_dfa_spanscan.inc, 由 re2_dfa.cc 末尾
+  以及流式游程扫描 + 锚定解析 (re2_span_scan.h + re2_dfa_spanscan_inl.h, 由 re2_dfa.cc 末尾
   #include 进去 —— class DFA 整个定义就在 re2_dfa.cc 里, 别的编译单元看不见 State/RWLocker/
   StateSaver)。唯一一处【改了上游行为写法】的是 Compiler::CompileSet 的两个入口:
   上游写成 "anchor_start_=true + start_ 和 start_unanchored_ 都指向带 .*? 前缀的那个入口",

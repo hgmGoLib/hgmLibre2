@@ -13,7 +13,7 @@
 package hgmLibre2
 
 /*
-#cgo CXXFLAGS: -std=c++11 -O2 -DNDEBUG -fno-exceptions -fno-rtti -I${SRCDIR}/internal_include
+#cgo CXXFLAGS: -std=c++11 -O2 -DNDEBUG -fno-exceptions -fno-rtti
 #include <stdlib.h>
 #include "cre2.h"
 */
