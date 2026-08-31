@@ -55,6 +55,36 @@ void DFASpanScanFree(DFASpanScan* ss);
 // 开始一次新扫描 (清游程表, 绑定正文长度)。textlen < 0 返回 false。
 bool DFASpanScanBegin(DFASpanScan* ss, int textlen);
 
+// ── g2 档: 存活位切分量 + 游程留 native, 分量整块交付 (Re2SetFrl 走的就是这条) ──
+// 开了之后每个字节额外读一次状态的 per-pattern 存活位: 某条 pattern 由活转死, 说明
+// "没有任何匹配能跨过这个位置", 于是它左右两侧的命中互不影响 —— 当场把它挂着的那一段
+// 收口成一个【分量】。分量内部再按 rightmost-longest 结算 (那一步在 cre2_frl.cpp)。
+//
+// 命中【不逐条过桥】: 每条 pattern 当前分量的结束位置游程攒在 native 侧 (每条一块,
+// 8 个 int32 起二倍扩, 收口后进按大小分档的回收池), 分量收口时把整块挂进待取列表。
+// 调用方每次 Step 返回后调 DFASpanScanG2Closed 取走这一批, 下一次 Step 会回收这些缓冲
+// ⇒ 指针只在"本次 Step 返回 到 下次 Step 调用"之间有效。
+// 🔴 g2 档下 Step 一个字节都不往 out 写 (out/outcap 完全没用上)。
+bool DFASpanScanBeginG2(DFASpanScan* ss, int textlen);
+
+// 这条 pattern 只要"有没有命中" —— 不攒游程、不盯存活位、不收口。Begin 之前调, 跨 scan 保留。
+void DFASpanScanG2BoolOnly(DFASpanScan* ss, int id);
+// nid 个字节, 第 i 个非零 = 第 i 条这一遍命中过 (每次 BeginG2 清零)。
+const uint8_t* DFASpanScanG2Hits(DFASpanScan* ss);
+
+struct DFASpanScanG2Rec {
+  int32_t id;             // 哪条 pattern
+  int32_t lo;             // 本分量左界: 上一次这条 pattern 断气的位置 (反向锚定的 bound)
+  int32_t nrun;           // 游程条数
+  int32_t pad_;
+  const int32_t* runs;    // runs[2k], runs[2k+1] = 第 k 条游程的 lo,hi (升序, 互不相接)
+};
+int DFASpanScanG2Closed(DFASpanScan* ss, const DFASpanScanG2Rec** recs);
+
+// g2 的内存账 (字节; nseg 是条数)。每次 BeginG2 重算, 只有回收池的水位跨 scan 保留。
+void DFASpanScanG2Stats(DFASpanScan* ss, long long* usedpeak, long long* heappeak,
+                        long long* poolbytes, long long* nseg);
+
 // 推进一步。text/textlen 必须与 Begin 时的长度一致, 且每次传同一份正文。
 // out 写入 (id, lo, hi) 三元组, outcap 是 int32 个数, 必须 >= 3*nid。
 // 返回本批写进去的【游程条数】(>=0); <0 = 出错 (DFA 放弃 / 状态恢复失败, 整次扫描作废)。

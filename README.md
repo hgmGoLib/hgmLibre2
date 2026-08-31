@@ -998,6 +998,105 @@ none of them, because there is no guess to get wrong. The oracle carries its own
 self-check: `ab|b` against `"aab"` must produce different answers under the two rules,
 or the whole comparison is vacuous.
 
+### One forward pass, spans straight out: `Re2SetFrl`
+
+`Re2SetFrl` answers the same question as `MatchScanner` — *where did each pattern
+match?* — but almost all of it lives in C++. Go only hands it three `[]int32` buffers
+and the C side writes `(Index, Start, End)` triples straight into them, a batch per
+`step`. The name: **F** = first pass forward, **RL** = the rightmost-longest family of
+de-overlap rules (the exact rule is spelled out below — it is *not* the same one
+`MatchScannerReverse` uses).
+
+```go
+s, _ := hgmLibre2.NewRe2SetFrl([]hgmLibre2.Re2SetFrlPattern_t{
+    {Pattern: `\d{3}-\d{2}-\d{4}`},                 // wants spans
+    {Pattern: `(?i)authorization`, ExistOnly: true},  // only "did it hit?"
+})
+defer s.Close()
+
+buf := hgmLibre2.NewRe2SetFrlBuf(1024)   // three []int32; reuse it => 0 allocs/op
+err := s.Scan(body, buf, func(Index, Start, End []int32) bool {
+    for k := range Index {
+        _ = body[Start[k]:End[k]]        // a real match of pattern Index[k]
+    }
+    return true                          // false = stop early
+})
+// afterwards s.Hit(i) / s.HitIDs(nil) is the hit table (the only output of ExistOnly rows)
+```
+
+The three slices handed to the callback **are** the buffers; the next batch overwrites
+them in place. Copy what you keep. And as with `MatchScanner`, it is all-or-nothing: a
+non-nil `err` voids the whole pass (including batches already handed over) — fall back
+to `FindAll` for that body.
+
+**How it differs from `MatchScanner`.** `MatchScanner` looks back once per match *end*
+that the cursor has not already covered. This layer looks back once per **component**.
+Components come from a per-pattern *liveness bit* carried in each DFA state
+(`State::live_`): if a pattern has no live threads at some offset, then no match of it
+can cross that offset, so hits on either side are independent. The moment a pattern
+goes live→dead its pending hits are closed off as one component — and the component's
+left edge doubles as the lower bound for the look-back, so resolving never has to walk
+to the start of the body. Three stages, each where it is cheapest:
+
+| stage | where | what |
+|---|---|---|
+| scan the body | the table's forward `kManyMatch` DFA | one pass |
+| collect + split | native side, no per-hit bridge crossing | match ends are kept as run-lengths in a per-pattern buffer, handed over one component at a time |
+| resolve starts | that one pattern's **single** `Regexp`, reverse-anchored | one call per non-overlapping match in the component |
+
+`Stats().NResolve / Stats().NSeg` is *how many reverse-anchored searches each component
+cost*; on the ten general-purpose patterns of the benchmark it is exactly 1.00 across
+all three corpora. `Stats().UsedPeak` — the native-side run buffer — stays in the tens
+of bytes and does not grow with the body.
+
+**The de-overlap rule — rightmost *end*, longest.** Start with the bound at the end of
+the body; repeatedly take the match whose **end** is furthest right and still `<=` the
+bound, break ties by taking the **longest** one (leftmost start), emit it, then drop the
+bound to its start. That is a different rule from `MatchScannerReverse` (which picks the
+rightmost *start* first) and from stdlib's leftmost-longest:
+
+| input | pattern | `Re2SetFrl` | `MatchScannerReverse` | stdlib `Longest` |
+|---|---|---|---|---|
+| `aaa` | `aa\|a` | `[0,1) [1,3)` | `[2,3) [1,2) [0,1)` | `[0,2) [2,3)` |
+| `abc` | `b\|abc` | `[0,3)` = `"abc"` | `[1,2)` = `"b"` | `[0,3)` = `"abc"` |
+
+That second row is why this layer picks ends rather than starts: picking starts truncates
+`"abc"` down to the `"b"` in the middle, and a caller that feeds the span to a checksum
+(national ID, IBAN, Luhn) then rejects its own true hit — a silent miss. If you need byte
+equivalence with `re.Longest().FindAllStringIndex`, use `MatchScanner` instead; if you
+just need everything framed (masking, locating, counting), this rule is fine.
+
+Correctness is pinned by `re2setfrl_test.go`: the oracle is an exhaustive, library-free
+search (`\A(?:pat)\z` over every `(e, s)`), corpora are generated from each pattern's own
+AST so random bytes cannot make the test vacuously green, and `aa|a` on `"aaa"` must give
+three *different* answers under the three rules or the whole comparison is a no-op. The
+oracle has no notion of components, so it also pins the claim that splitting into
+components does not change the answer.
+
+**`ExistOnly` is not an optional tweak.** A row marked `ExistOnly` sets one byte when it
+hits: no runs collected, no liveness watched, no component closed, no start resolved.
+That is the expensive part of this layer, not just a few results you would have thrown
+away — filtering inside the callback is throwing away work already paid for. Patterns
+that can match the empty string (`PatternLenRange` min `<= 0`) may *only* be `ExistOnly`;
+otherwise `NewRe2SetFrl` fails immediately, independent of any body.
+
+**Measuring it.** These DFA loops are extraordinarily sensitive to code layout on the
+benchmark machine: adding one *never-called* Go function to the test package moves the
+zero-hit 64 KiB figure between 98 µs and 199 µs. Numbers from a single binary are
+meaningless — sweep the layout (0..7 unused functions, one binary each) and take the
+**minimum** per variant. Done that way, on 64 KiB with the ten benchmark patterns:
+
+| corpus | old two-stage | `MatchScanner` | `Re2SetFrl` |
+|---|---|---|---|
+| zero hits | 97.5 µs | 98.5 µs | **97.2 µs** |
+| 39 sparse hits | 430.9 µs | 104.8 µs | **104.3 µs** |
+| worst case (all lowercase) | 598.9 µs | **478.7 µs** | 575.6 µs |
+
+Zero hits costs exactly what a plain scan costs — the liveness machinery is genuinely
+free until the first hit, because the idle loop is a separate instantiation that never
+reads a liveness bit at all. The worst-case corpus is the one where `[a-z]{4,}` never
+dies, so the whole body is a single component and every byte is watched.
+
 ### Scanning backwards
 
 `S B{m,n} L` — a counted repeat whose **start class is strictly narrower than
