@@ -1097,6 +1097,29 @@ free until the first hit, because the idle loop is a separate instantiation that
 reads a liveness bit at all. The worst-case corpus is the one where `[a-z]{4,}` never
 dies, so the whole body is a single component and every byte is watched.
 
+Those ten patterns **understate it**. On three real gate tables (368 pattern literals
+harvested from the product source, split by shape into cred/64, prompt/31, body/160),
+256 KiB of text, four hit densities, same eight-layout sweep — harness in
+`tmp/frlbench`:
+
+| table | hits | floor | `MatchScanner` | `Re2SetFrl` | end-to-end | start-resolution layer |
+|---|---|---|---|---|---|---|
+| cred | 1% | 0.40 ms | 0.45 ms | **0.42 ms** | 1.07× | 2.50× |
+| cred | 90% | 1.00 ms | 5.42 ms | **3.00 ms** | 1.81× | 2.21× |
+| prompt | 1% | 0.40 ms | **0.52 ms** | 0.59 ms | 0.88× | 0.63× |
+| prompt | 90% | 0.97 ms | 11.45 ms | **5.60 ms** | 2.04× | 2.26× |
+| body | 1% | 1.96 ms | 35.18 ms | **15.68 ms** | 2.24× | 2.42× |
+| body | 90% | 4.21 ms | 53.06 ms | **26.38 ms** | 2.01× | 2.20× |
+
+*Floor* is the forward set scan both paths must pay; the start-resolution column is
+`(total − floor)` compared. Eleven of the twelve cells favour `Re2SetFrl`, by 1.06×
+to 2.24× end to end and a steady 2.2–2.4× on the layer that actually differs. The one
+loss is the prompt table at 1% density: hits are so sparse that nearly every hit is its
+own component, so there are no reverse-anchored probes to save and the component
+bookkeeping is pure overhead. Where the saving comes from, in one line: `MatchScanner`
+runs one reverse-anchored probe **per match end**, `Re2SetFrl` runs one **per
+component** (body at 90%: 254k ends, 145k components).
+
 ### Scanning backwards
 
 `S B{m,n} L` — a counted repeat whose **start class is strictly narrower than
