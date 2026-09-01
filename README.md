@@ -998,35 +998,38 @@ none of them, because there is no guess to get wrong. The oracle carries its own
 self-check: `ab|b` against `"aab"` must produce different answers under the two rules,
 or the whole comparison is vacuous.
 
-### One forward pass, spans straight out: `Re2SetFrl`
+### One forward pass, spans straight out: `Re2SetFrel`
 
-`Re2SetFrl` answers the same question as `MatchScanner` — *where did each pattern
-match?* — but almost all of it lives in C++. Go only hands it three `[]int32` buffers
-and the C side writes `(Index, Start, End)` triples straight into them, a batch per
-`step`. The name: **F** = first pass forward, **RL** = **r**ightmost-end **l**ongest.
+`Re2SetFrel` answers the same question as `MatchScanner` — *where did each pattern
+match?* — but almost all of it lives in C++. Go only hands it a
+`[]Re2SetFrel_result_t` and the C side writes the results straight into it, a batch per
+`step` — that Go struct and C's `cre2_frel_result` are the same memory layout (three
+`int32`, no padding; a static assert on each side), so nothing is copied field by
+field. The name: **F** = first pass forward, **RL** = **r**ightmost-end **l**ongest.
 Do not call this rule plain "rightmost-longest": in this library that name already means
 `MatchScannerReverse`'s rule, which anchors on the **start**. This one anchors on the
 **end** — spelled out below, and they give different answers.
 
 ```go
-s, _ := hgmLibre2.NewRe2SetFrl([]hgmLibre2.Re2SetFrlPattern_t{
+s, _ := hgmLibre2.NewRe2SetFrel([]hgmLibre2.Re2SetFrelPattern_t{
     {Pattern: `\d{3}-\d{2}-\d{4}`},                 // wants spans
     {Pattern: `(?i)authorization`, ExistOnly: true},  // only "did it hit?"
 })
 defer s.Close()
 
-buf := hgmLibre2.NewRe2SetFrlBuf(1024)   // three []int32; reuse it => 0 allocs/op
-err := s.Scan(body, buf, func(Index, Start, End []int32) bool {
-    for k := range Index {
-        _ = body[Start[k]:End[k]]        // a real match of pattern Index[k]
+buf := make([]hgmLibre2.Re2SetFrel_result_t, 1024)   // reuse it => 0 allocs/op
+err := s.Scan(body, buf, func(rs []hgmLibre2.Re2SetFrel_result_t) bool {
+    for _, r := range rs {
+        _ = body[r.Start:r.End]          // a real match of pattern r.Index
     }
     return true                          // false = stop early
 })
 // afterwards s.Hit(i) / s.HitIDs(nil) is the hit table (the only output of ExistOnly rows)
 ```
 
-The three slices handed to the callback **are** the buffers; the next batch overwrites
-them in place. Copy what you keep. And as with `MatchScanner`, it is all-or-nothing: a
+The slice handed to the callback **is** `buf`; the next batch overwrites it in place.
+Copy what you keep. Its length only sets how many results cross the bridge per `step`,
+never the answer. And as with `MatchScanner`, it is all-or-nothing: a
 non-nil `err` voids the whole pass (including batches already handed over) — fall back
 to `FindAll` for that body.
 
@@ -1056,7 +1059,7 @@ bound, break ties by taking the **longest** one (leftmost start), emit it, then 
 bound to its start. That is a different rule from `MatchScannerReverse` (which picks the
 rightmost *start* first) and from stdlib's leftmost-longest:
 
-| input | pattern | `Re2SetFrl` | `MatchScannerReverse` | stdlib `Longest` |
+| input | pattern | `Re2SetFrel` | `MatchScannerReverse` | stdlib `Longest` |
 |---|---|---|---|---|
 | `aaa` | `aa\|a` | `[0,1) [1,3)` | `[2,3) [1,2) [0,1)` | `[0,2) [2,3)` |
 | `abc` | `b\|abc` | `[0,3)` = `"abc"` | `[1,2)` = `"b"` | `[0,3)` = `"abc"` |
@@ -1067,7 +1070,7 @@ That second row is why this layer picks ends rather than starts: picking starts 
 equivalence with `re.Longest().FindAllStringIndex`, use `MatchScanner` instead; if you
 just need everything framed (masking, locating, counting), this rule is fine.
 
-Correctness is pinned by `re2setfrl_test.go`: the oracle is an exhaustive, library-free
+Correctness is pinned by `re2setfrel_test.go`: the oracle is an exhaustive, library-free
 search (`\A(?:pat)\z` over every `(e, s)`), corpora are generated from each pattern's own
 AST so random bytes cannot make the test vacuously green, and `aa|a` on `"aaa"` must give
 three *different* answers under the three rules or the whole comparison is a no-op. The
@@ -1079,7 +1082,7 @@ hits: no runs collected, no liveness watched, no component closed, no start reso
 That is the expensive part of this layer, not just a few results you would have thrown
 away — filtering inside the callback is throwing away work already paid for. Patterns
 that can match the empty string (`PatternLenRange` min `<= 0`) may *only* be `ExistOnly`;
-otherwise `NewRe2SetFrl` fails immediately, independent of any body.
+otherwise `NewRe2SetFrel` fails immediately, independent of any body.
 
 **Measuring it.** These DFA loops are extraordinarily sensitive to code layout on the
 benchmark machine: adding one *never-called* Go function to the test package moves the
@@ -1087,7 +1090,7 @@ zero-hit 64 KiB figure between 98 µs and 199 µs. Numbers from a single binary 
 meaningless — sweep the layout (0..7 unused functions, one binary each) and take the
 **minimum** per variant. Done that way, on 64 KiB with the ten benchmark patterns:
 
-| corpus | old two-stage | `MatchScanner` | `Re2SetFrl` |
+| corpus | old two-stage | `MatchScanner` | `Re2SetFrel` |
 |---|---|---|---|
 | zero hits | 97.5 µs | 98.5 µs | **97.2 µs** |
 | 39 sparse hits | 430.9 µs | 104.8 µs | **104.3 µs** |
@@ -1103,7 +1106,7 @@ harvested from the product source, split by shape into cred/64, prompt/31, body/
 256 KiB of text, four hit densities, same eight-layout sweep — harness in
 `tmp/frlbench`:
 
-| table | hits | floor | `MatchScanner` | `Re2SetFrl` | end-to-end | start-resolution layer |
+| table | hits | floor | `MatchScanner` | `Re2SetFrel` | end-to-end | start-resolution layer |
 |---|---|---|---|---|---|---|
 | cred | 1% | 0.40 ms | 0.45 ms | **0.42 ms** | 1.07× | 2.50× |
 | cred | 90% | 1.00 ms | 5.42 ms | **3.00 ms** | 1.81× | 2.21× |
@@ -1113,12 +1116,12 @@ harvested from the product source, split by shape into cred/64, prompt/31, body/
 | body | 90% | 4.21 ms | 53.06 ms | **26.38 ms** | 2.01× | 2.20× |
 
 *Floor* is the forward set scan both paths must pay; the start-resolution column is
-`(total − floor)` compared. Eleven of the twelve cells favour `Re2SetFrl`, by 1.06×
+`(total − floor)` compared. Eleven of the twelve cells favour `Re2SetFrel`, by 1.06×
 to 2.24× end to end and a steady 2.2–2.4× on the layer that actually differs. The one
 loss is the prompt table at 1% density: hits are so sparse that nearly every hit is its
 own component, so there are no reverse-anchored probes to save and the component
 bookkeeping is pure overhead. Where the saving comes from, in one line: `MatchScanner`
-runs one reverse-anchored probe **per match end**, `Re2SetFrl` runs one **per
+runs one reverse-anchored probe **per match end**, `Re2SetFrel` runs one **per
 component** (body at 90%: 254k ends, 145k components).
 
 ### Scanning backwards

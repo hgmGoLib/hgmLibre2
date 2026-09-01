@@ -1,4 +1,4 @@
-// cre2_frl.cpp — Re2SetFrl 的引擎: F = first pass forward, RL = 【最右终点最长】。
+// cre2_frel.cpp — Re2SetFrel 的引擎: F = first pass forward, RL = 【最右终点最长】。
 //
 // 一遍正向 set 扫描, 直接交出【不重叠的命中区间】(index, start, end), 口径是
 // 【最右终点最长】: 上界从末尾起, 取终点最靠右的匹配, 同终点取最长 (起点最靠左), 收下
@@ -13,7 +13,7 @@
 // 三段分工 (每一段都在它最便宜的地方):
 //   ① 扫正文       整表正向 set 的 kManyMatch DFA, 一遍           (re2_dfa_spanscan_inl.h)
 //   ② 攒 + 切分量  存活位由活转死就收口, 游程留 native 不过桥      (同上, g2 档)
-//   ③ 补起点       这一条 pattern 自己的【单条】对象, 反向锚定     (本文件 FrlCloseSeg)
+//   ③ 补起点       这一条 pattern 自己的【单条】对象, 反向锚定     (本文件 FrelCloseSeg)
 // 🔴 ③ 走单条不走 set 是本库的一条总规矩 (2026-08-27 定的, 理由见 readme.txt):
 //    单条走 RE2::Match 那条完整的路 (DFA 放弃还有 OnePass/BitState/NFA 下家), set 那侧的
 //    锚定解析是 kManyMatch 的 DFA 独一条; 而且单条不必背每个状态那张 id 表, 状态更小。
@@ -21,7 +21,7 @@
 // 只要"有没有命中"的那几条 (boolonly) 走的是另一条路: 命中时只置一个字节, 不攒游程、
 // 不盯存活位、不收口、不补起点 —— 门上只当短路 bool 用的位一律该配这个。
 //
-// Go 侧门面在 re2setfrl.go。
+// Go 侧门面在 re2setfrel.go。
 
 #include "cre2.h"
 #include "cre2_internal.h"
@@ -31,7 +31,11 @@
 #include <string>
 #include <vector>
 
-struct cre2_frl {
+// out 数组是 Go 那侧的切片直接指过来的 (re2setfrel.go 的 Re2SetFrel_result_t), 两边必须
+// 是同一个布局: 三个 int32, 没有洞。Go 那侧也有一条对应的编译期断言。
+static_assert(sizeof(cre2_frel_result) == 12, "cre2_frel_result 必须是 3 个紧挨着的 int32");
+
+struct cre2_frel {
 	cre2_set *set;                 // 正向整表, 只用来扫
 	re2::DFASpanScan *ss;
 	int n;                         // pattern 条数
@@ -56,8 +60,8 @@ struct cre2_frl {
 	int badidx;
 };
 
-// FrlReOf: 惰性把第 id 条编成【单条】对象。补起点全走它。
-static cre2_re *FrlReOf(cre2_frl *f, int id) {
+// FrelReOf: 惰性把第 id 条编成【单条】对象。补起点全走它。
+static cre2_re *FrelReOf(cre2_frel *f, int id) {
 	if (id < 0 || id >= f->n) {
 		return NULL;
 	}
@@ -66,13 +70,13 @@ static cre2_re *FrlReOf(cre2_frl *f, int id) {
 	}
 	cre2_re *re = cre2_new_max_mem(f->pats[id].data(), (int)f->pats[id].size(), f->maxmem);
 	if (re == NULL) {
-		f->err = "re2 frl: 单条对象建不出来 (OOM)";
+		f->err = "re2 frel: 单条对象建不出来 (OOM)";
 		f->badidx = id;
 		return NULL;
 	}
 	const char *e = cre2_error(re);   // 没错时是空串, 不是 NULL
 	if (e != NULL && *e != '\0') {
-		f->err = std::string("re2 frl: 单条编译失败: ") + e;
+		f->err = std::string("re2 frel: 单条编译失败: ") + e;
 		f->badidx = id;
 		cre2_free(re);
 		return NULL;
@@ -81,7 +85,7 @@ static cre2_re *FrlReOf(cre2_frl *f, int id) {
 	return re;
 }
 
-// FrlCloseSeg: 把一个分量按【最右终点最长】结算掉, 结果 (升序) 落进 f->seg。
+// FrelCloseSeg: 把一个分量按【最右终点最长】结算掉, 结果 (升序) 落进 f->seg。
 //
 // r.runs 是这一分量里【匹配右端】的游程 (升序, 互不相接), r.lo 是分量左界 ——
 // 上一次这条 pattern 断气的位置, 分量内任何匹配的左端都 >= r.lo, 所以它就是反向锚定的
@@ -90,13 +94,13 @@ static cre2_re *FrlReOf(cre2_frl *f, int id) {
 // 从最右的右端起: 反向锚定拿【最靠左】的左端 (= 这个右端上最长的那个匹配), 收下,
 // 然后把上界 limit 压到刚拿到的左端 —— 下一处必须整个落在它左边。倒着找出来的,
 // 最后翻成升序。
-static bool FrlCloseSeg(cre2_frl *f, const char *text, int textlen,
+static bool FrelCloseSeg(cre2_frel *f, const char *text, int textlen,
                         const re2::DFASpanScanG2Rec &r) {
 	int k = r.nrun - 1;
 	if (k < 0) {
 		return true;
 	}
-	cre2_re *re = FrlReOf(f, r.id);
+	cre2_re *re = FrelReOf(f, r.id);
 	if (re == NULL) {
 		return false;
 	}
@@ -118,7 +122,7 @@ static bool FrlCloseSeg(cre2_frl *f, const char *text, int textlen,
 		cre2_span_resolve_result rr = cre2_resolve_span_reverse_r(re, text, textlen, e, r.lo);
 		f->nresolve++;
 		if (rr.rc < 0) {
-			f->err = "re2 frl: 反向锚定解析失败 (反向程序编不出来, 或 DFA 放弃); "
+			f->err = "re2 frel: 反向锚定解析失败 (反向程序编不出来, 或 DFA 放弃); "
 			         "用更大的 maxMem 重建";
 			f->badidx = r.id;
 			return false;
@@ -159,9 +163,9 @@ static bool FrlCloseSeg(cre2_frl *f, const char *text, int textlen,
 
 extern "C" {
 
-cre2_frl *cre2_frl_new(const char **pats, const int *patlens, const unsigned char *boolonly,
+cre2_frel *cre2_frel_new(const char **pats, const int *patlens, const unsigned char *boolonly,
                        int n, int64_t max_mem) {
-	cre2_frl *f = new (std::nothrow) cre2_frl;
+	cre2_frel *f = new (std::nothrow) cre2_frel;
 	if (f == NULL) {
 		return NULL;
 	}
@@ -178,14 +182,14 @@ cre2_frl *cre2_frl_new(const char **pats, const int *patlens, const unsigned cha
 	f->nresolve = 0;
 	f->badidx = -1;
 	if (n < 0 || (n > 0 && (pats == NULL || patlens == NULL))) {
-		f->err = "re2 frl: 参数不对";
+		f->err = "re2 frel: 参数不对";
 		return f;
 	}
 	f->re.assign(n > 0 ? n : 0, NULL);
 	f->boolonly.assign(n > 0 ? n : 0, 0);
 	f->set = cre2_set_new(max_mem);
 	if (f->set == NULL) {
-		f->err = "re2 frl: set 建不出来 (OOM)";
+		f->err = "re2 frel: set 建不出来 (OOM)";
 		return f;
 	}
 	for (int i = 0; i < n; i++) {
@@ -194,19 +198,19 @@ cre2_frl *cre2_frl_new(const char **pats, const int *patlens, const unsigned cha
 			f->boolonly[i] = boolonly[i] ? 1 : 0;
 		}
 		if (cre2_set_add(f->set, pats[i], patlens[i]) != i) {
-			f->err = "re2 frl: pattern 解析失败";
+			f->err = "re2 frel: pattern 解析失败";
 			f->badidx = i;
 			return f;
 		}
 	}
 	if (n > 0 && cre2_set_compile(f->set) == 0) {
-		f->err = "re2 frl: set 编译失败 (maxMem 不够, 调大它)";
+		f->err = "re2 frel: set 编译失败 (maxMem 不够, 调大它)";
 		return f;
 	}
 	if (n > 0) {
 		f->ss = f->set->set->NewSpanScan();
 		if (f->ss == NULL) {
-			f->err = "re2 frl: 扫描工作区建不出来 (DFA 建不出来 / OOM)";
+			f->err = "re2 frel: 扫描工作区建不出来 (DFA 建不出来 / OOM)";
 			return f;
 		}
 		for (int i = 0; i < n; i++) {
@@ -219,7 +223,7 @@ cre2_frl *cre2_frl_new(const char **pats, const int *patlens, const unsigned cha
 	return f;
 }
 
-void cre2_frl_free(cre2_frl *f) {
+void cre2_frel_free(cre2_frel *f) {
 	if (f == NULL) {
 		return;
 	}
@@ -237,9 +241,9 @@ void cre2_frl_free(cre2_frl *f) {
 	delete f;
 }
 
-const char *cre2_frl_error(const cre2_frl *f, int *badidx) {
+const char *cre2_frel_error(const cre2_frel *f, int *badidx) {
 	if (f == NULL) {
-		return "re2 frl: 空句柄";
+		return "re2 frel: 空句柄";
 	}
 	if (badidx != NULL) {
 		*badidx = f->badidx;
@@ -247,7 +251,7 @@ const char *cre2_frl_error(const cre2_frl *f, int *badidx) {
 	return f->err.empty() ? NULL : f->err.c_str();
 }
 
-int cre2_frl_begin(cre2_frl *f, int textlen) {
+int cre2_frel_begin(cre2_frel *f, int textlen) {
 	if (f == NULL || f->ss == NULL || textlen < 0) {
 		return 0;
 	}
@@ -262,16 +266,16 @@ int cre2_frl_begin(cre2_frl *f, int textlen) {
 	f->badidx = -1;
 	f->err.clear();
 	if (!re2::DFASpanScanBeginG2(f->ss, textlen)) {
-		f->err = "re2 frl: begin 失败";
+		f->err = "re2 frel: begin 失败";
 		f->failed = 1;
 		return 0;
 	}
 	return 1;
 }
 
-int cre2_frl_step(cre2_frl *f, const char *text, int textlen,
-                  int32_t *index, int32_t *start, int32_t *end, int cap, int *more) {
-	if (f == NULL || more == NULL || index == NULL || start == NULL || end == NULL || cap <= 0) {
+int cre2_frel_step(cre2_frel *f, const char *text, int textlen,
+                   cre2_frel_result *out, int cap, int *more) {
+	if (f == NULL || more == NULL || out == NULL || cap <= 0) {
 		return -1;
 	}
 	*more = 0;
@@ -283,9 +287,9 @@ int cre2_frl_step(cre2_frl *f, const char *text, int textlen,
 	for (;;) {
 		// ① 先把上一个分量结算出来的区间倒进调用方的数组
 		while (f->segi < f->seg.size() && n < cap) {
-			index[n] = f->seg[f->segi];
-			start[n] = f->seg[f->segi + 1];
-			end[n] = f->seg[f->segi + 2];
+			out[n].index = f->seg[f->segi];
+			out[n].start = f->seg[f->segi + 1];
+			out[n].end = f->seg[f->segi + 2];
 			f->segi += 3;
 			n++;
 		}
@@ -300,7 +304,7 @@ int cre2_frl_step(cre2_frl *f, const char *text, int textlen,
 		// ② 结算下一个已收口的分量 (一次一个: 内部缓冲最多只装一个分量的量)
 		if (f->reci < f->nrec) {
 			const re2::DFASpanScanG2Rec &r = f->recs[f->reci++];
-			if (!FrlCloseSeg(f, text, textlen, r)) {
+			if (!FrelCloseSeg(f, text, textlen, r)) {
 				f->failed = 1;
 				return -1;
 			}
@@ -314,7 +318,7 @@ int cre2_frl_step(cre2_frl *f, const char *text, int textlen,
 		int mo = 0;
 		// g2 档一个字节都不往 out 写, 所以这里给个占位就够 (见 span_scan.h)。
 		if (re2::DFASpanScanStep(f->ss, text, textlen, &dummy, 1, &mo) < 0) {
-			f->err = "re2 frl: 扫描失败 (DFA 放弃), 整遍作废; 用更大的 maxMem 重建";
+			f->err = "re2 frel: 扫描失败 (DFA 放弃), 整遍作废; 用更大的 maxMem 重建";
 			f->failed = 1;
 			return -1;
 		}
@@ -326,14 +330,14 @@ int cre2_frl_step(cre2_frl *f, const char *text, int textlen,
 	}
 }
 
-const unsigned char *cre2_frl_hits(const cre2_frl *f) {
+const unsigned char *cre2_frel_hits(const cre2_frel *f) {
 	if (f == NULL || f->ss == NULL) {
 		return NULL;
 	}
 	return re2::DFASpanScanG2Hits(f->ss);
 }
 
-void cre2_frl_stats(const cre2_frl *f, long long *usedpeak, long long *heappeak,
+void cre2_frel_stats(const cre2_frel *f, long long *usedpeak, long long *heappeak,
                     long long *poolbytes, long long *nseg, long long *nresolve) {
 	if (f == NULL) {
 		return;
