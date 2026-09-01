@@ -29,9 +29,16 @@
        unsupported 名单 · SetModes 的 boolOnly 降级 · NewRe2SetFrel 的逐条校验) ——
        通道本身就是一批几乎跑不到、因而基本没测过的分支。拆掉之后全库可以【无条件】假设
        "每个匹配至少 1 字节"。逐入口的回归在 emptymatch_test.go。
-       🔴 边角 (故意留的口子): 判断走 Go 的 regexp/syntax (理由见 patlen.go 文件头)。
-       极少数 RE2 认而 Go 的解析器不认的写法【解析不出来就放行】—— 宁可漏一条, 也不能把
-       本来能用的 pattern 拒掉; 真是坏 pattern, 后面 RE2 自己的编译会报错。
+       🔴 判定在【C 侧, 用 RE2 自己的解析器】做 (cre2_emptymatch.cpp: 与 RE2::Init 同一句
+       Regexp::Parse + 同一份 ParseFlags, 再用 RE2 自己的 Walker 自底向上算可空)。
+       所以【没有口子】: RE2 编得出来的 pattern, 这道门一定看得懂。
+       2026-09-01 当天先做成了 Go 侧 regexp/syntax 判定 + "Go 解析不了就放行", 那是个 bug ——
+       两个解析器认的不是同一个语言, PerlX 的 \C (匹配任意一个字节, RE2 认 · Go 报 invalid
+       escape sequence) 让 `\C*` 整条绕过去, 编得出来还照常产零长匹配。已改掉。
+       🔴 判据是【结构上能不能吃 0 个字节走完】, 不是"在空文本上能不能命中": 零宽断言
+       (^ $ \b \B \A \z) 一律算可空 —— \b 在空文本上并不命中, 可它在 "ab" 上照样产出
+       零长匹配。所以运行期拿空串探一次不能当判据, 那会漏掉一整族。
+       RE2 自己都解析不了的 pattern 这里【放行】, 由紧接着的编译去报 RE2 那条更准的错。
     ④ 编译的是【别人写的】正则 (用户/配置提供) 且语法面必须和 stdlib 逐字一致 —— 语义契约,
        与性能无关 (\C / 嵌套深度上限 / 个别 escape 两边不通)。
 * 自带 cgo 的原生 RE2 正则库, 不用 go-re2 / 不用 abseil / 不用 cmake, 编译期不下载远程源

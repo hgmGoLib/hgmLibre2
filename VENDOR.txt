@@ -32,6 +32,10 @@ re2_*.h / util_*.h     : RE2 的 .h (re2/*.h + util/*.h), 同样拍平, 同样�
 cre2.h / cre2.cpp      : 我们自己写的极小 C 包装 (不算改 RE2)
 cre2_internal.h        : cre2 各 .cpp 之间共用的句柄定义 (struct cre2_set), 不对外
 cre2_dfastats.cpp      : 进程级 DFA 计数的 hook 安装 (挂 re2::hooks)
+cre2_emptymatch.cpp    : "这条 pattern 能不能匹配空串" 的判定 (cre2_pattern_can_match_empty)。
+                         🔴 直接用 re2 的内部件: Regexp::Parse + Regexp::Walker。必须如此 ——
+                         这道门的全部价值就在于和真正编译时【同一个解析器同一份 ParseFlags】;
+                         在 Go 侧拿 regexp/syntax 另算一遍就会漏 (\C 那一族), 试过, 是个 bug。
 cre2_spanscan.cpp      : "命中在哪"的 C 门面 —— 流式游程扫描 (sqlite3_step 式轮询)
                          + 锚定解析 (cre2_set_resolve_span 及其按值返回孪生 _r)
                          + 可行前缀回推 (cre2_set_viable_starts)。

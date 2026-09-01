@@ -14,29 +14,42 @@
 //	x{0,3}    -> x{1,3}
 //	(a|)      -> a
 //
+// 🔴 判定【在 C 侧用 RE2 自己的解析器做】(cre2_emptymatch.cpp), 不在 Go 侧用 regexp/syntax。
+//    这一条是 2026-09-01 修掉的一个 bug: 两个解析器不是同一个语言, 老实现"Go 解析不了就
+//    放行"的口子被 PerlX 的 \C (匹配任意一个字节, RE2 认 · Go 报 invalid escape sequence)
+//    整条绕过, `\C*` 照常编出来并产出零长匹配。换成 RE2 自己的解析器之后没有这个口子:
+//    RE2 编得出来的 pattern, 这道门一定看得懂。
+//
+// 🔴 判据是【结构上能不能吃 0 个字节走完】, 不是"在空文本上能不能命中"。零宽断言
+//    (^ $ \b \B \A \z) 一律算可空 —— \b 在空文本上并不命中, 可它在 "ab" 上照样产出零长
+//    匹配。所以运行期拿空串探一次【不能】当判据, 那会漏掉一整族。
+//
 // 🔴 为什么不选"照编, 但引擎里不产出零长匹配": 后置过滤 != 引擎内禁止零长。默认口径是
 //    leftmost-first, `a*|b` 撞 "b" 时引擎在位置 0 先试 a*、匹配到空串就收工给 [0,0);
 //    后置一滤就变成"无匹配", 而正确的非空答案是 [0,1)="b"。要给对答案就得改 program,
 //    从此本库的匹配语义和 RE2 上游分家, VENDOR.txt 那套"从上游摘修复"的做法一路更难。
-//
-// 🔴 边角 (故意留的口子): 判断走 Go 的 regexp/syntax (理由见 patlen.go 文件头)。
-//    极少数 RE2 认而 Go 的解析器不认的写法, 这里【解析不出来就放行】—— 宁可漏一条,
-//    也不能把本来能用的 pattern 拒掉。真是坏 pattern, 后面 RE2 自己的编译会报错。
 package hgmLibre2
+
+/*
+#include <stdlib.h>
+#include "cre2.h"
+*/
+import "C"
 
 import (
 	"errors"
-	"regexp/syntax"
+	"runtime"
 )
 
 // checkNoEmptyMatch 是全库编译入口共用的那道门。pattern 能匹配空串就返回 error。
 // where 只用来拼错误文案 (如 "set pattern at index 3")。
+//
+// RE2 解析不了的 pattern 这里【放行】(返回 nil): 那不是"可空", 是"这条 pattern 本身坏了",
+// 该由紧接着的 cre2_new / cre2_set_add 去报 RE2 自己那条更准的错, 不该被这道门截胡。
 func checkNoEmptyMatch(where string, pattern string) error {
-	re, err := syntax.Parse(pattern, syntax.Perl)
-	if err != nil {
-		return nil // 解析不出来就放行, 见文件头最后一条
-	}
-	if min, _ := lenRangeOf(re); min > 0 {
+	r := C.cre2_pattern_can_match_empty(strBytePtr(pattern), C.int(len(pattern)))
+	runtime.KeepAlive(pattern)
+	if r != 1 {
 		return nil
 	}
 	return errors.New("re2native: " + where + " 能匹配空串, 本库一律拒绝 (任何正文里都有空串, " +

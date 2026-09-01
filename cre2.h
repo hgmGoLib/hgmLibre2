@@ -36,6 +36,13 @@ int64_t cre2_max_mem(const cre2_re *h);
 int cre2_ok(const cre2_re *h);
 /* 失败原因, NUL 结尾, 有效期直到 cre2_free. */
 const char *cre2_error(const cre2_re *h);
+
+/* pattern 能不能【匹配空串】(= 结构上能吃 0 个字节走完 = 能产出零长匹配).
+ * 1=能 0=不能 -1=RE2 自己都解析不了 (交给后面的 cre2_new / cre2_set_add 去报它本来的错).
+ * 实现在 cre2_emptymatch.cpp: 走的是 RE2::Init 里那一句 Regexp::Parse + RE2 自己的 Walker,
+ * 所以和真正编译时【同一个解析器同一份 ParseFlags】—— 这是它存在的全部理由.
+ * 判据是结构可空, 不是"在空文本上命中": \b 在空文本上不命中, 却照样能产零长匹配. */
+int cre2_pattern_can_match_empty(const char *pat, int patlen);
 /* 非锚定匹配 (等价 go-re2 MatchString): text 任意位置命中返回 1. */
 int cre2_partial_match(const cre2_re *h, const char *text, int textlen);
 

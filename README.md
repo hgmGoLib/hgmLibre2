@@ -1534,10 +1534,28 @@ performance side of the same decision — see
    library's matching semantics away from upstream RE2 and makes the "cherry-pick
    upstream fixes" arrangement in `VENDOR.txt` harder forever.
 
-   *Edge (a deliberate hole).* The check parses with Go's `regexp/syntax` (same reason as
-   `patlen.go`). The rare shapes RE2 accepts but Go's parser does not are **let through** —
-   better to miss one than to reject a pattern that works; a genuinely broken pattern is
-   still reported by RE2's own compile. Pinned per entry point in `emptymatch_test.go`.
+   *How the check is made — and why there is no hole.* The decision runs on the C side, in
+   `cre2_emptymatch.cpp`, using **RE2's own parser**: the same `Regexp::Parse` call
+   `RE2::Init` makes, with the flags `RE2::Options::ParseFlags()` produces, then RE2's own
+   non-recursive `Regexp::Walker` computing nullability bottom-up. Whatever RE2 can
+   compile, this gate can read. A pattern RE2 itself cannot parse is let through, so the
+   subsequent compile reports RE2's own, more accurate error.
+
+   The first cut of this (2026-09-01) instead parsed with Go's `regexp/syntax` and let
+   through whatever Go could not parse. That was a bug: the two parsers do not accept the
+   same language. PerlX's `\C` (match any single byte) is accepted by RE2 and rejected by
+   Go with `invalid escape sequence`, so `\C*` walked straight past the gate and went on
+   producing zero-length matches — `\C*?` over `"ab"` gave `[[0 0] [1 1] [2 2]]`.
+
+   *The criterion is structural nullability*, not "does it match the empty text". Zero-width
+   assertions (`^ $ \b \B \A \z`) count as nullable: `\b` does **not** match the empty
+   text, yet it still yields zero-length matches inside `"ab"`. A runtime probe against `""`
+   would therefore miss an entire family and cannot serve as the test.
+
+   Pinned in `emptymatch_test.go`: one case per entry point, a positive control that
+   non-nullable shapes (including `\C`, `\C+`) still compile, and a 4000-pattern
+   differential asserting this gate agrees with Go's `regexp/syntax` judgement everywhere
+   both parsers accept the input.
 
 2. **`ReplaceAllString` repl is literal — no `$` expansion.** stdlib expands
    `$1` / `${name}` / `$$` in the replacement string; here `repl` is inserted
