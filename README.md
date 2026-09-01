@@ -162,17 +162,17 @@ as `regexp.Compile` (RE2's default Perl mode), *not* leftmost-longest — e.g.
   `RegexpSet_FindAllIndex_Alloc_t`, `RegexpSet_FindAllIndex_Run_t`) — *not* in stdlib;
   one scan reporting **where** each pattern of the set can end, handed back in batches;
   see [FindAllIndex](#findallindex-the-raw-end-point-runs) below
-- `RegexpSet.NewMatchScanner` (`MatchScanner`, `SetMatch`, `Scan`, `SetModes`,
-  `MatchScanMode_t`, `IsHit`,
-  `GetHitIDs`, `GetStats`, `MatchScanStats_t`, `Close`) — *not* in stdlib; the finished form of the
-  above: one pass giving the hit table **and** de-duplicated match spans, replacing
-  `Match` + one `FindAllStringIndex` per hit pattern;
-  see [Where a set matched](#where-a-set-matched-matchscanner) below
-- `RegexpSetReverse.NewMatchScanner` (`MatchScannerReverse`, same method set) — *not* in
+- `RegexpSet.NewRe2Set_fll` (`Re2Set_fll_t`, `Scan`, `GetPatternLen`, `GetStats`,
+  `Re2Set_stats_t`, `Close`, plus the shared `Re2Set_req_t` / `Re2Set_alloc_t` /
+  `Re2Set_startEnd_t` / `NewRe2Set_alloc` / `NewRe2Set_allocBatch`) — *not* in stdlib;
+  the finished form of the above: one pass giving the hit table **and** de-duplicated
+  match spans, replacing `Match` + one `FindAllStringIndex` per hit pattern;
+  see [Where a set matched](#where-a-set-matched-re2set_fll_t) below
+- `RegexpSetReverse.NewRe2Set_rrl` (`Re2Set_rrl_t`, **same function signatures**) — *not* in
   stdlib; the same thing from the other end: one backwards pass giving de-duplicated
   spans under **rightmost-longest**, for tables whose patterns are cheap in reverse and
   explosive forwards; see
-  [Where a reverse set matched](#where-a-reverse-set-matched-matchscannerreverse) below
+  [Where a reverse set matched](#where-a-reverse-set-matched-re2set_rrl_t) below
 - `RegexpSet.ResolveSpan` / `ResolveSpanWithin` / `ResolveSpanBytes` (the same three on
   `RegexpSetReverse`, in the opposite direction) — *not* in stdlib; complete one end
   point into a whole span with a single anchored question whose cost does not depend on
@@ -518,7 +518,7 @@ oracle exactly, every time. The same DFA-failure hook *does* fire, as expected,
 for single-`Regexp` matching under a starved budget — and there it is harmless,
 because a lone `RE2` falls back to the NFA and still returns the correct answer.
 
-### Where a set matched: `MatchScanner`
+### Where a set matched: `Re2Set_fll_t`
 
 `RegexpSet.Match` answers *which* of the N patterns hit. Learning *where* they hit
 used to cost a second pass per hit pattern: `Match` once to narrow the table down,
@@ -534,25 +534,32 @@ when the scan ends. This library keeps it. On a 6.4 MB body, `Match` alone costs
 18.5 ms and `Match` *plus* collecting every end point costs 18.4 ms — within noise,
 so the positions are free.
 
-`MatchScanner` is the finished form of that: **one** pass over the input, giving both
+`Re2Set_fll_t` is the finished form of that: **one** pass over the input, giving both
 the hit table and de-duplicated match spans, in batches, with a fixed memory
 footprint.
 
 ```go
-ms, unsupported, err := set.NewMatchScanner()  // reusable workspace: build once, keep it, Close it
+ms, err := set.NewRe2Set_fll()    // reusable workspace: build once, keep it, Close it
 defer ms.Close()
-// unsupported: pattern indices that cannot produce spans at all (today: they match the
-// empty string). Fixed at construction, independent of any input — settle them here.
 
-ms.SetModes(modes)                // optional: what each pattern needs (default: spans, auto-tiered)
-
-err = ms.Scan(body, func(batch []hgmLibre2.SetMatch) {
-    for _, m := range batch {     // body[m.Lo:m.Hi] is a real match of pattern m.Index
-        handle(m.Index, body[m.Lo:m.Hi])
-    }
-})                                // err != nil ⟹ the whole pass is void; redo it with FindAll
-ids := ms.GetHitIDs()                // the same hit table Set.Match would have returned
-// ms.IsHit(i) is the O(1) form of the same answer
+// Build the request once too: a fresh one per pass (it carries closures) is an
+// allocation per pass. Passing nil is legal and means "I want nothing".
+req := &hgmLibre2.Re2Set_req_t{
+    Allocer:            hgmLibre2.NewRe2Set_alloc(),
+    ExistOnlyIndexList: []int32{3, 7},   // optional: these only need "did it hit"
+    StartEndResultFn: func(batch []hgmLibre2.Re2Set_startEnd_t) bool {
+        for _, m := range batch {        // body[m.Start:m.End] is a real match of pattern m.Index
+            handle(m.Index, body[m.Start:m.End])
+        }
+        return true                      // return false to stop early (not an error)
+    },
+    HitIndexResultFn: func(ids []int32) bool {
+        // handed once, after the scan: the same hit table Set.Match would have returned
+        // (ascending, including the ExistOnly rows)
+        return true
+    },
+}
+err = ms.Scan(body, req)          // err != nil ⟹ the whole pass is void; redo it with FindAll
 st := ms.GetStats()                  // Walks / Cands / Tries / Emits for that pass
 // st.Tries/st.Walks is the number to watch: 1.00 means the first candidate start was
 // always the answer. Measured 1.00 on every production table. The first three counters
@@ -588,7 +595,7 @@ question — *how much better is this layer than not having it* (versus the old 
 plus one `FindAll` per hit pattern") — and that ratio only improved. Post-change numbers are
 in `doc/补起点换路的实测账_20260828.txt`.
 
-Rules that matter, all pinned by tests (`matchscan_test.go`, `spanscan_*_test.go`):
+Rules that matter, all pinned by tests (`re2set_fll_test.go`, `spanscan_*_test.go`):
 
 - **The batch slice is the internal buffer itself**, overwritten in place by the
   next batch. Keep what you need by appending it elsewhere. This is why the API is
@@ -600,56 +607,50 @@ Rules that matter, all pinned by tests (`matchscan_test.go`, `spanscan_*_test.go
   Within one pattern they are ascending by `Lo` and non-overlapping. Grouping by
   pattern is one `append` on your side; doing it in the library would mean
   accumulating, which is exactly what the batching avoids.
-- **Passing `nil` as `batchFn` is legal** — you then get only the hit table, i.e.
-  `Set.Match` semantics, with no span work done at all.
-- **The workspace is not concurrency-safe**: one `MatchScanner` per goroutine. The
+- **Leaving `StartEndResultFn` nil is legal** — you then get only the hit table, i.e.
+  `Set.Match` semantics, with no span work done at all. Passing `req == nil` (or a
+  request with both callbacks nil) means "I want nothing": no pass, no allocation.
+- **The workspace is not concurrency-safe**: one `Re2Set_fll_t` per goroutine. The
   `RegexpSet` behind it is read-only and shared freely, so several scanners can run
   against one set concurrently.
 - **`text` is only referenced during `Scan`** (the left edge is recovered by reading
   it); the scanner does not retain it afterwards.
 
-#### `SetModes`: what each pattern needs
+#### `ExistOnlyIndexList`: a pure cost switch
 
-`ms.SetModes(modes)` declares, per pattern index, one of two things (indices beyond
-a short slice take the zero value; `nil` = all default):
+`req.ExistOnlyIndexList` names the pattern indices that only need *"did it hit"*:
 
-| mode | what it means |
+| listed? | what it means |
 |---|---|
-| `MatchScanMode_span` (zero value) | give me spans. **Leftmost-longest, unconditionally** — no pattern shape escapes it. |
-| `MatchScanMode_boolOnly` | I only need "did it hit". No span is ever closed, no endpoint recovered. |
+| not listed (default) | give me spans. **Leftmost-longest, unconditionally** — no pattern shape escapes it. |
+| listed | I only need "did it hit". No span is ever closed, no endpoint recovered — but the row still appears in the hit table. |
 
-🔴 Until 2026-08-28 there was a third mode, `MatchScanMode_spanFast`, forcing a cheap
-cursor path that did **not** guarantee leftmost-longest and required the caller to fuzz
-out a per-pattern clearance first. It is **gone**. The path that replaced it is both
-strictly leftmost-longest *and* cheaper than `spanFast` was, so the trade it offered no
-longer exists — see *How the three paths became one* below.
+🔴 Until 2026-08-28 this was a three-state knob fixed at construction (`SetModes`),
+with a third mode `MatchScanMode_spanFast` forcing a cheap cursor path that did **not**
+guarantee leftmost-longest and required the caller to fuzz out a per-pattern clearance
+first. That mode is **gone** — the path that replaced it is both strictly
+leftmost-longest *and* cheaper than `spanFast` was (see *How the three paths became one*
+below) — and on 2026-09-01 the remaining two states became this per-call list.
 
-`boolOnly` is the one that pays: patterns left out of span work still appear in the
-hit table, they just never pay for endpoint recovery, which is the expensive half.
-Many entries in a big table are pure booleans ("does this class of content appear at
-all") and nobody ever asks where they hit; on the table above, two such patterns
-alone accounted for **57%** of all runs. This is static information — you know at
-build time which branches consult a position — so set it once, right after building
-the scanner.
+🔴 It is a **per-call** parameter, not a construction-time attribute. "Ask whether it
+is there, and only then ask where" is the most natural way to use this layer; with a
+per-call list one object answers both questions, instead of two objects with two caches.
 
-It is one three-state table rather than two masks ("wants a span" × "which path")
-because *wants-no-span-but-use-path-B* is not a meaningful combination; two masks
-would eventually contradict each other.
-
-`SetModes` returns an error if a pattern that can match the empty string is given
-anything other than `boolOnly` — every offset would be a zero-length hit and the
-cursor cannot advance past it. That is rejected up front rather than degrading
-silently at scan time.
+`ExistOnly` is the entry that pays: it skips **endpoint recovery**, which is the
+expensive half — not merely a few results. Many entries in a big table are pure
+booleans ("does this class of content appear at all") and nobody ever asks where they
+hit; on the table above, two such patterns alone accounted for **57%** of all runs.
+Filtering inside the callback cannot replace it: by then the money is already spent.
 
 #### What `Scan` guarantees
 
 Long-form, in Chinese:
-[`doc/MatchScanner的leftmost-longest保证.md`](doc/MatchScanner%E7%9A%84leftmost-longest%E4%BF%9D%E8%AF%81.md).
+[`doc/fll的leftmost-longest保证.md`](doc/fll%E7%9A%84leftmost-longest%E4%BF%9D%E8%AF%81.md).
 
-In the default mode (`MatchScanMode_span`) the spans handed to you satisfy:
+For every pattern not listed in `ExistOnlyIndexList`, the spans handed to you satisfy:
 
-1. `text[Lo:Hi]` is a **real** match of that pattern;
-2. spans **of one pattern** are non-overlapping and ascending by `Lo`;
+1. `body[Start:End]` is a **real** match of that pattern;
+2. spans **of one pattern** are non-overlapping and ascending by `Start`;
 3. the semantics are **leftmost-longest** — i.e. `re.Longest().FindAllStringIndex`.
 
 Three things are easy to misread there:
@@ -660,14 +661,17 @@ Three things are easy to misread there:
   leftmost-*first* (greedy); the two disagree wherever the greedy first hit at a
   start is shorter than the longest one. Compare against `Longest()`, or you get a
   false red.
-- Empty-capable patterns are rejected by `SetModes`, not silently degraded.
+- There is **no zero-length case** in any of this: patterns that can match the empty
+  string are rejected at every compile entry point library-wide (see
+  [Empty-capable patterns are rejected](#empty-capable-patterns-are-rejected)), so this
+  layer assumes unconditionally that every match is at least one byte long.
 
 How the endpoint is recovered, per pattern:
 
 | pattern shape | mode | how |
 |---|---|---|
-| `min == max` (fixed length) | any | `Lo = Hi - min`, one subtraction, the regex engine is never entered. Both paths agree here, so the mode does not apply. |
-| variable | `span` (default) | **two steps.** ① A reverse pass from the end `e` with **every live state seeded**, walking left until the machine dies, collecting *all* viable-prefix starts in `[cursor, e)` (`RegexpSetReverse.GetViableStarts`, on a reverse set holding **just that one pattern**). ② Try those candidates **in ascending order** with an anchored longest forward search; the first one that verifies is the answer. Ascending ⟹ leftmost; longest-mode ⟹ longest end. Strictly leftmost-longest for any pattern shape, and **no `maxLen` is needed** — the look-back's lower bound is wherever the reverse machine died. Cost: the look-back windows are pairwise **disjoint** (bounded by one extra pass over the text) plus however many false candidates get verified — measured `1.00` tries per look-back on every production table. |
+| `min == max` (fixed length) | any | `Start = End - min`, one subtraction, the regex engine is never entered. |
+| variable | spans wanted (default) | **two steps.** ① A reverse pass from the end `e` with **every live state seeded**, walking left until the machine dies, collecting *all* viable-prefix starts in `[cursor, e)` (`RegexpSetReverse.GetViableStarts`, on a reverse set holding **just that one pattern**). ② Try those candidates **in ascending order** with an anchored longest forward search; the first one that verifies is the answer. Ascending ⟹ leftmost; longest-mode ⟹ longest end. Strictly leftmost-longest for any pattern shape, and **no `maxLen` is needed** — the look-back's lower bound is wherever the reverse machine died. Cost: the look-back windows are pairwise **disjoint** (bounded by one extra pass over the text) plus however many false candidates get verified — measured `1.00` tries per look-back on every production table. |
 | — | — | if the single-pattern object will not compile, `maxMem` is too small and `Scan` fails the whole pass. |
 
 **One rule governs all of it (2026-08-27): the pass over the text uses the set; every
@@ -686,7 +690,7 @@ the set.** Three reasons:
 The answers were byte-for-byte unchanged (`TestMatchScanPathsSameAsSetRoute`: 300
 AST-generated corpora per path, 54 000 spans, zero differences), and dense-hit corpora
 got 27–36% cheaper. 🔴 That test was removed on 2026-08-28 along with the two paths it
-replayed; the same AST-generated corpus is now pinned in `matchscan_astfuzz_test.go`
+replayed; the same AST-generated corpus is now pinned in `re2set_fll_astfuzz_test.go`
 against stdlib's `Longest()`, which is a harder oracle than a replica of our own old
 code.
 
@@ -696,7 +700,7 @@ For the fixed-length tier the equality is provable, not merely measured: an end 
 has exactly one possible start `e-min`, so starts are monotone in ends and "greedy
 leftmost non-overlapping" is precisely what the cursor produces. It is cross-checked
 against `FindAllStringIndex` on 60 000 random fixed-length patterns
-(`TestMatchScanStrictVsFindAll`).
+(`TestRe2SetFllStrictVsFindAll`).
 
 For the variable-length tier the pairing has to be **rebuilt** on the Go side, and
 *how* you rebuild it decides what semantics you get. This scan yields the *set of end
@@ -708,7 +712,7 @@ mode that reports *all* ends) discards. Until 2026-08-28 three rebuilds coexiste
 |---|---|---|---|
 | **path A** (`spanFast`) | reverse machine seeded with **accept only** → one start, then an anchored longest end | **a third kind** — neither leftmost-first nor leftmost-longest | two calls per hit, look-back windows **overlap** |
 | **path B** (old default) | one forward **unanchored** longest search from `max(cursor, e-maxLen)` | leftmost-longest | patterns with no length bound must **walk the gaps** (up to 2.00× the text) |
-| **path D2** (separate type `MatchScanner2`) | what the table above now describes | leftmost-longest | verifying false candidates (never happens on real tables) |
+| **path D2** (separate type `Re2Set_fll_t2`) | what the table above now describes | leftmost-longest | verifying false candidates (never happens on real tables) |
 
 Path A's defect is structural: seeding accept only sees the starts where a match ends
 *exactly* at `e`. `\b(?:ab cd ef|cd)\b` against `"ab cd ef"` — the smallest end the set
@@ -742,8 +746,10 @@ local Claude history) × 9 **production** gate tables = 99 cells. Raw reports in
   add**, since B built no reverse object at all. Measure it with `GetViableOneStats()`.
 
 Removed along with the two paths: `MatchScanMode_spanFast`, the guard rejecting it in
-`MatchScannerReverse.SetModes`, the `MatchScanner2` type, `RegexpSet.reverseOne` /
+the reverse side's `SetModes`, the `MatchScanner2` type, `RegexpSet.reverseOne` /
 `ReverseOneStats` / `rev1`, and the tests that existed only to compare paths.
+(`SetModes` itself, and the two remaining modes, went away on 2026-09-01 — see
+`ExistOnlyIndexList` above.)
 
 **Anchoring used to remove path A's problem entirely** — wrapping a variable pattern in
 word boundaries (`\b(?:…)\b`) pins the start, so "which start to pick" never arose: in a
@@ -752,26 +758,24 @@ now a property of the patterns rather than a requirement on the caller: fixed-le
 were always safe to slice with, and variable-length spans are too, since they are strictly
 leftmost-longest.
 
-#### "I could not give you everything": exactly two ways to say it
+#### "I could not give you everything": exactly one way to say it
 
 🔴 There is no "I bailed halfway through, these patterns are yours to finish" middle
-state (it was removed on 2026-08-27). Only two:
+state (it was removed on 2026-08-27). Only one:
 
 | where | what it says |
 |---|---|
-| `NewMatchScanner`'s `unsupported` | `[]int32` — pattern indices that cannot produce spans at all. Today there is exactly one reason: the pattern matches the empty string (`GetPatternLenRange`'s `min <= 0`), so every position is a zero-length hit the cursor cannot pin down. |
 | `Scan`'s `err` | this pass is void — the batches you already received do not count either. Redo the whole input with `FindAll`. |
 
-`unsupported` **does not depend on the input**: it is decided when the workspace is
-built and never changes, so you can pin it in a regression test (put an `a*` in the
-set and the index comes back). Configure those patterns as `boolOnly` — they still
-appear in the hit table — or run them the old way. Asking for spans on one makes
-`SetModes` fail immediately; if you never call `SetModes` they are handled as
-`boolOnly`, since you were already told at construction.
+🔴 Until 2026-09-01 there was a second one: `NewMatchScanner` handed back an
+`unsupported` list (the patterns that could match the empty string and therefore could
+not produce spans). Empty-capable patterns are now rejected at every compile entry point
+library-wide, so such a pattern can never reach a set — the list and the whole escape
+hatch behind it are gone.
 
-`Scan`'s `err` has three causes, all of them "`maxMem` is too small": the underlying
-`FindAllIndex` pass failed; one of the two single-pattern objects needed to fill in the
-other end would not compile; the reverse look-back gave up.
+`Scan`'s `err` has three causes, all of them "`maxMem` is too small": the scan pass
+itself gave up; one of the two single-pattern objects needed to fill in the other end
+would not compile; the reverse look-back gave up.
 
 🔴 "The reverse set would not compile" is deliberately **not** given a fallback. Measured
 byte-exactly on 2026-08-28: of 590 production patterns only **16** cost more in reverse
@@ -819,7 +823,7 @@ their own `Scan` callback, where the cost is visible to whoever wrote it.
 
 #### `FindAllIndex`: the raw end-point runs
 
-`MatchScanner` is built on top of a lower layer, exported for callers who want to
+`Re2Set_fll_t` is built on top of a lower layer, exported for callers who want to
 apply their own pairing or overlap policy:
 
 ```go
@@ -846,7 +850,7 @@ err := set.FindAllIndex(body, alloc, func(runs []hgmLibre2.RegexpSet_FindAllInde
 - **This is not `FindAllStringIndex` semantics.** That returns a leftmost-first,
   non-overlapping sequence; this returns *all* end points of *all* patterns, overlaps
   included (`abcd|bc` on `"abcd"` reports both). Choosing between overlapping hits is
-  policy, and the library does not decide it for you — use `MatchScanner` if you want
+  policy, and the library does not decide it for you — use `Re2Set_fll_t` if you want
   finished spans.
 - Ordering is **not** globally ascending (a run closes only when its pattern hits
   again non-consecutively, or at end of input, so patterns interleave), but it *is*
@@ -917,25 +921,36 @@ Patterns that RE2 accepts but Go's parser rejects return `(0, PatLenUnbounded)` 
 conservative in the safe direction, i.e. it can only push a pattern onto the fallback
 path, never produce a wrong start.
 
-### Where a reverse set matched: `MatchScannerReverse`
+### Where a reverse set matched: `Re2Set_rrl_t`
 
-The mirror of `MatchScanner`: one pass from the **end** of the input, handing back
-de-duplicated, non-overlapping spans in batches. The API is identical — open it on a
+The mirror of `Re2Set_fll_t`: one pass from the **end** of the input, handing back
+de-duplicated, non-overlapping spans in batches. The function signatures are identical
+(same `Re2Set_req_t` / `Re2Set_alloc_t` / `Re2Set_startEnd_t`) — open it on a
 `*RegexpSetReverse` instead of a `*RegexpSet`:
 
 ```go
 rs, _ := hgmLibre2.NewRegexpSetReverseMaxMem(patterns, hgmLibre2.DefaultSetMaxMem)
-ms, unsupported, _ := rs.NewMatchScanner()   // reusable workspace; not concurrency-safe
+ms, _ := rs.NewRe2Set_rrl()   // reusable workspace; not concurrency-safe
 defer ms.Close()
 
-err := ms.Scan(body, func(batch []hgmLibre2.SetMatch) {
-    for _, m := range batch { _ = body[m.Lo:m.Hi] }   // a real match of pattern m.Index
+err := ms.Scan(body, &hgmLibre2.Re2Set_req_t{
+    Allocer: hgmLibre2.NewRe2Set_alloc(),
+    StartEndResultFn: func(batch []hgmLibre2.Re2Set_startEnd_t) bool {
+        for _, m := range batch { _ = body[m.Start:m.End] } // a real match of pattern m.Index
+        return true
+    },
 })
 ```
 
+🔴 The three types have the **same function signatures**, but they are deliberately
+**not** a Go `interface` — this library has no need for one and does not define one.
+Same shape means easy to learn and easy to swap by hand; it does not mean
+interchangeable, and the output order differs (fll ascending / rrl descending /
+frel ascending by `Start`).
+
 Two things differ from the forward scanner, and only two:
 
-1. spans come back in **descending** `Lo` order (forward: ascending);
+1. spans come back in **descending** `Start` order (forward: ascending);
 2. the de-overlap rule is **rightmost-longest** (forward: leftmost-longest).
 
 Both directions guarantee the same three things: every span is a real match, spans of
@@ -957,7 +972,7 @@ collapse in reverse — the `S B{m,n} L` shape of
 [Scanning backwards](#scanning-backwards). Before this layer existed, such a table
 could only be scanned backwards as a *gate*: `Match` said which patterns hit, and
 getting positions meant a second forward pass over the whole body — which is exactly
-the `1 + k` passes `MatchScanner` exists to collapse.
+the `1 + k` passes `Re2Set_fll_t` exists to collapse.
 
 **Reverse is the easier direction, not the harder one.** A forward DFA pass reports
 match **ends**, so the start has to be guessed back on the Go side — that guess is
@@ -988,7 +1003,7 @@ because nothing further left can outrank it — the same sentence as the forward
 scanner's, in a mirror. So the cursor still advances inside the callback and output
 still goes into the same fixed 12 KB buffer.
 
-**How it is pinned.** `matchscan_reverse_test.go` generates its corpus from each
+**How it is pinned.** `re2set_rrl_test.go` generates its corpus from each
 pattern's own `regexp/syntax` AST (random bytes never produce real matches — that is a
 vacuously green test) and checks against an exhaustive rightmost-longest oracle written
 against stdlib alone. The first five patterns in that list are exactly the
@@ -998,42 +1013,44 @@ none of them, because there is no guess to get wrong. The oracle carries its own
 self-check: `ab|b` against `"aab"` must produce different answers under the two rules,
 or the whole comparison is vacuous.
 
-### One forward pass, spans straight out: `Re2SetFrel`
+### One forward pass, spans straight out: `Re2Set_frel_t`
 
-`Re2SetFrel` answers the same question as `MatchScanner` — *where did each pattern
+`Re2Set_frel_t` answers the same question as `Re2Set_fll_t` — *where did each pattern
 match?* — but almost all of it lives in C++. Go only hands it a
-`[]Re2SetFrel_result_t` and the C side writes the results straight into it, a batch per
-`step` — that Go struct and C's `cre2_frel_result` are the same memory layout (three
+`[]Re2Set_startEnd_t` and the C side writes the results straight into it, a batch per
+`step` — that Go struct and C's `cre2_re2set_result` are the same memory layout (three
 `int32`, no padding; a static assert on each side), so nothing is copied field by
 field. The name: **F** = first pass forward, **RL** = **r**ightmost-end **l**ongest.
 Do not call this rule plain "rightmost-longest": in this library that name already means
-`MatchScannerReverse`'s rule, which anchors on the **start**. This one anchors on the
+`Re2Set_rrl_t`'s rule, which anchors on the **start**. This one anchors on the
 **end** — spelled out below, and they give different answers.
 
 ```go
-s, _ := hgmLibre2.NewRe2SetFrel([]hgmLibre2.Re2SetFrelPattern_t{
-    {Pattern: `\d{3}-\d{2}-\d{4}`},                 // wants spans
-    {Pattern: `(?i)authorization`, ExistOnly: true},  // only "did it hit?"
-})
+set, _ := hgmLibre2.NewRegexpSet([]string{`\d{3}-\d{2}-\d{4}`, `(?i)authorization`})
+s, _ := set.NewRe2Set_frel()
 defer s.Close()
 
-buf := make([]hgmLibre2.Re2SetFrel_result_t, 1024)   // reuse it => 0 allocs/op
-err := s.Scan(body, buf, func(rs []hgmLibre2.Re2SetFrel_result_t) bool {
-    for _, r := range rs {
-        _ = body[r.Start:r.End]          // a real match of pattern r.Index
-    }
-    return true                          // false = stop early
+err := s.Scan(body, &hgmLibre2.Re2Set_req_t{
+    Allocer:            hgmLibre2.NewRe2Set_alloc(),
+    ExistOnlyIndexList: []int32{1},       // row 1 only needs "did it hit?"
+    StartEndResultFn: func(rs []hgmLibre2.Re2Set_startEnd_t) bool {
+        for _, r := range rs {
+            _ = body[r.Start:r.End]       // a real match of pattern r.Index
+        }
+        return true                       // false = stop early
+    },
+    // HitIndexResultFn, handed once after the scan, is the hit table
+    // (the only output of the ExistOnly rows)
 })
-// afterwards s.IsHit(i) / s.GetHitIDs(nil) is the hit table (the only output of ExistOnly rows)
 ```
 
-The slice handed to the callback **is** `buf`; the next batch overwrites it in place.
-Copy what you keep. Its length only sets how many results cross the bridge per `step`,
-never the answer. And as with `MatchScanner`, it is all-or-nothing: a
+The slice handed to the callback **is** the `Allocer`'s buffer; the next batch
+overwrites it in place. Copy what you keep. Its length only sets how many results cross
+the bridge per `step`, never the answer. And as with `Re2Set_fll_t`, it is all-or-nothing: a
 non-nil `err` voids the whole pass (including batches already handed over) — fall back
 to `FindAll` for that body.
 
-**How it differs from `MatchScanner`.** `MatchScanner` looks back once per match *end*
+**How it differs from `Re2Set_fll_t`.** `Re2Set_fll_t` looks back once per match *end*
 that the cursor has not already covered. This layer looks back once per **component**.
 Components come from a per-pattern *liveness bit* carried in each DFA state
 (`State::live_`): if a pattern has no live threads at some offset, then no match of it
@@ -1048,7 +1065,7 @@ to the start of the body. Three stages, each where it is cheapest:
 | collect + split | native side, no per-hit bridge crossing | match ends are kept as run-lengths in a per-pattern buffer, handed over one component at a time |
 | resolve starts | that one pattern's **single** `Regexp`, reverse-anchored | one call per non-overlapping match in the component |
 
-`GetStats().NResolve / GetStats().NSeg` is *how many reverse-anchored searches each component
+`GetStats().Tries / GetStats().NSeg` is *how many reverse-anchored searches each component
 cost*; on the ten general-purpose patterns of the benchmark it is exactly 1.00 across
 all three corpora. `GetStats().UsedPeak` — the native-side run buffer — stays in the tens
 of bytes and does not grow with the body.
@@ -1056,10 +1073,10 @@ of bytes and does not grow with the body.
 **The de-overlap rule — rightmost *end*, longest.** Start with the bound at the end of
 the body; repeatedly take the match whose **end** is furthest right and still `<=` the
 bound, break ties by taking the **longest** one (leftmost start), emit it, then drop the
-bound to its start. That is a different rule from `MatchScannerReverse` (which picks the
+bound to its start. That is a different rule from `Re2Set_rrl_t` (which picks the
 rightmost *start* first) and from stdlib's leftmost-longest:
 
-| input | pattern | `Re2SetFrel` | `MatchScannerReverse` | stdlib `Longest` |
+| input | pattern | `Re2Set_frel_t` | `Re2Set_rrl_t` | stdlib `Longest` |
 |---|---|---|---|---|
 | `aaa` | `aa\|a` | `[0,1) [1,3)` | `[2,3) [1,2) [0,1)` | `[0,2) [2,3)` |
 | `abc` | `b\|abc` | `[0,3)` = `"abc"` | `[1,2)` = `"b"` | `[0,3)` = `"abc"` |
@@ -1067,22 +1084,26 @@ rightmost *start* first) and from stdlib's leftmost-longest:
 That second row is why this layer picks ends rather than starts: picking starts truncates
 `"abc"` down to the `"b"` in the middle, and a caller that feeds the span to a checksum
 (national ID, IBAN, Luhn) then rejects its own true hit — a silent miss. If you need byte
-equivalence with `re.Longest().FindAllStringIndex`, use `MatchScanner` instead; if you
+equivalence with `re.Longest().FindAllStringIndex`, use `Re2Set_fll_t` instead; if you
 just need everything framed (masking, locating, counting), this rule is fine.
 
-Correctness is pinned by `re2setfrel_test.go`: the oracle is an exhaustive, library-free
+Correctness is pinned by `re2set_frel_test.go`: the oracle is an exhaustive, library-free
 search (`\A(?:pat)\z` over every `(e, s)`), corpora are generated from each pattern's own
 AST so random bytes cannot make the test vacuously green, and `aa|a` on `"aaa"` must give
 three *different* answers under the three rules or the whole comparison is a no-op. The
 oracle has no notion of components, so it also pins the claim that splitting into
 components does not change the answer.
 
-**`ExistOnly` is not an optional tweak.** A row marked `ExistOnly` sets one byte when it
+**`ExistOnlyIndexList` is not an optional tweak.** A listed row sets one byte when it
 hits: no runs collected, no liveness watched, no component closed, no start resolved.
 That is the expensive part of this layer, not just a few results you would have thrown
-away — filtering inside the callback is throwing away work already paid for. Patterns
-that can match the empty string (`GetPatternLenRange` min `<= 0`) may *only* be `ExistOnly`;
-otherwise `NewRe2SetFrel` fails immediately, independent of any body.
+away — filtering inside the callback is throwing away work already paid for.
+🔴 It is a **per-call** parameter, not a construction-time attribute: the same object can
+want spans on one pass and only bits on the next, and the hit table comes out identical
+either way (`TestRe2SetFrel_ExistOnly` pins exactly that). Until 2026-09-01 it was the
+construction-time field `Re2SetFrelPattern_t.ExistOnly`, and the only hard reason for that
+was "which rows may produce spans is decided by `min <= 0`" — rejecting empty-capable
+patterns library-wide removed the reason.
 
 **Measuring it.** These DFA loops are extraordinarily sensitive to code layout on the
 benchmark machine: adding one *never-called* Go function to the test package moves the
@@ -1090,7 +1111,7 @@ zero-hit 64 KiB figure between 98 µs and 199 µs. Numbers from a single binary 
 meaningless — sweep the layout (0..7 unused functions, one binary each) and take the
 **minimum** per variant. Done that way, on 64 KiB with the ten benchmark patterns:
 
-| corpus | old two-stage | `MatchScanner` | `Re2SetFrel` |
+| corpus | old two-stage | `Re2Set_fll_t` | `Re2Set_frel_t` |
 |---|---|---|---|
 | zero hits | 97.5 µs | 98.5 µs | **97.2 µs** |
 | 39 sparse hits | 430.9 µs | 104.8 µs | **104.3 µs** |
@@ -1106,7 +1127,7 @@ harvested from the product source, split by shape into cred/64, prompt/31, body/
 256 KiB of text, four hit densities, same eight-layout sweep — harness in
 `tmp/frlbench`:
 
-| table | hits | floor | `MatchScanner` | `Re2SetFrel` | end-to-end | start-resolution layer |
+| table | hits | floor | `Re2Set_fll_t` | `Re2Set_frel_t` | end-to-end | start-resolution layer |
 |---|---|---|---|---|---|---|
 | cred | 1% | 0.40 ms | 0.45 ms | **0.42 ms** | 1.07× | 2.50× |
 | cred | 90% | 1.00 ms | 5.42 ms | **3.00 ms** | 1.81× | 2.21× |
@@ -1116,12 +1137,12 @@ harvested from the product source, split by shape into cred/64, prompt/31, body/
 | body | 90% | 4.21 ms | 53.06 ms | **26.38 ms** | 2.01× | 2.20× |
 
 *Floor* is the forward set scan both paths must pay; the start-resolution column is
-`(total − floor)` compared. Eleven of the twelve cells favour `Re2SetFrel`, by 1.06×
+`(total − floor)` compared. Eleven of the twelve cells favour `Re2Set_frel_t`, by 1.06×
 to 2.24× end to end and a steady 2.2–2.4× on the layer that actually differs. The one
 loss is the prompt table at 1% density: hits are so sparse that nearly every hit is its
 own component, so there are no reverse-anchored probes to save and the component
-bookkeeping is pure overhead. Where the saving comes from, in one line: `MatchScanner`
-runs one reverse-anchored probe **per match end**, `Re2SetFrel` runs one **per
+bookkeeping is pure overhead. Where the saving comes from, in one line: `Re2Set_fll_t`
+runs one reverse-anchored probe **per match end**, `Re2Set_frel_t` runs one **per
 component** (body at 90%: 254k ends, 145k components).
 
 ### Scanning backwards
@@ -1170,7 +1191,7 @@ semantics from the forward leftmost-first one. Use reverse as the cheap gate and
 
 On the **set** side that objection is answered rather than avoided: rightmost is a
 perfectly good de-overlap rule as long as it is the declared one, so
-[`MatchScannerReverse`](#where-a-reverse-set-matched-matchscannerreverse) gives spans
+[`Re2Set_rrl_t`](#where-a-reverse-set-matched-matchscannerreverse) gives spans
 under **rightmost-longest** and says so.
 
 `RegexpSetReverse` does report positions, in its own direction:
@@ -1184,7 +1205,7 @@ scans a 6.4 MB body in 18 ms with zero flushes forward takes **65 s** in reverse
 the arena pinned at its 254 MB ceiling and still flushing. Measure
 `GetMemInfo().FlushesTotal` before pointing a reverse set at whole documents; to recover
 the left edge of a hit you already found, use `ResolveSpanWithin`, whose cost is
-independent of input length. `MatchScanner` does exactly this internally — a lazily
+independent of input length. `Re2Set_fll_t` does exactly this internally — a lazily
 built **one-pattern** reverse set per pattern that ever needs a left edge, never used
 to scan text (see `GetViableOneStats` for what those cost: 32 patterns, 973 states,
 2.0 MB on that table).
@@ -1472,7 +1493,7 @@ reaching for `CompileMaxMem`/`CompileReverse`; the sections above are the summar
 ## Differences from stdlib `regexp`
 
 This is the complete list of concrete behavior differences from Go's standard
-library `regexp`. The first two are **API-design choices** (this library
+library `regexp`. The first three are **API-design choices** (this library
 deliberately is not a drop-in); the rest follow from running the **native RE2
 engine** instead of Go's from-scratch reimplementation. All are intentional and
 covered by tests.
@@ -1482,14 +1503,50 @@ For a migration checklist that pairs each gap (here and in
 performance side of the same decision — see
 [`doc/与标准库regexp怎么选.md`](doc/%E4%B8%8E%E6%A0%87%E5%87%86%E5%BA%93regexp%E6%80%8E%E4%B9%88%E9%80%89.md) §4.
 
-1. **`ReplaceAllString` repl is literal — no `$` expansion.** stdlib expands
+<a id="empty-capable-patterns-are-rejected"></a>
+
+1. **Patterns that can match the empty string are rejected.** `a*`, `x{0,3}`, `(a|)`,
+   `a?`, `""`, `(?m)^[ \t]*$`, a bare `\b` — every compile entry point in this library
+   (`Compile` / `MustCompile` / `CompileLongest*` / `CompileReverse*` / `NewRegexpSet` /
+   `NewRegexpSetMaxMem` / `NewRegexpSetReverseMaxMem` / `NewPrefilter`) returns an error
+   on the spot (`MustCompile` panics). stdlib compiles them happily.
+
+   *Why.* Every string contains the empty string, so such a pattern matches everywhere
+   and carries no information — it is a mistake in the pattern, not something an engine
+   should service. Rejecting it library-wide (2026-09-01) let a whole family of escape
+   hatches be deleted (`MatchScanner`'s `unsupported` list, `SetModes`' `boolOnly`
+   downgrade, `NewRe2SetFrel`'s per-pattern check) — hatches that were, by construction,
+   branches almost nothing ever executed and therefore almost nothing ever tested. Every
+   layer above may now assume **unconditionally** that a match is at least one byte long.
+
+   *What to do.* Make the quantifier non-nullable: `a*` → `a+`, `x{0,3}` → `x{1,3}`,
+   `(a|)` → `a`; for "is this line blank" use `len(line) == 0` rather than a regex.
+   Beyond correctness this is also the faster shape — on a 115 KiB line-oriented body,
+   `(?m)^[ \t]*$` ran at **0.23×** stdlib while `(?m)^[ \t]+$` runs at **8.45×**
+   (`doc/与标准库regexp怎么选.md` §2.5). If the zero-length semantics are genuinely
+   required, use stdlib for that one pattern.
+
+   *Why not "compile it, but never emit zero-length matches".* Post-filtering is not the
+   same as forbidding zero length inside the engine. The default rule is leftmost-first,
+   so `a*|b` against `"b"` tries `a*` at offset 0, matches the empty string and stops,
+   giving `[0,0)`. Filtering that out yields "no match", whereas the correct non-empty
+   answer is `[0,1)="b"`. Getting it right means changing the program, which forks this
+   library's matching semantics away from upstream RE2 and makes the "cherry-pick
+   upstream fixes" arrangement in `VENDOR.txt` harder forever.
+
+   *Edge (a deliberate hole).* The check parses with Go's `regexp/syntax` (same reason as
+   `patlen.go`). The rare shapes RE2 accepts but Go's parser does not are **let through** —
+   better to miss one than to reject a pattern that works; a genuinely broken pattern is
+   still reported by RE2's own compile. Pinned per entry point in `emptymatch_test.go`.
+
+2. **`ReplaceAllString` repl is literal — no `$` expansion.** stdlib expands
    `$1` / `${name}` / `$$` in the replacement string; here `repl` is inserted
    byte-for-byte with no expansion and no escaping (so `"$1"` stays `"$1"`,
    `"$$"` stays `"$$"`). This is the one method that is *not* signature-compatible
    in behavior. If you need capture-group substitution, use `ReplaceAllStringFunc`
    and build the replacement yourself. (`FindReplaceWithin` is a different,
    non-stdlib method and uses RE2's `\1` rewrite syntax — see its section above.)
-2. **`[]byte` replace methods reuse `src` on the no-change path.** stdlib's
+3. **`[]byte` replace methods reuse `src` on the no-change path.** stdlib's
    `ReplaceAll` / `ReplaceAllFunc` always return a freshly allocated slice; here
    an input that comes out byte-for-byte unchanged (no match, or a replacement
    that changes nothing) is returned **as the original `src` slice**, allocation-free
@@ -1497,28 +1554,28 @@ performance side of the same decision — see
    behaved this way; strings being immutable, it is only observable in the
    `[]byte` family. Content-wise the results are identical, including the
    `nil`-vs-empty conventions. See [Byte-slice methods](#byte-slice-methods).
-3. **Invalid UTF-8 input.** stdlib treats each invalid byte as one-byte
+4. **Invalid UTF-8 input.** stdlib treats each invalid byte as one-byte
    `U+FFFD` and lets `.` match it; native RE2 only matches whole valid runes, so
    on e.g. `[]byte{0xff,'a',0xfe}` the pattern `.` finds just the `a`. If you
    match on possibly-invalid UTF-8 and need stdlib's behavior, use stdlib.
-4. **`\C` is accepted** (RE2 "any byte"); stdlib `regexp` rejects `\C` at
+5. **`\C` is accepted** (RE2 "any byte"); stdlib `regexp` rejects `\C` at
    compile time. More generally a handful of escapes are RE2-only or stdlib-only,
    so a pattern valid in one may be rejected by the other.
-5. **2 GiB input limit.** Lengths/offsets cross the cgo boundary as 32-bit
+6. **2 GiB input limit.** Lengths/offsets cross the cgo boundary as 32-bit
    `int`, so inputs (and patterns) longer than `2^31-1` bytes are conservatively
    treated as *no match* / returned unchanged rather than matched. stdlib has no
    such limit. (Irrelevant unless you feed multi-gigabyte strings.)
-6. **Case-folded literals fold over the full Unicode orbit when they are merged
+7. **Case-folded literals fold over the full Unicode orbit when they are merged
    into a character class.** When a case-folded literal is one branch of an
    alternation that RE2 factors into a single character class, the class picks up
    every fold-equivalent rune, not just the ASCII pair: `\w|[kK]` also matches
    U+212A KELVIN SIGN, where stdlib matches only `k`/`K`. (`[sS]|\w` has always
    matched U+017F this way.) This is upstream RE2 behavior and only shows up for
    non-ASCII fold-equivalents.
-7. **Capture names may be non-ASCII.** `(?P<中文>a)` compiles here; stdlib has
+8. **Capture names may be non-ASCII.** `(?P<中文>a)` compiles here; stdlib has
    rejected non-ASCII capture names since Go 1.22. Both forms of named group —
    `(?P<name>expr)` and `(?<name>expr)` — are accepted, as in stdlib (Go 1.22+).
-8. **No nesting-depth limit.** stdlib rejects patterns whose parse tree nests
+9. **No nesting-depth limit.** stdlib rejects patterns whose parse tree nests
    deeper than 1000 (`expression nests too deeply`, Go 1.19+); this library
    accepts them. 200 000 nested groups compile in ~100 ms with linear memory and
    no stack growth (parsing, simplification and teardown are all iterative), and

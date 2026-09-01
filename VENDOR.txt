@@ -60,8 +60,8 @@ re2_dfa.cc             : ①转移表槽位 8 字节 State* → 4 字节 arena �
                            SpanDFA), 文件末尾 #include "re2_dfa_spanscan_inl.h"。除这两处外
                            【一个字没动】—— 热循环是另写的一份, 不往 InlinedSearchLoop 里塞
                            分支 (它是全库最热的)。
-                         ⑤可行前缀回推 (MatchScanner 补起点用; 2026-08-28 之前只有那个已删的
-                           MatchScanner2 / 路 D2 用它): 私有 enum 里加一个
+                         ⑤可行前缀回推 (Re2Set_fll_t 补起点用; 2026-08-28 之前只有那个已删的
+                           Re2Set_fll_t2 / 路 D2 用它): 私有 enum 里加一个
                            kStartViable = 8 并把 kMaxStart 从 8 抬到 16 —— 就这一处。
                            start_[base|kStartViable] 存的是"种【全部指令】"的那个起始状态,
                            实现全在 re2_dfa_spanscan_inl.h (SpanDFA::ViableStart/ViableStarts)。

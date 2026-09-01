@@ -1,23 +1,23 @@
 补起点换路的实测账 (2026-08-28)
 ================================
 
-这是 MatchScanner"补起点"那条路从【三条并存】收成【一条】那次换路的原始报表。
-结论写在 hgmLibre2/matchscan.go 头注"老账"那一节, 这里放的是数字本身。
+这是 Re2Set_fll_t"补起点"那条路从【三条并存】收成【一条】那次换路的原始报表。
+结论写在 hgmLibre2/re2set_fll.go 头注"老账"那一节, 这里放的是数字本身。
 
 三条路各是什么
 --------------
-  A  = MatchScanner + MatchScanMode_spanFast : 反向机【只种 accept】(RegexpReverse.ResolveSpanWithin)
+  A  = Re2Set_fll_t + MatchScanMode_spanFast : 反向机【只种 accept】(RegexpReverse.ResolveSpanWithin)
                                                回推一个起点, 再正向锚定取最长右端。两趟, 回看窗口【相交】,
                                                给的是"第三种口径"(既不是 leftmost-first 也不是 leftmost-longest)。
-  B  = MatchScanner 默认档                    : 从 max(游标, e-maxL) 起做一次正向【非锚定】longest 搜索。
+  B  = Re2Set_fll_t 默认档                    : 从 max(游标, e-maxL) 起做一次正向【非锚定】longest 搜索。
                                                一趟, 口径严, 贵在【没有上界的条要走完空隙】。
-  D2 = MatchScanner2                          : 反向机【种全部状态】(RegexpSetReverse.GetViableStarts) 收下
+  D2 = Re2Set_fll_t2                          : 反向机【种全部状态】(RegexpSetReverse.GetViableStarts) 收下
                                                [游标, e) 里全部可行前缀起点(降序), 再【升序】逐个正向锚定验,
                                                第一个成的就是答案。口径严, 回看窗口两两【不交】。
 
   三者共有的定长捷径: minL == maxL ⟹ start = e - minL, 一句减法, 不进正则引擎。
 
-留下来的是 D2, 现在它就是 MatchScanner 唯一那条路; A / B / MatchScanMode_spanFast / MatchScanner2
+留下来的是 D2, 现在它就是 Re2Set_fll_t 唯一那条路; A / B / MatchScanMode_spanFast / Re2Set_fll_t2
 这个类型 全部删除。
 
 口径 (逐区间对拍, 基准取 D2)
@@ -62,7 +62,7 @@
 ########## scanbench ##########
 
 === RUN   TestScanPathABD
-hgmLibre2 补起点三条路 (A=spanFast · B=默认档 · D2=MatchScanner2) × 生产真门表 9 张
+hgmLibre2 补起点三条路 (A=spanFast · B=默认档 · D2=Re2Set_fll_t2) × 生产真门表 9 张
 口径: 每条路取 1 轮最小值 · 热身正文前 1.00MB · 三条路共用同一个 *RegexpSet
 语料 consoleAsset       100.00MB   web 前端构建产物的 js 151 + css 2 原样复制 · 预期零到低命中
 
@@ -83,7 +83,7 @@ gatePosData:302                8     0    143.2ms    845.0ms    141.0ms    5.99 
 吞吐(整条门链): A 37.8 MB/s · B 11.8 MB/s · D2 47.2 MB/s
 --- PASS: TestScanPathABD (13.88s)
 === RUN   TestCredQuadPathABD
-hgmLibre2 补起点三条路 (A=spanFast · B=默认档 · D2=MatchScanner2) × 生产真门表 9 张
+hgmLibre2 补起点三条路 (A=spanFast · B=默认档 · D2=Re2Set_fll_t2) × 生产真门表 9 张
 口径: 每条路取 1 轮最小值 · 热身正文前 1.00MB · 三条路共用同一个 *RegexpSet
 语料 ②主循环splice         100.00MB   凭据二次方生成器的②主循环splice腿语料 · 4993219 个 token
 语料 ①转义补扫              100.00MB   凭据二次方生成器的①转义补扫腿语料 · 4766254 个 token
@@ -228,7 +228,7 @@ ok  	caller/tests/scanBench	188.128s
 ########## sbscan ##########
 
 === RUN   TestSbScanPathABD
-hgmLibre2 补起点三条路 (A=spanFast · B=默认档 · D2=MatchScanner2) × 生产真门表 9 张
+hgmLibre2 补起点三条路 (A=spanFast · B=默认档 · D2=Re2Set_fll_t2) × 生产真门表 9 张
 口径: 每条路取 1 轮最小值 · 热身正文前 1.00MB · 三条路共用同一个 *RegexpSet
 语料 sbMixed            100.00MB   四段各占约四分之一: goSrc=25MB manualZh=25MB manualEn=25MB elfLinux=25MB
 
@@ -254,7 +254,7 @@ ok  	caller/tests/scanBench/sbScan	35.099s
 ########## jsonl ##########
 
 === RUN   TestJsonlPathABD
-hgmLibre2 补起点三条路 (A=spanFast · B=默认档 · D2=MatchScanner2) × 生产真门表 9 张
+hgmLibre2 补起点三条路 (A=spanFast · B=默认档 · D2=Re2Set_fll_t2) × 生产真门表 9 张
 口径: 每条路取 1 轮最小值 · 热身正文前 1.00MB · 三条路共用同一个 *RegexpSet
 语料 jsonlReal          100.56MB   本机 claude 真历史 · 会话 13 个 / 文件 14 份 / 请求 478 条 · 锚 97 条 · 最大 body 767KB
 

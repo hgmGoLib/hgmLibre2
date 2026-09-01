@@ -298,7 +298,8 @@ func TestBytesSrcNotMutated(t *testing.T) {
 
 // TestBytesNilAndEmptyInput: nil 与空切片输入不得 panic, 且与 stdlib 逐一同结果.
 func TestBytesNilAndEmptyInput(t *testing.T) {
-	for _, pat := range []string{`a*`, `\d+`, `^$`} {
+	// 🔴 原来这里还有 `a*` 与 `^$` 两条 (能匹配空串)。全库拒空串之后它们编不出来了。
+	for _, pat := range []string{`\d+`} {
 		std := regexp.MustCompile(pat)
 		mine := MustCompile(pat)
 		for _, b := range [][]byte{nil, {}} {

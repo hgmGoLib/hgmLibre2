@@ -22,7 +22,7 @@ func TestStepAllocVariants_Equiv(t *testing.T) {
 	cases := []struct{ pat, body string }{
 		{`(\w+)=(\w+)`, "a=1 bb=22 ccc=333 dddd=4444 " + "x=9 "},
 		{`(\w+)=(\w+)`, "完全没有命中的一段正文"},
-		{`a*`, "baaacaaad"},              // 空匹配去重路径
+		// 🔴 原来这里有一条 {`a*`, "baaacaaad"} (空匹配去重路径)。全库拒空串之后它编不出来了。
 		{`(a)(b)?`, "ab a ab a"},         // 未参与组 -1,-1
 		{`\d+`, "1 22 333 4444 55555 666666 7777777 88 9 10 11 12 13 14 15 16 17 18 19 20"},
 	}

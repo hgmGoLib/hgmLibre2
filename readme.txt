@@ -3,9 +3,9 @@
 三个旋钮按收益排是 方向 (反着扫) > 表的形状 > 内存预算, 以及量什么、怎么标定、哪些路已经排除。
 本库 vs Go 标准库 regexp 怎么选 看 doc/与标准库regexp怎么选.md —— 哪种形状谁更快 (含实测表)、
 本库缺哪些 stdlib API、一页判据。数据出自 stdlib_compare_test.go, 换机器重跑一遍就知道还成不成立。
-一遍扫一张表要"命中在哪" (MatchScanner) 看 doc/MatchScanner的leftmost-longest保证.md ——
+一遍扫一张表要"命中在哪" (Re2Set_fll_t) 看 doc/fll的leftmost-longest保证.md ——
 它凭什么敢无条件说 leftmost-longest、对拍要拿哪个当 oracle,
-以及【反向 MatchScanner】那一侧的 rightmost-longest (§8): 什么时候该反着扫、两种口径差在哪。
+以及【Re2Set_rrl_t】那一侧的 rightmost-longest (§8): 什么时候该反着扫、两种口径差在哪。
 
 要点速记 (详见 README.md):
 * 【默认用本库】。标准库 regexp 的匹配是从零重写的 NFA 模拟, 只有提得出【字面量前缀】时才走
@@ -17,11 +17,21 @@
     ② 调用停在【过桥地板价】上 (一次 cgo 过桥 ~67ns, stdlib ~2ns): 输入只有几字节且正则简单到
        onepass 一遍就完。🔴 "输入短" 本身【不是】判据 —— 161B 的串上 6 条要回溯的正则,
        本库快 24 倍且零分配。决定胜负的是形状不是长度。
-    ③ pattern【能匹配空串】且要 FindAll 整篇 (如 (?m)^[ \t]*$): 每行都成立 -> FindAll 被迫
-       产出与行数同量级的空匹配, 本库这条路比标准库重, 115KiB 行式正文上是 0.23 倍。
-       🔴 这是【pattern 形状】问题不是引擎问题: 同一个意图改成不可空匹配 (* -> +) 立刻翻成
-       本库快 8.45 倍, 而且在标准库上也更快 —— 先试着改 pattern, 改不动再留标准库。
-       数字见 empty_width_bench_test.go 与 doc/与标准库regexp怎么选.md 的 §2.5。
+    ③ pattern【能匹配空串】(如 a* · x{0,3} · (a|) · (?m)^[ \t]*$ · \b): 本库【一律拒】——
+       每一个编译入口 (Compile / MustCompile / CompileLongest / CompileReverse /
+       NewRegexpSet / NewRegexpSetReverseMaxMem / NewPrefilter ...) 都当场报错, 见
+       emptymatch.go。理由: 任何正文里都有空串, 这种 pattern 必然处处命中, 拿它当正则没有
+       信息量 —— 是 pattern 写错了, 不该由引擎伺候。
+       🔴 先改 pattern: a* -> a+ · x{0,3} -> x{1,3} · (a|) -> a · 要"空行"就别用正则
+       (len(line)==0)。改成不可空之后同一个意图在本库上快 8.45 倍, 在标准库上也更快。
+       真改不动 (语义上就是要零长匹配) 才留标准库。
+       🔴 这条规矩是 2026-09-01 定的, 换掉的是从前那一整套"逃生通道"(MatchScanner 的
+       unsupported 名单 · SetModes 的 boolOnly 降级 · NewRe2SetFrel 的逐条校验) ——
+       通道本身就是一批几乎跑不到、因而基本没测过的分支。拆掉之后全库可以【无条件】假设
+       "每个匹配至少 1 字节"。逐入口的回归在 emptymatch_test.go。
+       🔴 边角 (故意留的口子): 判断走 Go 的 regexp/syntax (理由见 patlen.go 文件头)。
+       极少数 RE2 认而 Go 的解析器不认的写法【解析不出来就放行】—— 宁可漏一条, 也不能把
+       本来能用的 pattern 拒掉; 真是坏 pattern, 后面 RE2 自己的编译会报错。
     ④ 编译的是【别人写的】正则 (用户/配置提供) 且语法面必须和 stdlib 逐字一致 —— 语义契约,
        与性能无关 (\C / 嵌套深度上限 / 个别 escape 两边不通)。
 * 自带 cgo 的原生 RE2 正则库, 不用 go-re2 / 不用 abseil / 不用 cmake, 编译期不下载远程源
@@ -128,8 +138,8 @@
       反向线性。实测 [A-Za-z][A-Za-z0-9]{2,19}key × 120 份 8KB 语料: 正向 35149 状态 / 5.35MB,
       反向 45 状态 / 0.01MB, 命中集一致。
       ⚠ Match 只回答"命中没有 / 哪几条命中", 不回答"在哪"。要位置别再走"命中之后正向
-      FindStringIndex 重扫整篇"那条老路 —— 用 RegexpSetReverse.NewMatchScanner (见下面
-      "反向 MatchScanner"): 一遍扫就直接给不重叠的命中区间, 口径 rightmost-longest。
+      FindStringIndex 重扫整篇"那条老路 —— 用 RegexpSetReverse.NewRe2Set_rrl (见下面
+      "Re2Set_rrl_t"): 一遍扫就直接给不重叠的命中区间, 口径 rightmost-longest。
       只想自己拼的, 底座也在: FindAllIndex 给匹配左端, 正向 set 的 ResolveSpan 取右端。
       🔴 正向 RegexpSet 和反向 RegexpSetReverse 是【两个类型】, 不是一个类型上的 Reverse() 开关
       (2026-08-25 拆的; 单条那边 Regexp / RegexpReverse 本来就是两个)。理由三条: 两份完全不同的
@@ -147,7 +157,7 @@
       与默认的 leftmost-first (贪心) 选【同一个起点】, 只在终点上分歧: a|ab 撞 "ab" 贪心给
       [0,1), longest 给 [0,2)。
       🔴 为什么要它: 调用方要"从某处起【最长】的那个匹配"时, 没有它就得两趟 (先贪心搜一次
-         定起点, 再另找一条锚定的路把终点重取成最长); 有了它是一趟的事。MatchScanner 的
+         定起点, 再另找一条锚定的路把终点重取成最长); 有了它是一趟的事。Re2Set_fll_t 的
          默认档 2026-08-27 就是这么从两趟压成一趟的。
       🔴 变长 pattern 上取到贪心那个短终点 = 把命中截断, 下游拿 text[Lo:Hi] 去过校验位
          (身份证 · IBAN mod-97 · Luhn) 会失败, 整条真命中被自己毙掉 = 无声漏报。所以"要位置
@@ -224,12 +234,12 @@
       🔴 两端都给是【必须】的, 不能只留一端: `ab|c` 撞 "abc" 的两个 end 是 2 和 3 —— 连号,
       只留 3 就把 [0,2) 那个匹配悄悄弄丢了, 而且不报错。展开 Lo..Hi 就能无损还原逐个位置。
       🔴 顺序【不保证】全局按位置升序 (游程要等"这条再次命中且不连号"或"整篇扫完"才收口,
-      不同 pattern 会交错)。但【同一条 pattern 内部】是升序的 —— 上面那层 MatchScanner 的游标
+      不同 pattern 会交错)。但【同一条 pattern 内部】是升序的 —— 上面那层 Re2Set_fll_t 的游标
       就靠这条。要全局有序自己排, 排的是游程条数不是位置数。
       🔴 语义【不是】FindAllStringIndex: 那个只给 leftmost-first 的不重叠序列, 这里给的是
       所有 pattern 的所有匹配端点, 重叠的也在里面 (`abcd|bc` 撞 "abcd" 两条都报)。要取舍
       (优先级贪心 / 相交即丢 / …) 是调用方的业务规则, 库这层不替它决定 —— 要成品区间用
-      NewMatchScanner (见下)。
+      NewRe2Set_fll_t (见下)。
       🔴 给的是【一批一个数组】: 既不是"一次性全给"也不是"一条一个回调"。
       不能全给: 游程条数没有上界 (真表约 30741 条/MB, 200MB body = 47MB), 攒成一个数组等于
       让内存跟着正文长度走。也不该一条一回调: 那是每条游程一次不可内联的间接调用, 6.4MB 上
@@ -284,60 +294,81 @@
          的起点也认。前者是后者的子集, 而【leftmost 到底在哪】只有问后者才问得对 ——
          \b(?:ab cd ef|cd)\b 撞 "ab cd ef": 门给的最小右端是 "cd" 那处 (偏移 5), 只种 accept
          只能回推到 3, 而真正的最左起点是 0 (text[0:5)="ab cd" 不是匹配, 但是可行前缀)。
-         2026-08-28 之前 MatchScanner 有一档 spanFast 走的正是"只种 accept"那条路, 上面
+         2026-08-28 之前 Re2Set_fll_t 有一档 spanFast 走的正是"只种 accept"那条路, 上面
          这个例子就是它那个"第三种口径"的病根; 那一档删了, 现在补起点【只走这一条】。
       🔴 这一步与 ResolveSpan 一样【只能在库里做】: 种全部状态要的是 DFA 起始状态的构造权
          (re2_dfa.cc 的 start_[kStartViable]), 从外面够不着。种的是【锚定入口的可达闭包】,
          不是"程序里 1..size 全塞" —— set 程序还挂着一截 .*? 非锚定前缀, 种上它机器永远死不掉,
          而且回答的会变成另一个问题。
       代价 = 这处命中能往回够多远 (可行前缀集合空了机器就死), 与正文长度无关 —— 与 ResolveSpan
-      同一个量级、同一个道理。上面那层 MatchScanner 就是靠它换来严格 leftmost-longest。
-    - RegexpSet.NewMatchScanner + (*MatchScanner).SetModes / Scan / GetHitIDs / IsHit / GetStats / Close
+      同一个量级、同一个道理。上面那层 Re2Set_fll_t 就是靠它换来严格 leftmost-longest。
+    - RegexpSet.NewRe2Set_fll + (*Re2Set_fll_t).Scan / GetPatternLen / GetStats / Close
+      + Re2Set_req_t / Re2Set_alloc_t / Re2Set_startEnd_t (三个算法共用, 见 re2set_common.go)
       + RegexpSet.GetPatternLenRange / GetViableOneStats:
       【一遍扫, 直接给不重复的命中区间】—— 把上面两件 (游程扫 + 锚定解析) 拼成调用方真正要的
       形状, 顺带把"同一处命中报出一串右端"那种重复在库里就解决掉。替的是这套两段式:
       先 Set.Match 扫一遍拿"哪几条命中", 再为了知道【在哪】把命中的每条各对整篇正文跑一遍
       FindAllStringIndex —— 命中 k 条就是 1+k 遍全文。
-        ms, unsup, _ := set.NewMatchScanner()   // 热路径上建一次留着; 不是并发安全的
+        ms, _ := set.NewRe2Set_fll()   // 热路径上建一次留着; 不是并发安全的
         defer ms.Close()
-        // unsup 是【走不了区间这条路】的那几条下标 (当下只有一个原因: 能匹配空串)。
-        //   与正文无关, 建工作区那一刻就定死 —— 装表这一步把它们配成 boolOnly 或走老路。
-        ms.SetModes(modes)                  // 每条要什么, 两态 (见下); 不调 = 全默认档
-        err := ms.Scan(body, func(ms []SetMatch) {   // ← 唯一一遍全文, 结果【一批一批】来
-            for _, m := range ms { … m.Index / m.Lo / m.Hi … }   // text[Lo:Hi] 是第 Index 条的真匹配
-        })                                  // 之后 IsHit(i)/GetHitIDs() 就是门那张 bool 表
+        req := &Re2Set_req_t{               // req 和 alloc 都【建一次留着】: 现造一个就是一笔分配
+            Allocer:            NewRe2Set_alloc(),
+            ExistOnlyIndexList: []int32{3, 7},          // 这几条只要位, 别花钱补端点 (见下)
+            StartEndResultFn: func(rs []Re2Set_startEnd_t) bool {   // 结果【一批一批】来
+                for _, r := range rs { … r.Index / r.Start / r.End … } // body[Start:End] 是第 Index 条的真匹配
+                return true                                          // 返 false = 提前收工 (不算错)
+            },
+            HitIndexResultFn: func(hit []int32) bool {  // 扫完【一次性】交全表命中位 (升序)
+                … // 等价于 Set.Match 那张表, 含 ExistOnly 的那几条
+                return true
+            },
+        }
+        err := ms.Scan(body, req)           // ← 唯一一遍全文
+        // 🔴 req 传 nil 合法 = "什么都不要": 两个回调都没有 ⟹ 一遍都不扫, 一个字节都不分配。
         // 🔴 【要么全给, 要么整遍不算数】: err != nil 就是这一遍作废, 整篇走老路 FindAll。
         //    没有"这几条没给全, 你自己补"的中间态 —— 原委见下面那一节。
-        // 🔴 交给回调的切片是内部缓冲本身, 下一批原地覆写; 各条 pattern 的结果【交错】着来
-        //    (同一条内部按 Lo 升序), 想按条归拢是调用方一句 append 的事
+        // 🔴 交给回调的切片是 Allocer 里那块缓冲本身, 下一批原地覆写; 各条 pattern 的结果
+        //    【交错】着来 (同一条内部按 Start 升序), 想按条归拢是调用方一句 append 的事
       🔴 库【故意不给】"一次性物化成数组"的接口 (AppendAllMatches 2026-08-27 删了)。要数组的
          自己在回调里 append 一行 —— 那一行写在调用方家里, 谁写谁看得见代价 (内存 ∝ 命中数)。
 
-      ── 两态旋钮 SetModes ─────────────────────────────────────────────────────
-        MatchScanMode_span      要区间。【零值 = 默认档】, 无条件保证 leftmost-longest。
-        MatchScanMode_boolOnly  只要"命中没命中"。一处区间都不收口、一次端点都不补。
-      🔴 零值就是要区间那一档 —— 漏配一条的后果是【慢】(白给没人要的位补端点), 不是【错】。
-      🔴 2026-08-28 之前是【三态】: 多一个 MatchScanMode_spanFast, 强制走那条便宜但不保证
-         leftmost-longest 的"路 A", 挂之前要调用方自己拿 fuzz 跑一份"这条走 A 也不岔"的凭据。
-         整档删了 —— 换上来的这条路 (见下面"变长怎么补") 既是严格口径, 价钱又比 A 还便宜,
-         那一档就没有存在理由了, 留着只会让人以为还有便宜可占。
-      🔴 boolOnly 不是可选优化, 也不能靠"调用方在回调里自己过滤"顶替: 挡掉的是那几条的
+      ── ExistOnlyIndexList: 纯成本开关 ────────────────────────────────────────
+      名单上的那几条只报"命中没命中" (照样进 HitIndexResultFn 的全表命中位), 但一处区间都
+      不收口、一次端点都不补, 也不出现在 StartEndResultFn 里。
+      🔴 它是【每遍请求】的参数, 不是建对象时定死的属性 —— "先问有没有, 有才问在哪"这个最
+         自然的用法, 从此一个对象两种问法, 不必开两个对象两份缓存。
+      🔴 不填 = 全表都要区间。漏填一条的后果是【慢】(白给没人要的位补端点), 不是【错】。
+      🔴 StartEndResultFn 为 nil 时等价于"全表都在名单上": 正文照样扫完 (命中位表要扫到底
+         才稳定), 但一处区间都不收口。
+      🔴 它不是可选优化, 也不能靠"调用方在回调里自己过滤"顶替: 挡掉的是那几条的
          【端点补全】(这一层真花钱的那步), 不只是少交几处。门上很多位只当外层短路的 bool 用
          (bgAPACCombined 那种), 从来没人问它在哪 —— 真表上光两条这样的 pattern 就占了 57%
          的游程。回调里过滤是钱已经花完了才扔。
-      🔴 能匹配空串的 pattern 配 span 会被 SetModes 当场【报错】(每个偏移都是零长
-         命中, 游标推不过去), 不是运行时静默退化。这种条只能配 boolOnly, 或者走老路。
+      🔴 2026-08-28 之前这里是一个建对象时定死的【三态旋钮 SetModes】(span / boolOnly /
+         spanFast)。spanFast 那一档走的是便宜但不保证 leftmost-longest 的"路 A", 挂之前要
+         调用方自己拿 fuzz 跑凭据 —— 整档删了 (换上来的路既是严格口径, 价钱又比 A 还便宜);
+         剩下两态在 2026-09-01 降成这一个每遍传的名单。
+
+      ── Re2Set_alloc_t: 接口处的纯缓冲 ────────────────────────────────────────
+      里面只有 Go 侧那几块数组 (区间批缓冲 · 命中位缓冲 · ExistOnly 位图), 一个 native 句柄
+      都没有 ⟹ 同一个 alloc 可以【跨对象、跨表】自由传, 不存在"这个 alloc 不是这张表的"
+      这种运行期错误。native 侧的工作区 (扫描挂起点 · 游程池 · 候选缓冲) 归 Re2Set_*_t 自己。
+      🔴 Allocer 传 nil 的默认档 = 【现建一个用完就扔】, 【不是】 sync.Pool: 池的存期是一轮
+         GC, 而这条路真正的用法是"下一个 ≥4KB 的正文", 中间必然隔着若干轮 GC ⟹ 一次都命中
+         不了, 等于把这条路上最大的一笔开销藏进默认档。要复用就自己持有一个, 显式。
 
       ── 默认档交出来的区间, 逐字读 ────────────────────────────────────────────
-        ① text[Lo:Hi] 是这条 pattern 的一个【真匹配】;
-        ② 【同一条 pattern】吐的区间互不相交, 按 Lo 升序;
+        ① body[Start:End] 是这条 pattern 的一个【真匹配】;
+        ② 【同一条 pattern】吐的区间互不相交, 按 Start 升序;
         ③ 口径是 leftmost-longest, 即 stdlib 的 re.Longest().FindAllStringIndex。
       🔴 ③【不是】"和 FindAllStringIndex 一样"。stdlib 默认的 FindAll 是 leftmost-first
          (贪心), 两者在"同一起点上贪心先撞到的比最长的短"时给不同右端。对拍要拿 Longest()
          那个去对, 拿默认那个对会是【假红】。
       🔴 ② 只管【单条】。两条 pattern 在同一片正文上照样重叠 —— 那不是重复, 是两个问题各要
          一个答案 (见下面"跨 pattern 一概不合并")。
-      怎么做到的 (详见 doc/MatchScanner的leftmost-longest保证.md):
+      🔴 ①②③ 里【没有零长匹配这一档】: 能匹配空串的 pattern 在编译入口就被全库拒了
+         (见下面"空串一律拒"那一节), 所以这一层无条件假设每个匹配至少 1 字节。
+      怎么做到的 (详见 doc/fll的leftmost-longest保证.md):
         定长 (min == max)  Lo = Hi - min, 一句减法, 不进正则引擎。起点唯一 ⟹ 可论证。
         变长 (min < max)   【两步】:
                            ① 反向 · 种全部状态 · 从右端 e 往左走到死, 把起点落在 [游标, e) 里的
@@ -393,7 +424,7 @@
                              (\b(?:ab cd ef|cd)\b 撞 "ab cd ef" 那个例子, 见 GetViableStarts 那节)。
         路 B (旧默认档)      从 max(游标, e-maxL) 起做一次正向【非锚定】longest 搜索。一趟,
                              口径严, 贵在【没有上界的条要走完空隙】(封顶 2.00x 正文)。
-        路 D2 (MatchScanner2) 就是现在这一条, 当时挂在一个独立类型上专门用来比价。
+        路 D2 (Re2Set_fll_t2) 就是现在这一条, 当时挂在一个独立类型上专门用来比价。
       收成一条的凭据 (2026-08-28, 11 份 100MB 量级真语料 × 9 张生产真门表 = 99 格;
       原始报表在 doc/补起点换路的实测账_20260828.txt):
         口径  D2 与路 B 逐区间【一处不差】(对账 1.619 亿处区间)。这是敢换默认档的全部凭据。
@@ -406,27 +437,19 @@
         内存  D2 要"反向单条 set"(vp1), 路 A 要"反向单条"(rev1), 同一量级 —— 最大那张 158 条
               表上 89 条被真问到位置, vp1 9.6MB vs rev1 7.6MB (1.26x)。相对路 B 是【净增】
               (B 一条反向都不建), 这一笔是换路的全部代价, 量它用 GetViableOneStats()。
-      于是: 路 A / 路 B / MatchScanMode_spanFast / MatchScanner2 这个类型, 全部删除。
+      于是: 路 A / 路 B / MatchScanMode_spanFast / Re2Set_fll_t2 这个类型, 全部删除。
       更早那一笔 (2026-08-27) 换的是"补端点回不回 set", 与这次是两件事: 那次把两条老路的
       第二趟从整表 set.ResolveSpan 换成单条对象, 答案一字不差而价钱降了 27~36%。
 
-      ── "没能全给你"只有两处交代, 都是调用方【造得出来】的 ────────────────────
+      ── "没能全给你"只有一处交代, 而且是调用方【造得出来】的 ─────────────────
       🔴 这一层没有"扫到一半反悔、这几条你自己补"的中间态 (2026-08-27 拆掉的)。只有:
-
-        NewMatchScanner 的 unsupported   []int32, 走不了区间这条路的那几条 pattern 下标。
-                                         当下只有一个原因: 这条能匹配空串 (GetPatternLenRange
-                                         的 min <= 0), 每个位置都是一处零长命中, 游标压不住。
-                                         🔴 【与正文无关】, 建工作区那一刻就定死, 扫多少遍
-                                            都不变 —— 所以它能直接写成回归测试 (扔一条 a*
-                                            进去, 必然报出它的下标)。
-                                         名单上的: 配 MatchScanMode_boolOnly (命中表照样有
-                                         它们), 或者自己走老路 FindAll。配了要区间的档,
-                                         SetModes 当场报错; 压根不调 SetModes 的按 boolOnly
-                                         处理 —— 反正你在建的时候已经知道了。
+      🔴 2026-09-01 之前这里还有第二处: NewMatchScanner 交一张 unsupported 名单 (能匹配空串
+         的那几条走不了区间)。现在【全库编译入口一律拒空串】(见下面"空串一律拒"那一节),
+         表里根本不可能有那种条, 名单和整条逃生通道一起没了。
 
         Scan 的 err                      这一遍不算数 (已经交出去的批次也不算), 整篇走老路。
                                          三种来由都是 maxMem 配小了:
-                                           · 底下那遍 FindAllIndex 自己失败;
+                                           · 扫正文那一遍 DFA 放弃;
                                            · 补端点要的那个单条对象编不出来 (正向单条 /
                                              反向单条 set, 两个都可能);
                                            · 反向回推那一趟 DFA 放弃。
@@ -520,13 +543,14 @@
         按正文长度: 真语料 8KB 以下打平 (1.0×) · 32KB 3.1× · 512KB 6.1× · 2MB 14×
         最坏 (每 38 字节一处命中的合成串): 0.94×, 即 6% 慢 —— 每处命中要两次 cgo 往返,
         正文短到几乎全是命中时这笔固定开销赢不了。真 base64 碎片不长这样 (打平)。
-    - RegexpSetReverse.NewMatchScanner + (*MatchScannerReverse).SetModes / Scan / GetHitIDs / IsHit / Close:
-      【反向 MatchScanner】—— 与上面那个是镜像, 从正文末尾往前一遍扫, 同样一批一批交出不重叠的
-      命中区间。用法逐字相同 (换成 rs.NewMatchScanner() 即可), 只有两处不一样:
-        ① 交出来的区间按 Lo 【降序】(正向是升序);
+    - RegexpSetReverse.NewRe2Set_rrl + (*Re2Set_rrl_t).Scan / GetPatternLen / GetStats / Close:
+      【Re2Set_rrl_t】—— 与上面那个是镜像, 从正文末尾往前一遍扫, 同样一批一批交出不重叠的
+      命中区间。函数签名【同形】(同一个 Re2Set_req_t / Re2Set_alloc_t / Re2Set_startEnd_t),
+      用法逐字相同 (换成 rs.NewRe2Set_rrl() 即可), 只有两处不一样:
+        ① 交出来的区间按 Start 【降序】(正向是升序);
         ② 去重叠的口径是 【rightmost-longest】(正向是 leftmost-longest)。
       🔴 两种口径没有本质区别, 只是结果不一样 —— 同一片正文上"谁先占坑"从左边换到了右边。
-         两边都保证: text[Lo:Hi] 是真匹配 · 同一条 pattern 内部互不相交 · 有匹配的地方不静默。
+         两边都保证: body[Start:End] 是真匹配 · 同一条 pattern 内部互不相交 · 有匹配的地方不静默。
          只在【两个真匹配互相交叠】的地方才分家, 不交叠的正文上两者逐处相同:
            a|ab  撞 "abab"   最左最长 [[0,2) [2,4)]   最右最长 [[2,4) [0,2)]   同一批, 顺序反
            ab|b  撞 "aab"    最左最长 [[1,3)="ab"]    最右最长 [[2,3)="b"]     ← 这里才真差
@@ -538,7 +562,7 @@
       窄于重复类那一族 (doc/状态数为什么会相乘.txt §3)。实测 [A-Za-z][A-Za-z0-9]{2,19}key
       × 120 份 8KB 语料: 正向 66572 状态 / 8.39MB, 反向 42 状态 / 0.07MB。
       在这一层补上之前, 这种表反着扫只能当【门】(Match 回答哪几条命中), 要位置还得正向再扫
-      一遍全文 —— 而"把 1+k 遍压成 1 遍"正是 MatchScanner 存在的全部意义。
+      一遍全文 —— 而"把 1+k 遍压成 1 遍"正是 Re2Set_fll_t 存在的全部意义。
       🔴 方向是【每条 pattern 各自】的决定, 不是一张表的属性: 各建一个单条正/反向 set, 拿真
          语料比 GetMemInfo().States, 小的那边就是它该去的那一组。反向 set 本身仍然必须【一条一个
          或者很小一张表】—— set 里状态数是相乘的, 155 条的反向表在 6.4MB 上是 65 秒。
@@ -566,40 +590,43 @@
       所以游标照样在回调里当场推完, 输出照样写进那块固定的 12KB 缓冲。
 
       ── 正确性怎么钉的 ────────────────────────────────────────────────────────
-      matchscan_reverse_test.go: 语料按每条 pattern 自己的 AST 生成 (随机字节撞不出真匹配 =
+      re2set_rrl_test.go: 语料按每条 pattern 自己的 AST 生成 (随机字节撞不出真匹配 =
       空转绿), 判据是与本库无关的【穷举 rightmost-longest】(stdlib \A(?:pat)\z 逐 (s,e) 试)。
       名单里前五条正是把【2026-08-28 删掉的那条正向路 A】搞岔的那几个反例 (abc|b · a|ab · x{1,3}[a-c]?(?:ab|cd)? ·
       (?:ab)?[bc]{1,2} · (?:ab)*b{1,3}) —— 反向这一侧一处都不岔, 因为没有"猜"这一步。
       判据自身有一道自检: ab|b 撞 "aab" 两种口径必须给出不同答案, 否则整套对拍是空转。
 
-    - Re2SetFrel (re2setfrel.go · cre2_frel.cpp): 【一遍正着扫, 直接给不重叠的命中区间】,
-      几乎全部逻辑在 C++ 里, Go 侧只有一个门面。名字: F = first pass forward (第一趟正着扫),
-      RL = 【最右终点最长】(rightmost-END-longest, 确切定义见下面那条红字)。
-      🔴 别把它说成光秃秃的 "rightmost-longest" —— 那个词在本库里已经是【反向 MatchScanner】
+    - RegexpSet.NewRe2Set_frel + (*Re2Set_frel_t).Scan / GetPatternLen / GetStats / Close
+      (re2set_frel.go · cre2_re2set.cpp): 【一遍正着扫, 直接给不重叠的命中区间】,
+      全部逻辑在 C++ 里, Go 侧只有一层薄壳。名字: f = first pass forward (第一趟正着扫),
+      rel = 【最右终点最长】(rightmost-END-longest, 那个 e 就是"锚终点"的标记)。
+      🔴 别把它说成光秃秃的 "rightmost-longest" —— 那个词在本库里已经是【Re2Set_rrl_t】
          的口径, 挑的是【起点】最靠右, 不是一回事。
-        s, err := NewRe2SetFrel([]Re2SetFrelPattern_t{
-            {Pattern: `\d{3}-\d{2}-\d{4}`},                 // 要区间
-            {Pattern: `(?i)authorization`, ExistOnly: true},  // 只要"有没有"
-        })
+      函数签名与另外两个【同形】(同一个 Re2Set_req_t / Re2Set_alloc_t / Re2Set_startEnd_t):
+        set, _ := NewRegexpSet([]string{`\d{3}-\d{2}-\d{4}`, `(?i)authorization`})
+        s, err := set.NewRe2Set_frel()
         defer s.Close()
-        buf := make([]Re2SetFrel_result_t, 1024)      // 复用同一个 => 稳态零分配
-        err = s.Scan(body, buf, func(rs []Re2SetFrel_result_t) bool {
-            for _, r := range rs {
-                _ = body[r.Start:r.End]              // 第 r.Index 条的一处真匹配
-            }
-            return true                              // 返 false = 提前停
-        })
-        // 之后 s.IsHit(i) / s.GetHitIDs(nil) 是命中表 (ExistOnly 那几条唯一的产物)
-      buf 的长度只决定一批交多少条 (过桥次数), 不影响结果; 几百到几千都行。
-      🔴 Re2SetFrel_result_t 与 C 的 cre2_frel_result 是【同一个内存布局】(三个 int32, 无洞):
-         Scan 把调用方这个切片的地址直接交给 C 写, 不做逐字段搬运。所以那三个字段不许加、
+        req := &Re2Set_req_t{
+            Allocer:            NewRe2Set_alloc(),
+            ExistOnlyIndexList: []int32{1},        // 第 1 条只要"有没有", 不补端点
+            StartEndResultFn: func(rs []Re2Set_startEnd_t) bool {
+                for _, r := range rs {
+                    _ = body[r.Start:r.End]         // 第 r.Index 条的一处真匹配
+                }
+                return true                          // 返 false = 提前停
+            },
+            HitIndexResultFn: func(hit []int32) bool { … ; return true }, // 扫完一次性交全表命中位
+        }
+        err = s.Scan(body, req)
+      🔴 Re2Set_startEnd_t 与 C 的 cre2_re2set_result 是【同一个内存布局】(三个 int32, 无洞):
+         Scan 把 Allocer 里那块缓冲的地址直接交给 C 写, 不做逐字段搬运。所以那三个字段不许加、
          不许换序、不许换类型 —— Go 侧两条 const 断言 + C++ 侧一条 static_assert 钉着。
-      🔴 交给回调的切片就是 buf 本身, 下一批原地覆写。要留自己拷。
+      🔴 交给回调的切片就是那块缓冲本身, 下一批原地覆写。要留自己拷。
       🔴 【要么全给, 要么整遍不算数】: err != nil 就是这一遍作废 (已经交出去的批也不算),
-         整篇走老路 FindAll。没有"这几条没给全你自己补"的中间态 —— 与 MatchScanner 同规矩。
+         整篇走老路 FindAll。没有"这几条没给全你自己补"的中间态 —— 与 Re2Set_fll_t 同规矩。
 
-      ── 它和 MatchScanner 差在哪 (为什么要多一个) ────────────────────────────
-      MatchScanner 是"每个没被游标盖住的【右端】回看一次"; 这一层是"每个【分量】结算一次"。
+      ── 它和 Re2Set_fll_t 差在哪 (为什么要多一个) ────────────────────────────
+      Re2Set_fll_t 是"每个没被游标盖住的【右端】回看一次"; 这一层是"每个【分量】结算一次"。
       分量从哪来: DFA 状态里带一个 per-pattern【存活位】(re2_dfa.cc 的 State::live_ +
       BuildGLive) —— 某条 pattern 在某个偏移上没有活线程, 就没有任何匹配能跨过这个偏移,
       于是它左右两侧的命中互不影响。由活转死就当场把它挂着的那一段收口成一个分量。
@@ -609,47 +636,49 @@
         ② 攒 + 切分量 命中【不逐条过桥】: 每条 pattern 当前分量的右端游程攒在 native 侧
                       (8 个 int32 起二倍扩, 收口后进按大小分档的回收池), 分量收口时整块
                       挂进待取列表                                 同上, g2 档
-        ③ 补起点      这一条 pattern 自己的【单条】对象, 反向锚定  cre2_frel.cpp FrelCloseSeg
-      ③ 走单条不走 set 是本库那条总规矩 (2026-08-27, 理由见上面 MatchScanner 那节)。
-      真表上 ②③ 的账: GetStats().NResolve / GetStats().NSeg = 【每个分量问了几次反向锚定】,
+        ③ 补起点      这一条 pattern 自己的【单条】对象, 反向锚定  cre2_re2set.cpp FrelCloseSeg
+      ③ 走单条不走 set 是本库那条总规矩 (2026-08-27, 理由见上面 Re2Set_fll_t 那节)。
+      真表上 ②③ 的账: GetStats().Tries / GetStats().NSeg = 【每个分量问了几次反向锚定】,
       10 条通用 pattern × 三档语料实测恒为 1.00 (一个分量一趟就结完); UsedPeak (native 侧
       游程峰值) 是 16~64 字节量级, 与正文长度无关。Go 侧稳态 0 allocs/op。
 
       ── 🔴 口径: 最右【终点】最长, 不是最右【起点】最长 ─────────────────────
       上界从正文末尾起, 反复取"终点最靠右且 <= 上界"的匹配, 同终点取【最长】(= 起点最靠左),
-      收下之后把上界压到它的起点。这与反向 MatchScanner 的 rightmost-longest (先挑【起点】
+      收下之后把上界压到它的起点。这与Re2Set_rrl_t 的 rightmost-longest (先挑【起点】
       最靠右的) 是【两个口径】, 与 stdlib 的 leftmost-longest 也是两个:
-          aa|a  撞 "aaa"   Re2SetFrel [[0,1) [1,3)]   反向MatchScanner [[2,3) [1,2) [0,1)]
+          aa|a  撞 "aaa"   Re2Set_frel_t [[0,1) [1,3)]   Re2Set_rrl_t [[2,3) [1,2) [0,1)]
                            stdlib Longest [[0,2) [2,3)]              ← 三个都不一样
-          b|abc 撞 "abc"   Re2SetFrel [[0,3)="abc"]   反向MatchScanner [[1,2)="b"]
+          b|abc 撞 "abc"   Re2Set_frel_t [[0,3)="abc"]   Re2Set_rrl_t [[1,2)="b"]
       🔴 后面这一格就是选终点不选起点的理由: 挑起点那一侧会把 "abc" 截成中间那个 "b" ——
          下游拿这一段去过校验位 (身份证 · IBAN · Luhn) 会失败, 真命中被自己毙掉 = 无声漏报。
       🔴 要与 stdlib 的 re.Longest().FindAllStringIndex 逐字节等价的调用方【不要用这个】,
-         用 MatchScanner。只是要"把这片正文里的东西都框出来"(脱敏 · 定位 · 计数) 才用它。
-      钉法: re2setfrel_test.go 的 frelBrute 是与本库无关的穷举 (stdlib \A(?:pat)\z 逐 (e,s) 试),
+         用 Re2Set_fll_t。只是要"把这片正文里的东西都框出来"(脱敏 · 定位 · 计数) 才用它。
+      钉法: re2set_frel_test.go 的 frelBrute 是与本库无关的穷举 (stdlib \A(?:pat)\z 逐 (e,s) 试),
       语料按每条 pattern 自己的 AST 生成 (随机字节撞不出真匹配 = 空转绿); TestRe2SetFrel_Shape
       里那一格 aa|a 撞 "aaa" 三个口径必须给出三个不同答案, 否则整套对拍是空转。
       判据是【不分量】的全局穷举 ⇒ 它同时钉住了"存活位切分量不改变答案"。
 
-      ── ExistOnly 不是可选优化 ───────────────────────────────────────────────
-      配了它的那几条, 命中时只置一个字节: 不攒游程 · 不盯存活位 · 不收口 · 不补起点。
+      ── ExistOnlyIndexList 不是可选优化 ──────────────────────────────────────
+      名单上的那几条, 命中时只置一个字节: 不攒游程 · 不盯存活位 · 不收口 · 不补起点。
       挡掉的是这一层真花钱的那步, 不只是少交几处结果 —— 门上很多位只当外层短路的 bool 用
       (bgAPACCombined 那种), 从来没人问它在哪, 真表上光两条这样的 pattern 就占了 57% 的游程。
       回调里自己过滤顶替不了: 那是钱已经花完了才扔。
-      🔴 能匹配空串的 pattern (GetPatternLenRange 的 min <= 0) 只允许配 ExistOnly, 否则
-         NewRe2SetFrel 【当场】报错 (与正文无关, 建的时候就定死, 能直接写成回归测试)。
+      🔴 它是【每遍请求】的参数, 不是建对象时定死的属性 —— 同一个对象可以这一遍全要区间、
+         下一遍全只要位, 命中位表逐位不变 (re2set_frel_test.go 的 TestRe2SetFrel_ExistOnly
+         就是钉这件事的)。2026-09-01 之前它是构造期属性 Re2SetFrelPattern_t.ExistOnly,
+         唯一的硬理由是"哪几条能给区间要靠 min<=0 定死"; 全库拒空串之后这个理由没了。
 
       ── 🔴 量它的时候: 这几条循环对【代码布局】极其敏感 ──────────────────────
-      2026-09-01 实测: 同一份 C++, Go 那侧只多编进一个【没人调用】的函数, 零命中 64KiB 上
-      Re2SetFrel 就在 98us 和 199us 之间来回跳, MatchScanner 也在 97us 和 142us 之间跳 ——
+      2026-08-31 实测: 同一份 C++, Go 那侧只多编进一个【没人调用】的函数, 零命中 64KiB 上
+      Re2Set_frel_t 就在 98us 和 199us 之间来回跳, Re2Set_fll_t 也在 97us 和 142us 之间跳 ——
       整整两倍, 而两个变体的最小值其实是一样的。所以:
         · 单个二进制里量出来的差别【不可信】, 必须扫一遍布局 (往测试包里塞 0~7 个没用的
           函数, 各建一个二进制) 然后【每个变体各取最小值】再比。
         · doc/set性能优化经验.txt 早就写了这台机 ±20%~2倍的抖动, 这是目前见过最狠的一例。
-      按这个法子量出来的结果见 re2setfrel_bench_test.go 的注释。
+      按这个法子量出来的结果见 re2set_frel_bench_test.go 的注释。
 
-      ── 与 d2 (MatchScanner) 的实测对比 ──────────────────────────────────────
-      re2setfrel_bench_test.go 那三档语料只有 10 条手造 pattern, 【会低估】(few 打平 ·
+      ── 与 d2 (Re2Set_fll_t) 的实测对比 ──────────────────────────────────────
+      re2set_frel_bench_test.go 那三档语料只有 10 条手造 pattern, 【会低估】(few 打平 ·
       most 慢 17%)。换成三张真门表 (从 asc 源码里静态收的 368 条字面量按形状分成
       cred 64 / prompt 31 / body 160 条, 256KiB 正文 × 四档命中密度, 8 个布局各取最小,
       尺子在 tmp/frlbench):
@@ -658,13 +687,13 @@
           几乎一处一个分量, 省不出反向锚定的次数, 白付切分量的记账。密一点就反超。
         · 省在哪: d2 【每个右端】问一次反向锚定, Frel 【每个分量】问一次。命中越密, 一个
           分量里塞的右端越多, 差距越大 (body 90%: 25 万处命中 vs 14.5 万个分量)。
-      全表在 re2setfrel_bench_test.go 头注里。
+      全表在 re2set_frel_bench_test.go 头注里。
 
     - 性能 (spanscan_bench_test.go · 64KiB 正文 · 10 条通用 pattern · Ryzen 5900X · 稳态复用):
       对照的"旧实现"就是今天调用方那一套 —— set.Match 当门 + 逐条命中 pattern 在整篇正文上
       FindAllStringIndex (命中 k 条 = 1+k 遍全文扫描, 而且后面那 k 遍是最贵的非锚定扫描)。
       🔴 这一档的"推荐用法"只适用于【要与 FindAllStringIndex 逐字节等价】的调用方 ——
-         反向 set 扫 + 一次左到右的推进 (rev-cov, 判据抄在 matchscan.go 注释里), 与 FindAll 逐处全等
+         反向 set 扫 + 一次左到右的推进 (rev-cov, 判据抄在 re2set_fll.go 注释里), 与 FindAll 逐处全等
          (TestSpanPerf_Shape 直接对账), 三档都不劣于旧实现:
                               0 命中     稀疏(39 处)   最坏输入(见下)
         旧实现                 93.1us      400.8us      596.0us  给 4 处
@@ -697,7 +726,7 @@
       🔴 但【不要把这一档当成通用推荐】。它的证据是 10 条 pattern / 64KiB 的合成微基准, 那个
          规模【结构上】显不出 set 里状态数相乘这件事。同一条路换成真实的 155 条规则表 × 6.4MB:
          整表反向 set 一遍扫要 65 秒 (arena 顶满 254MB 仍在 flush), 正向同表 18ms 零 flush ——
-         整整差四个数量级, 结论直接翻过来。不要求逐字节等价的调用方一律走上面的 MatchScanner
+         整整差四个数量级, 结论直接翻过来。不要求逐字节等价的调用方一律走上面的 Re2Set_fll_t
          (正向扫 + 单条反向锚定回推), 别建整表反向 set。
       ⚠ 量这类差别时【两条路必须共用同一批 set 对象】: 同一批 pattern 建两次, 两个 DFA 的
         状态区落在不同地址上, cache set 冲突不一样 —— 实测同一段代码只因为换了个 set 对象

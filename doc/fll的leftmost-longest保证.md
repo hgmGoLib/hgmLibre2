@@ -1,18 +1,18 @@
-# MatchScanner 的 leftmost-longest 保证
+# Re2Set_fll_t 的 leftmost-longest 保证
 
-> 一句话: **MatchScanner 的口径无条件是 leftmost-longest。没有旋钮, 没有"快而不准"的档。**
+> 一句话: **Re2Set_fll_t 的口径无条件是 leftmost-longest。没有旋钮, 没有"快而不准"的档。**
 >
-> 这一页讲三件事: 怎么用 · 这句保证是怎么兑现的 · 以及**反向 MatchScanner** 那一侧的
+> 这一页讲三件事: 怎么用 · 这句保证是怎么兑现的 · 以及**Re2Set_rrl_t** 那一侧的
 > rightmost-longest(第 8 节)。
 >
-> API 速查在 `../readme.txt`, 英文长版在 `../README.md` 的 *Where a set matched: `MatchScanner`*,
-> 实现和逐条论证在 `../matchscan.go` 的文件头注释。
+> API 速查在 `../readme.txt`, 英文长版在 `../README.md` 的 *Where a set matched: `Re2Set_fll_t`*,
+> 实现和逐条论证在 `../re2set_fll.go` 的文件头注释。
 
 ---
 
 ## 0. 历史包袱: 别再引用"第三种口径"那段, 也别再找 `spanFast`
 
-2026-08-26 之前, `MatchScanner` 只有一条路 —— 游标启发式 —— 而它给的是**第三种口径**
+2026-08-26 之前, `Re2Set_fll_t` 只有一条路 —— 游标启发式 —— 而它给的是**第三种口径**
 (既不是 leftmost-first 也不是 leftmost-longest)。那一版的文档措辞是"变长档不保证和谁一样"。
 
 之后加了"路 B"(窗口 + 正向非锚定)并把它设成零值默认档, 而那条游标启发式退居成一个旋钮
@@ -24,9 +24,9 @@
 
 - `MatchScanMode_spanFast` 这个常量**删了**, 配它编译不过;
 - 那一整节"怎么 fuzz 出凭据"**删了** —— 没有要挂的档, 也就没有要跑的凭据;
-- 独立类型 `MatchScanner2`(当时用来比价的那条"路 D2")**删了**, 它就是现在的 `MatchScanner`。
+- 独立类型 `Re2Set_fll_t2`(当时用来比价的那条"路 D2")**删了**, 它就是现在的 `Re2Set_fll_t`。
 
-看到任何"MatchScanner 不保证 leftmost-longest"或者"给这一条挂 spanFast"的话, 那是过期文档。
+看到任何"Re2Set_fll_t 不保证 leftmost-longest"或者"给这一条挂 spanFast"的话, 那是过期文档。
 换路那次的实测账在 `补起点换路的实测账_20260828.txt`。
 
 ---
@@ -36,40 +36,50 @@
 ```go
 set, _ := hgmLibre2.NewRegexpSet(patterns)   // 包级变量, 建一次
 
-ms, unsup, _ := set.NewMatchScanner()        // 热路径上建一次留着; 不是并发安全的
+ms, _ := set.NewRe2Set_fll()               // 热路径上建一次留着; 不是并发安全的
 defer ms.Close()
-// unsup: 走不了区间这条路的那几条下标 (当下只有"能匹配空串"一个原因)。与正文无关,
-// 建工作区那一刻就定死 —— 装表这一步把它们配成 boolOnly 或者干脆走老路。
 
-// 可选: 每条 pattern 要什么。不调 = 全默认档 (要区间, 保证 leftmost-longest)。
-ms.SetModes(modes)
-
-err := ms.Scan(body, func(batch []hgmLibre2.SetMatch) {
-    for _, m := range batch {
-        // body[m.Lo:m.Hi] 是第 m.Index 条 pattern 的真匹配
-        handle(m.Index, body[m.Lo:m.Hi])
-    }
-})   // 🔴 要么全给, 要么整遍不算数: err != nil ⟹ 这一遍作废, 整篇走老路 FindAll
-ids := ms.GetHitIDs()      // 与 Set.Match 同解的那张命中表; ms.IsHit(i) 是 O(1) 的同一个答案
+// req 和 alloc 都【建一次留着】—— 每遍现造一个 (带闭包) 就是每遍一笔分配。
+req := &hgmLibre2.Re2Set_req_t{
+    Allocer:            hgmLibre2.NewRe2Set_alloc(),
+    ExistOnlyIndexList: []int32{3, 7},   // 可选: 这几条只要位, 别花钱补端点
+    StartEndResultFn: func(batch []hgmLibre2.Re2Set_startEnd_t) bool {
+        for _, m := range batch {
+            // body[m.Start:m.End] 是第 m.Index 条 pattern 的真匹配
+            handle(m.Index, body[m.Start:m.End])
+        }
+        return true                       // 返 false = 提前收工 (不算错)
+    },
+    HitIndexResultFn: func(ids []int32) bool {
+        // 扫完【一次性】交全表命中位 (升序, 与 Set.Match 同解, 含 ExistOnly 的那几条)
+        return true
+    },
+}
+err := ms.Scan(body, req)
+// 🔴 要么全给, 要么整遍不算数: err != nil ⟹ 这一遍作废, 整篇走老路 FindAll
+// 🔴 req 传 nil 合法 = "什么都不要": 一遍都不扫, 一个字节都不分配
 ```
 
-三态旋钮:
+`ExistOnlyIndexList` 是**纯成本开关**:
 
-| mode | 含义 |
+| 在不在名单上 | 含义 |
 |---|---|
-| `MatchScanMode_span` (**零值**) | 要区间。库自动分档, 对外**保证 leftmost-longest**。 |
-| `MatchScanMode_boolOnly` | 只要"命中没命中"。一处区间都不收口、一次端点都不补。 |
+| 不在(默认) | 要区间。对外**保证 leftmost-longest**, 无条件。 |
+| 在名单上 | 只要"命中没命中"。一处区间都不收口、一次端点都不补, 但照样进命中位表。 |
 
-🔴 **零值就是最稳那一档** —— 漏配一条的后果是**慢**, 不是**错**。这是故意选的零值方向。
+🔴 **不填就是最稳那一档** —— 漏填一条的后果是**慢**, 不是**错**。这是故意选的默认方向。
 
-🔴 `boolOnly` 不是可选优化: 挡掉的是那几条的**端点补全**(这一层真花钱的那步), 不只是少交几处。
+🔴 它不是可选优化: 挡掉的是那几条的**端点补全**(这一层真花钱的那步), 不只是少交几处。
 门上很多位只当外层短路的 bool 用, 从来没人问它在哪 —— 真表上光两条这样的 pattern 就占了
 **57%** 的游程。在回调里过滤是钱已经花完了才扔。
 
-🔴 **能匹配空串的 pattern** 在 `NewMatchScanner` 就进 `unsupported` 名单, 配 `span`
-会被 `SetModes` **当场报错**(每个偏移都是零长命中, 游标推不过去), 不是运行时静默退化。
-这种条只能配 `boolOnly` 或者走老路。钉在 `TestMatchScanSetModesRejectsEmptyCapable` 与
-`TestMatchScanEmptyCapableFallback`。
+🔴 它是**每遍请求**的参数, 不是建对象时定死的属性 —— "先问有没有, 有才问在哪"这个最自然的
+用法, 从此一个对象两种问法, 不必开两个对象两份缓存。
+
+🔴 **能匹配空串的 pattern 在这一层根本不会出现**: 2026-09-01 起全库的每一个编译入口都当场
+拒 (`emptymatch.go`), 表都建不起来。所以这一层**无条件**假设"每个匹配至少 1 字节",
+没有 `unsupported` 名单, 没有"只能配 boolOnly"的降级, 也没有任何一处零长匹配的兜底分支。
+逐入口的回归在 `emptymatch_test.go`。
 
 ---
 
@@ -86,7 +96,7 @@ Lo = Hi - min
 不进正则引擎。右端 `e` 的合法起点只能是 `e-min`(唯一), 长度也唯一 ⟹ 不存在"挑哪个起点"和
 "取最长还是取贪心先撞上的"这两个问题。剩下的"从左往右取不相交"两种口径的规则一样。
 所以**定长条上两条路必然同解, 档位对它不生效**。
-钉在 `TestMatchScanStrictVsFindAll`(6 万条随机定长 pattern 对拍)。
+钉在 `TestRe2SetFllStrictVsFindAll`(6 万条随机定长 pattern 对拍)。
 
 ### (b) 变长 —— 收下全部候选起点, 升序验, 第一个成的就是答案
 
@@ -138,32 +148,31 @@ Lo = Hi - min
 
 **试/看 = `Tries/Walks`** = 每次回看验了几次。`1.00` = 升序第一个候选就是答案, 一次假候选都没验。
 2026-08-28 实测 **11 份 100MB 真语料 × 9 张生产真门表 = 99 格, 全是 1.00**。
-最坏形状上会到 2.00(`a|[ab]+c`: 每个右端两个候选, 第一个必然验不过), 见 `TestMatchScanPerfHard`。
+最坏形状上会到 2.00(`a|[ab]+c`: 每个右端两个候选, 第一个必然验不过), 见 `TestRe2SetFllPerfHard`。
 
 🔴 前三个字段**只统计变长条** —— 定长条走 `e-minL` 那句减法, 一次回看都不做, 不进分母。
 `Emits` 不一样, 它把定长的也数进去了, 所以**别拿 `Tries/Emits` 当"平均验了几次"**, 会被定长条
 稀释成假象。
 
-钉在 `matchscan_viable_test.go`(已知反例逐条对 `Longest()` · 14 条 pattern × 400 轮随机正文 ·
-`benchPats` 整表 × 三档语料)和 `matchscan_astfuzz_test.go`(语料从 pattern 自己的 AST 生成,
+钉在 `re2set_fll_viable_test.go`(已知反例逐条对 `Longest()` · 14 条 pattern × 400 轮随机正文 ·
+`benchPats` 整表 × 三档语料)和 `re2set_fll_astfuzz_test.go`(语料从 pattern 自己的 AST 生成,
 300 轮 · 2.7 万处区间)。**oracle 一律是 `re.Longest().FindAllStringIndex`** —— 见 §3。
 
 ### (c) 补不出来的 —— 退回去, 不猜
 
 **宁可退回去也不给一个"像是对的"答案** —— 这是第三条腿, 也是前两条腿敢写成"保证"的前提。
 
-"退回去"只有两个形状, 而且两个都是调用方**造得出来**的:
+"退回去"只有一个形状, 而且它是调用方**造得出来**的:
 
 | 在哪儿交代 | 说的是什么 |
 |---|---|
-| `NewMatchScanner` 的 `unsupported` | `[]int32` —— 走不了区间这条路的那几条 pattern 下标。当下只有一个原因: 这条能匹配空串 (`GetPatternLenRange` 的 `min <= 0`), 每个位置都是一处零长命中, 游标压不住。 |
 | `Scan` 的 `err` | 这一遍不算数 (已经交出去的批次也不算), 整篇走老路 `FindAll`。 |
 
-`unsupported` **与正文无关**, 建工作区那一刻就定死、扫多少遍都不变 ⟹ 它能直接写成回归测试
-(扔一条 `a*` 进 set, 必然报出它的下标, 见 `TestMatchScanEmptyCapableFallback`)。名单上的那几条
-配成 `boolOnly` (命中表照样有它们) 或者自己走老路; 配了要区间的档 `SetModes` 当场报错。
+🔴 2026-09-01 之前这里还有第二个形状: `NewMatchScanner` 交一张 `unsupported` 名单
+(能匹配空串的那几条走不了区间)。现在全库编译入口一律拒空串 (`emptymatch.go`),
+表里根本不可能有那种条, 名单和整条逃生通道一起没了。
 
-`Scan` 的 `err` 三种来由都是 `maxMem` 配小了 —— 底下那遍 `FindAllIndex` 失败 / 补端点的单条
+`Scan` 的 `err` 三种来由都是 `maxMem` 配小了 —— 扫正文那一遍 DFA 放弃 / 补端点的单条
 对象编不出来 / 锚定解析时 DFA 放弃。另有一种"游程不按扫描方向单调", 那是**本库的不变量崩了**
 = bug, 也从这里以 `err` 交出来, 不吞。
 
@@ -205,7 +214,7 @@ DFA-only (`re2_set.cc:216`, `dfa_failed` ⟹ 直接 `return false`) —— NFA �
 |---|---|---|
 | 定长 | 0 | 一句减法, 不进引擎 |
 | 变长 | 1 反向 + N 正向 | `RegexpSetReverse.GetViableStarts`(一条 pattern 自己的反向 set)→ 正向单条 longest 锚定 `FindStringIndexAtWithin`, N = `Tries/Walks`, 真表上恒为 1 |
-| 反向 MatchScanner | 1 | 正向单条 longest 锚定 `FindStringIndexAtWithin`(bound 掐在游标上) |
+| Re2Set_rrl_t | 1 | 正向单条 longest 锚定 `FindStringIndexAtWithin`(bound 掐在游标上) |
 
 **三条理由**:
 
@@ -220,7 +229,7 @@ DFA-only (`re2_set.cc:216`, `dfa_failed` ⟹ 直接 `return false`) —— NFA �
 共对账 5.4 万处区间, 与旧的 set 路子逐字节相同; 价钱上命中密集档降了 27~36%(命中稀疏与
 零命中持平, 那两档的时间本来就不在补端点上)。
 🔴 那份钉子 2026-08-28 随着两条老路一起删了 —— 它的参照实现是路 A / 路 B 的复刻, 而两条路
-都没了。同一份 AST 生成语料现在钉在 `matchscan_astfuzz_test.go` 上, oracle 从"自家旧实现"
+都没了。同一份 AST 生成语料现在钉在 `re2set_fll_astfuzz_test.go` 上, oracle 从"自家旧实现"
 换成了 stdlib 的 `Longest()`, 比原来更硬。
 
 🔴 顺带记一笔实现坑: `cre2_match_at` 原本每次调用 `std::vector<StringPiece> sub(nmatch)`,
@@ -267,7 +276,7 @@ locs := want.FindAllStringIndex(text, -1)
 |---|---|---|---|
 | **路 A**(`spanFast` 旋钮) | 反向机**只种 accept** 回推一个起点(`RegexpReverse.ResolveSpanWithin`)+ 正向锚定取最长右端 | **第三种口径** | 两趟, 回看窗口**相交** |
 | **路 B**(旧默认档) | 从 `max(游标, e-maxL)` 起一次正向**非锚定** longest 搜索 | leftmost-longest | 没有长度上界的条要**走完空隙**(封顶 2.00x 正文) |
-| **路 D2**(独立类型 `MatchScanner2`) | 就是现在这一条(§2(b)) | leftmost-longest | 验假候选(真表上一次都不验) |
+| **路 D2**(独立类型 `Re2Set_fll_t2`) | 就是现在这一条(§2(b)) | leftmost-longest | 验假候选(真表上一次都不验) |
 
 路 A 的病根: **只种 accept 只看得见"正好在 `e` 结束"的那些起点**。
 `\b(?:ab cd ef|cd)\b` 撞 `"ab cd ef"` —— 门给的最小右端是 `"cd"` 那处(偏移 5), 回推只能到 3,
@@ -307,8 +316,8 @@ locs := want.FindAllStringIndex(text, -1)
 
 ### 一起删掉的东西
 
-- `MatchScanMode_spanFast` 这个常量, 和 `MatchScannerReverse.SetModes` 里挡它的那道闸;
-- `MatchScanner2` 这个类型, 以及 `RegexpSet.reverseOne` / `ReverseOneStats` / `rev1` 三件;
+- `MatchScanMode_spanFast` 这个常量, 和反向那一侧 `SetModes` 里挡它的那道闸(两者 2026-09-01 随 `SetModes` 整个没了);
+- `Re2Set_fll_t2` 这个类型, 以及 `RegexpSet.reverseOne` / `ReverseOneStats` / `rev1` 三件;
 - 这一页原来的 §5 "怎么 fuzz 出这份凭据"整节 —— 没有要挂的档, 也就没有要跑的凭据;
 - 库里的 `matchscan_paths_test.go`(路 A/B 与旧 set 路子的对拍)和 `matchscan2_bench_test.go`
   (三条路的对照台);
@@ -343,12 +352,12 @@ break 把低优先级线程整段截掉(`re2_dfa.cc:1197`), `kLongestMatch` 干�
 
 ## 6. 真实产品上跑出来的结果
 
-调用方产品的敏感数据门把整张规则表接到了 `MatchScanner` 上, 现状:
+调用方产品的敏感数据门把整张规则表接到了 `Re2Set_fll_t` 上, 现状:
 
 | | |
 |---|---|
 | 接管的位数 | **56**(静态名单 53 位 + 凭据锚段 3 位) |
-| 分档 | 全部 `MatchScanMode_span`(产品侧那个分档函数恒返它)—— 只有一档可配 |
+| 分档 | 全表都要区间(产品侧那个分档函数恒返 false = 不进 ExistOnly 名单)—— 只有一档可配 |
 | 对拍 oracle | 全部 `Longest().FindAllStringIndex` |
 | 常驻对拍规模 | **3 983 754** 例交叉语料, 与 oracle **零差异**(产品侧那道常驻交叉对拍门) |
 
@@ -400,13 +409,13 @@ break 把低优先级线程整段截掉(`re2_dfa.cc:1197`), `kLongestMatch` 干�
 
 ---
 
-## 8. 反向 MatchScanner: 同一件事的镜像, 口径是 rightmost-longest
+## 8. Re2Set_rrl_t: 同一件事的镜像, 口径是 rightmost-longest
 
-`RegexpSetReverse.NewMatchScanner()` 开出来的是 `*MatchScannerReverse`。方法名、回调形状、
-`unsupported` 名单与 `err` 的语义 (见第 2 节 (c))、那块固定 12KB 缓冲 —— 与正向那个
-**逐字相同**。只有两处不一样:
+`RegexpSetReverse.NewRe2Set_rrl()` 开出来的是 `*Re2Set_rrl_t`。函数签名(同一个
+`Re2Set_req_t` / `Re2Set_alloc_t` / `Re2Set_startEnd_t`)、`err` 的语义 (见第 2 节 (c))、
+那块固定 12KB 缓冲 —— 与正向那个**逐字相同**。只有两处不一样:
 
-1. 交出来的区间按 `Lo` **降序**(正向是升序);
+1. 交出来的区间按 `Start` **降序**(正向是升序);
 2. 去重叠的口径是 **rightmost-longest**(正向是 leftmost-longest)。
 
 ### 8.1 两种口径没有本质区别
@@ -436,7 +445,7 @@ break 把低优先级线程整段截掉(`re2_dfa.cc:1197`), `kLongestMatch` 干�
 | 反向 | 42 | 0.07MB |
 
 在这一层补上之前(2026-08-27), 这种表反着扫只能当**门**: `Match` 回答哪几条命中, 要位置
-还得正向再扫一遍全文 —— 而"把 1+k 遍压成 1 遍"正是 MatchScanner 存在的全部意义。
+还得正向再扫一遍全文 —— 而"把 1+k 遍压成 1 遍"正是 Re2Set_fll_t 存在的全部意义。
 
 🔴 方向是**每条 pattern 各自**的决定, 不是一张表的属性: 各建一个单条正/反向 set, 拿真语料
 比 `GetMemInfo().States`, 小的那边就是它该去的那一组。反向 set 本身仍然必须**一条一个或者很小
@@ -474,7 +483,7 @@ break 把低优先级线程整段截掉(`re2_dfa.cc:1197`), `kLongestMatch` 干�
 
 ### 8.5 正确性怎么钉的
 
-`matchscan_reverse_test.go`, 四件缺一不可(与第 5 节同一套规矩):
+`re2set_rrl_test.go`, 四件缺一不可(与第 5 节同一套规矩):
 
 1. **语料从每条 pattern 自己的 AST 生成** —— 随机字节撞不出真匹配, 那是空转绿;
 2. **判据与本库无关**: 拿 stdlib 的 `\A(?:pat)\z` 逐 `(s,e)` 穷举出 rightmost-longest 序列;

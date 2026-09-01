@@ -68,6 +68,10 @@ func NewPrefilter(patterns []string, minAtomLen int, maxMem int64) (*Prefilter, 
 			C.cre2_prefilter_free(h)
 			return nil, errors.New("re2native: prefilter pattern too large (>2GiB)")
 		}
+		if err := checkNoEmptyMatch("prefilter pattern at index "+strconv.Itoa(i), pat); err != nil { // 见 emptymatch.go
+			C.cre2_prefilter_free(h)
+			return nil, err
+		}
 		id := int(C.cre2_prefilter_add(h, strBytePtr(pat), C.int(len(pat))))
 		runtime.KeepAlive(pat)
 		if id != i {

@@ -27,7 +27,8 @@ var revEquivPatterns = []string{
 	`(?i)Hello`, `(?i)[a-f]{2,4}X`,
 	`(?s)a.{3}b`, `a.{3}b`,
 	`中[文字]{1,3}串`, `[^\x{0000}-\x{007f}]{2,}`, `✓+`,
-	`x|yy|zzz`, `(?:ab)+c`, `\d{3}-\d{4}`, `a*`, ``,
+	// 🔴 原来这一行末尾还有 `a*` 和 `` (空 pattern) 两条。全库拒空串之后它们编不出来了。
+	`x|yy|zzz`, `(?:ab)+c`, `\d{3}-\d{4}`,
 	`(?:sk|rk)_(?:live|test)_[0-9a-zA-Z]{6,12}`,
 }
 
@@ -323,14 +324,8 @@ func TestMatchReverseFallsBackButStaysCorrect(t *testing.T) {
 }
 
 func TestMatchReverse_EmptyAndEdges(t *testing.T) {
-	re := MustCompileReverse(`a*`)
-	defer re.FreeC()
-	if !re.MatchString("") {
-		t.Fatal(`a* 应当匹配空串`)
-	}
-	if !re.Match(nil) {
-		t.Fatal(`a* 应当匹配 nil []byte`)
-	}
+	// 🔴 原来这里先拿 `a*` 钉"空串/nil 上也该匹配"。全库拒空串之后 `a*` 编不出来了
+	//    (见 emptymatch.go), 空正文上一律无匹配 —— 就是下面 zzz 那一段。
 	none := MustCompileReverse(`zzz`)
 	defer none.FreeC()
 	if none.MatchString("") {
@@ -418,8 +413,9 @@ func TestRegexpReverse_StringAndMaxMem(t *testing.T) {
 		t.Fatalf("CompileReverse 出来的 MaxMem=%d, want DefaultMaxMem=%d", got, DefaultMaxMem)
 	}
 
-	// MustCompileReverse 走的是同一条路; 顺带盖住带锚 / 多字节 / 空 pattern 的原文回读。
-	for _, p := range []string{pat, `^中[文字]{1,3}串$`, `\bword\b`, `(?i)(?s)a.{3}b`, ``} {
+	// MustCompileReverse 走的是同一条路; 顺带盖住带锚 / 多字节的原文回读。
+	// 🔴 原来这张表末尾还有一条空 pattern ``。全库拒空串之后它编不出来了 (见 emptymatch.go)。
+	for _, p := range []string{pat, `^中[文字]{1,3}串$`, `\bword\b`, `(?i)(?s)a.{3}b`} {
 		m := MustCompileReverse(p)
 		if got := m.String(); got != p {
 			t.Fatalf("MustCompileReverse(%q).String()=%q", p, got)
@@ -498,6 +494,6 @@ func TestMustCompileReverse_PanicsOnBadPattern(t *testing.T) {
 				t.Fatalf("好 pattern 不该 panic: %v", r)
 			}
 		}()
-		MustCompileReverse(`a*`).FreeC()
+		MustCompileReverse(`a+`).FreeC()
 	}()
 }

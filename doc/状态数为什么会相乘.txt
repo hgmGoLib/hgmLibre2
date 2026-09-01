@@ -174,8 +174,8 @@ A0. **先看能不能反着扫** —— 这一族 pattern 的必需字面量在�
    起点立刻稀疏 (实测 35149 → 45 个状态), 而且**命中集一个字节不变**, 不用去说服规则作者。
    API 是 CompileReverse (得到一个单独的 *RegexpReverse 对象) / NewRegexpSetReverseMaxMem,
    用法与三条注意事项见 set性能优化经验.txt §4A。
-   **要位置也不用再正向扫一遍**: RegexpSetReverse.NewMatchScanner() 一遍扫直接给不重叠的
-   命中区间 (口径 rightmost-longest · 区间按 Lo 降序 · 见 doc/MatchScanner的leftmost-longest保证.md
+   **要位置也不用再正向扫一遍**: RegexpSetReverse.NewRe2Set_rrl() 一遍扫直接给不重叠的
+   命中区间 (口径 rightmost-longest · 区间按 Lo 降序 · 见 doc/fll的leftmost-longest保证.md
    第 8 节)。单条 RegexpReverse 那边仍然只回答"命中没有", 拿它当门, 命中的那极少数再正向跑一次。
 
 A. **改那一条 pattern** —— 不能翻方向时收益最大, 成本最低。

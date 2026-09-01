@@ -309,53 +309,6 @@ cre2_rev_match_result cre2_partial_match_reverse(const cre2_re *h, const char *t
  * 语义细节和"为什么是轮询不是回调/不是一次吐完"见 re2_span_scan.h。 */
 typedef struct cre2_spanscan cre2_spanscan;
 
-/* ── Re2SetFrel: 一遍正向扫描, 直接交出不重叠的命中区间 (口径【最右终点最长】) ─────
- * 语义与分工见 cre2_frel.cpp 的文件头; Go 门面在 re2setfrel.go。
- * 用法:
- *   cre2_frel *f = cre2_frel_new(pats, patlens, boolonly, n, max_mem);
- *   if (cre2_frel_error(f, &bad)) { ... }
- *   cre2_frel_begin(f, textlen);
- *   cre2_frel_result out[1024];
- *   for (;;) {
- *       int more = 0;
- *       int k = cre2_frel_step(f, text, textlen, out, 1024, &more);
- *       if (k < 0) { 整遍作废 }
- *       // out[0..k): text[out[i].start : out[i].end] 是第 out[i].index 条的一处匹配
- *       if (!more) break;
- *   }
- *   cre2_frel_free(f);                  // 工作区可以反复 begin, 不必每篇正文重开
- */
-typedef struct cre2_frel cre2_frel;
-
-/* 一处命中。布局与 Go 的 Re2SetFrel_result_t 【必须一致】(三个 int32, 无洞) —— Go 那侧
- * 直接把自己那个切片的地址传进来让 C 写, 不做逐字段搬运。两侧各有静态断言钉着。 */
-typedef struct cre2_frel_result {
-	int32_t index;
-	int32_t start;
-	int32_t end;
-} cre2_frel_result;
-
-/* 建工作区。boolonly[i] 非零 = 第 i 条只要"有没有命中", 不要区间 (可传 NULL = 全要区间)。
- * 恒返回句柄 (除非 OOM), 建没建成看 cre2_frel_error。 */
-cre2_frel *cre2_frel_new(const char **pats, const int *patlens, const unsigned char *boolonly,
-                       int n, int64_t max_mem);
-void cre2_frel_free(cre2_frel *f);
-/* NULL = 没错。出错时 *badidx 是出问题的那条 pattern 下标 (说不出具体哪条时 -1)。 */
-const char *cre2_frel_error(const cre2_frel *f, int *badidx);
-
-/* 开始扫一篇正文 (只绑长度; 正文指针每次 step 传, 与 spanscan 同一套规矩)。1=成功 0=失败。 */
-int cre2_frel_begin(cre2_frel *f, int textlen);
-/* 推进一步, 最多往 out 写 cap 条。返回本批条数 (>=0); <0 = 出错, 整遍作废。
- * *more 非零 = 还有, 接着调。text/textlen 必须与 begin 时一致, 且每次传同一份正文。 */
-int cre2_frel_step(cre2_frel *f, const char *text, int textlen,
-                   cre2_frel_result *out, int cap, int *more);
-/* n 个字节, 第 i 个非零 = 第 i 条这一遍命中过 (含 boolonly 那几条)。每次 begin 清零。 */
-const unsigned char *cre2_frel_hits(const cre2_frel *f);
-/* 本遍的账: usedpeak = native 侧游程真正装着数据的字节峰值; heappeak = 真实堆高水位;
- * poolbytes = 回收池里躺着的; nseg = 收口的分量条数; nresolve = 问了几次反向锚定。 */
-void cre2_frel_stats(const cre2_frel *f, long long *usedpeak, long long *heappeak,
-                    long long *poolbytes, long long *nseg, long long *nresolve);
-
 /* 开一个流式扫描工作区 (set 必须已 cre2_set_compile)。OOM / 没编译返回 NULL。
  * 工作区可以反复用于多次扫描 (游程表不重新分配), 但【不是并发安全的】: 一个线程一个。 */
 cre2_spanscan *cre2_set_spanscan_new(const cre2_set *h);
@@ -443,6 +396,82 @@ void cre2_rev_mem_info(const cre2_re *h, cre2_set_mem *out);
 cre2_set *cre2_set_new_ex(int64_t max_mem, int reversed);
 /* 这个 set 是不是反向编译的。 */
 int cre2_set_reversed(const cre2_set *h);
+
+/* ── 补端点用的【单条对象】: 一张表一份, 惰性建, 内部加锁, 所有扫描工作区共用 ──────
+ * 🔴 千万别把这两样挪进扫描工作区: 工作区是每 goroutine 一份 (生产上按 GOMAXPROCS 池化
+ *    4~64 份), 挂进去就是把最大那张表 9.6MB 的反向单条缓存乘以份数。
+ * cre2_set_one_fwd    第 i 条自己那条【正向 · longest】RE2 对象 (锚定取最长右端;
+ *                     它的反向程序同时也是 cre2_resolve_span_reverse_r 用的那份)。
+ * cre2_set_one_viable 第 i 条自己那条【反向 · 只装这一条】的 set (cre2_set_viable_starts 用)。
+ * 建不出来返回 NULL 并记住, 不会每遍重编。返回的指针有效期到 cre2_set_free。 */
+const cre2_re *cre2_set_one_fwd(cre2_set *h, int i);
+const cre2_set *cre2_set_one_viable(cre2_set *h, int i);
+/* 【已经被建出来】的那些反向单条 set 的账。不制造状态。 */
+void cre2_set_one_viable_stats(cre2_set *h, int *n, long long *states, long long *arenacap);
+
+/* ── re2set: fll / rrl / frel 三个算法的同一台机器 (实现在 cre2_re2set.cpp) ──────────
+ * 一遍扫正文, 直接交出【不重叠的命中区间】(index, start, end)。三个口径只差"分量/游程里
+ * 从哪一端起算 + 上界往哪压", 底座 (正向 kManyMatch DFA · 存活位切分量 · 游程留 native ·
+ * 反向锚定回推 · 正向锚定验证) 是同一套。语义见 cre2_re2set.cpp 头注, Go 门面在 re2set_*.go。
+ *
+ *   cre2_re2set *s = cre2_re2set_new(set, CRE2_RE2SET_fll, minlen, maxlen, n);
+ *   if (cre2_re2set_error(s, &bad)) { ... }
+ *   cre2_re2set_begin(s, textlen, existonly);
+ *   cre2_re2set_result out[1024];
+ *   for (;;) {
+ *       int more = 0;
+ *       int k = cre2_re2set_step(s, text, textlen, out, 1024, &more);
+ *       if (k < 0) { ... }
+ *       if (!more) break;
+ *   }
+ *   cre2_re2set_free(s);            // 工作区可以反复 begin, 不必每篇正文重开
+ *
+ * 🔴 工作区【借】set, 不持有它: set 必须活得比工作区久 (Go 侧靠对象里存一份引用保住)。 */
+#define CRE2_RE2SET_fll 0  /* 第一趟正向 · leftmost-longest      (正向 set) */
+#define CRE2_RE2SET_rrl 1  /* 第一趟反向 · rightmost-longest     (反向 set) */
+#define CRE2_RE2SET_frel 2 /* 第一趟正向 · rightmost-END-longest (正向 set) */
+
+typedef struct cre2_re2set cre2_re2set;
+
+/* 一处命中: text[start,end) 是第 index 条 pattern 的一个真匹配。
+ * Go 那侧的 Re2Set_startEnd_t 与它同布局, 两边各有一条编译期断言钉住。 */
+typedef struct cre2_re2set_result {
+	int32_t index;
+	int32_t start;
+	int32_t end;
+} cre2_re2set_result;
+
+/* minlen/maxlen 是每条 pattern 的匹配字节长度区间 (Go 侧 regexp/syntax 算好传下来;
+ * maxlen < 0 = 没上限)。恒返回句柄 (除非 OOM), 建没建成看 cre2_re2set_error。 */
+cre2_re2set *cre2_re2set_new(cre2_set *set, int mode, const int32_t *minlen,
+                             const int32_t *maxlen, int n);
+void cre2_re2set_free(cre2_re2set *s);
+const char *cre2_re2set_error(const cre2_re2set *s, int *badidx);
+
+/* 开始扫一篇正文 (只绑长度; 正文指针每次 step 传, 与 spanscan 同一套规矩)。
+ * existonly: n 个字节, 非零 = 这一条【只要位, 不要区间】—— 不补端点, 也不进 step 的输出。
+ * 可为 NULL (= 全都要区间)。🔴 它是【每遍】的参数, 不是建对象时定死的属性。 1=成功 0=失败。 */
+int cre2_re2set_begin(cre2_re2set *s, int textlen, const unsigned char *existonly);
+
+/* 取一批命中区间。返回本批条数 (>=0); <0 = 出错 (整遍作废, 原因看 cre2_re2set_error)。
+ * *more: 1 = 还没完, 取走这批再 step; 0 = 完了。cap 必须 >= pattern 条数。 */
+int cre2_re2set_step(cre2_re2set *s, const char *text, int textlen,
+                     cre2_re2set_result *out, int cap, int *more);
+
+/* n 个字节, 第 i 个非零 = 第 i 条这一遍命中过 (含 existonly 的那些条)。每次 begin 清零。
+ * 🔴 扫完 (step 报 more==0) 之后才稳定 —— 存活位要走到底才定得下来。 */
+const unsigned char *cre2_re2set_hits(const cre2_re2set *s);
+
+/* 这一遍的账 (每个出参可为 NULL):
+ *   walks    锚定回推了几趟 · cands 收到几个候选起点 (只有 fll 会涨) · tries 锚定验了几次 ·
+ *   emits    交出去几处区间;
+ *   nseg     存活位切出来几个分量 (fll/frel; rrl 不切分量恒 0) ——
+ *            tries/nseg 就是"平均每个分量里有几处不重叠的匹配", 越接近 1 说明切得越干净;
+ *   usedpeak native 游程里【真正装着结束位置】的字节峰值 · heappeak 真实堆高水位 ·
+ *   poolbytes 回收池里躺着的字节 (跨 scan 保留)。 */
+void cre2_re2set_stats(const cre2_re2set *s, long long *walks, long long *cands,
+                       long long *tries, long long *emits, long long *nseg,
+                       long long *usedpeak, long long *heappeak, long long *poolbytes);
 
 /* ── DFA 状态缓存计数 (可观测 · 进程级) ────────────────────────────────────────
  * RE2 的 DFA 状态缓存满了不是 LRU 淘汰, 而是【整表清空】重建 (DFA::ResetCache):

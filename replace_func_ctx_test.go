@@ -180,13 +180,13 @@ var sinkStr string
 // TestReplaceAllStringFunc_QuickDiffStdlib — 手挑 + 随机的 stdlib 差分门。
 // (2026-08-22 从调用方搬来:那边原本有一份"一次开到位"的本地实现,门是拿它跟库对拍;
 // 这轮把那份实现合进库里了,门也就该跟着回到库这边。)
-// 语料的着眼点与 EquivLibAndStdlib 不同,故两个都留:这里挑的是【能匹配空串】的 `x*`(空匹配是
-// 这类逐处替换最容易分叉的地方)+ 调用方真在用的那两条(\uXXXX / &#…;)+ 一条多子组的。
+// 语料的着眼点与 EquivLibAndStdlib 不同,故两个都留:调用方真在用的那两条(\uXXXX / &#…;)
+// + 一条多子组的。(原来还挑了一条能匹配空串的 `x*`, 全库拒空串之后它编不出来了。)
 func TestReplaceAllStringFunc_QuickDiffStdlib(t *testing.T) {
 	pats := []string{
 		`\\u[0-9a-fA-F]{4}`,
 		`&#(?:[xX]([0-9a-fA-F]{1,6})|([0-9]{1,7}));`,
-		`x*`,
+		// 🔴 原来这里有一条 `x*` (能匹配空串)。全库拒空串之后它编不出来了。
 		`[0-9]+`,
 	}
 	fns := []func(string) string{

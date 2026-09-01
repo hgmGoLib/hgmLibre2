@@ -123,6 +123,9 @@ func compileMaxMem(pattern string, maxMem int64, longest bool) (*Regexp, error) 
 	if len(pattern) > maxCInt {
 		return nil, errors.New("re2native: pattern too large (>2GiB)")
 	}
+	if err := checkNoEmptyMatch("pattern", pattern); err != nil { // 全库一条规矩, 见 emptymatch.go
+		return nil, err
+	}
 	p := strBytePtr(pattern)
 	var h *C.cre2_re
 	if longest {

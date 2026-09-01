@@ -633,12 +633,13 @@ class DFASpanScan {
     return static_cast<int>(g2closed_.size());
   }
 
-  // SetBoolOnly: 这条 pattern 只要"有没有命中"。建工作区之后 Begin 之前调, 一次就够
-  // (跨 scan 保留)。挡掉的是这一层真花钱的那步 —— 攒游程 + 盯存活位 + 收口 + 补起点,
-  // 不只是少交几处结果。门上只当短路 bool 用的位一律配这个。
-  void SetBoolOnly(int id) {
+  // SetBoolOnly: 这条 pattern 只要"有没有命中"。Begin 之前调 (跨 scan 保留, 所以
+  // 【要能关】—— 调用方每遍传的名单不一样, 只能开不能关就会把上一遍的名单粘到这一遍)。
+  // 挡掉的是这一层真花钱的那步 —— 攒游程 + 盯存活位 + 收口 + 补起点, 不只是少交几处结果。
+  // 门上只当短路 bool 用的位一律配这个。
+  void SetBoolOnly(int id, bool on) {
     if (id >= 0 && id < nid_)
-      gbool_[id] = 1;
+      gbool_[id] = on ? 1 : 0;
   }
   // Hits: nid 个字节, 第 i 个非零 = 第 i 条这一遍命中过。Begin 时清零。
   const uint8_t* Hits() const { return ghit_.empty() ? NULL : &ghit_[0]; }
@@ -1306,9 +1307,9 @@ bool DFASpanScanBeginG2(DFASpanScan* ss, int textlen) {
   return ss->Begin(textlen, true);
 }
 
-void DFASpanScanG2BoolOnly(DFASpanScan* ss, int id) {
+void DFASpanScanG2BoolOnly(DFASpanScan* ss, int id, int on) {
   if (ss != NULL)
-    ss->SetBoolOnly(id);
+    ss->SetBoolOnly(id, on != 0);
 }
 
 const uint8_t* DFASpanScanG2Hits(DFASpanScan* ss) {

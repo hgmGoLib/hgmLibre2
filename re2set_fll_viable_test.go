@@ -6,12 +6,12 @@ import (
 	"testing"
 )
 
-// matchscan_viable_test.go —— MatchScanner 补起点那条路 (反向种全部状态收候选 + 升序逐个
+// re2set_fll_viable_test.go —— fll 补起点那条路 (反向种全部状态收候选 + 升序逐个
 // 正向锚定验) 的回归。GetViableStarts 本身的单元测试也在这里。
 //
 // 🔴 2026-08-28 之前这条路叫"路 D2", 挂在一个独立类型 MatchScanner2 上, 与老的路 A
 //    (spanFast) / 路 B (默认档) 并存比价。比完了, A/B 和那个类型一起删了, 这几个用例
-//    跟着落到 MatchScanner 上 —— 现在它们钉的就是【唯一那条路】。
+//    跟着落到 Re2Set_fll_t 上 —— 现在它们钉的就是【唯一那条路】。
 
 // viablePats 是对拍用的 pattern 表。选的时候两件事都要:
 //   · 前七条是【老的路 A 已知会岔开】的形状 (最小反例 + 那个 \b(?:ab cd ef|cd)\b);
@@ -35,12 +35,12 @@ var viablePats = []string{
 	`\b[A-Z][12]\d{8}\b`,
 }
 
-// TestMatchScanViableIsLongest —— 那条【无条件保证】: 逐字节等于 stdlib 的
+// TestRe2SetFllViableIsLongest —— 那条【无条件保证】: 逐字节等于 stdlib 的
 // re.Longest().FindAllStringIndex。
 //
 // 语料是老的路 A 岔开过的那几个最小反例 —— 这条路的分歧全出在"同一个右端上有好几个
 // 可行起点"的形状里, 这批就是那种形状。
-func TestMatchScanViableIsLongest(t *testing.T) {
+func TestRe2SetFllViableIsLongest(t *testing.T) {
 	cases := []struct{ pat, text string }{
 		{`abc|b`, "abc"},
 		{`x{1,3}[a-c]?(?:ab|cd)?`, "xab"},
@@ -63,11 +63,12 @@ func TestMatchScanViableIsLongest(t *testing.T) {
 		for _, loc := range want.FindAllStringIndex(c.text, -1) {
 			flat = append(flat, int32(loc[0]), int32(loc[1]))
 		}
-		ms, _, err := set.NewMatchScanner()
+		ms, err := set.NewRe2Set_fll()
 		if err != nil {
 			t.Fatal(err)
 		}
-		got := scanByPat(t, ms, c.text)[0]
+		byPat, _ := scanFlat(t, ms.Scan, c.text)
+		got := byPat[0]
 		ms.Close()
 		if fmt.Sprint(got) != fmt.Sprint(flat) {
 			t.Errorf("%q 撞 %q: 给 %v, Longest 给 %v", c.pat, c.text, got, flat)
@@ -75,12 +76,12 @@ func TestMatchScanViableIsLongest(t *testing.T) {
 	}
 }
 
-// TestMatchScanVsLongestFuzz —— 整张表 × 随机正文, 每条 pattern 都要与
+// TestRe2SetFllVsLongestFuzz —— 整张表 × 随机正文, 每条 pattern 都要与
 // re.Longest().FindAllStringIndex 【逐字节】相同。
 //
 // 🔴 oracle 必须是 Longest() 那个。stdlib 默认的 FindAll 是 leftmost-first (贪心),
 //    两者在"同一起点上贪心先撞到的比最长的短"时给不同的右端, 拿默认那个对是【假红】。
-func TestMatchScanVsLongestFuzz(t *testing.T) {
+func TestRe2SetFllVsLongestFuzz(t *testing.T) {
 	set, err := NewRegexpSet(viablePats)
 	if err != nil {
 		t.Fatal(err)
@@ -90,14 +91,11 @@ func TestMatchScanVsLongestFuzz(t *testing.T) {
 		std[i] = regexp.MustCompile(p)
 		std[i].Longest()
 	}
-	ms, unsup, err := set.NewMatchScanner()
+	ms, err := set.NewRe2Set_fll()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ms.Close()
-	if len(unsup) != 0 {
-		t.Fatalf("这批 pattern 不该有走不了区间的: %v", unsup)
-	}
 	// 语料按【pattern 自己的字母表】撒, 否则随机正文上一条都命中不了, 测试是空转绿。
 	const alpha = "abcdefqxyz ABCDEF12345678-张三李四王五"
 	rnd := benchLCG(20260827)
@@ -110,7 +108,7 @@ func TestMatchScanVsLongestFuzz(t *testing.T) {
 			buf[i] = rs[rnd(len(rs))]
 		}
 		text := string(buf)
-		byPat := scanByPat(t, ms, text)
+		byPat, _ := scanFlat(t, ms.Scan, text)
 		for i := range viablePats {
 			var flat []int32
 			for _, loc := range std[i].FindAllStringIndex(text, -1) {
@@ -130,42 +128,32 @@ func TestMatchScanVsLongestFuzz(t *testing.T) {
 	t.Logf("对账 %d 条 pattern-正文 · 共 %d 处命中, 岔开 0", cmp, total)
 }
 
-// TestMatchScanBenchTableVsLongest —— 换成【整张真表 benchPats × 三档语料】再对一遍
+// TestRe2SetFllBenchTableVsLongest —— 换成【整张真表 benchPats × 三档语料】再对一遍
 // re.Longest().FindAllStringIndex。上面那个 fuzz 是"小表 × 随机短正文"(形状刁钻但正文小),
 // 这个是"大表 × 长正文"(形状普通但游标要真的走很多步) —— 两头都要。
 //
 // 🔴 2026-08-28 之前这里是 TestMatchScan2SameAsPathB: D2 与路 B 两条自家实现互相对拍。
 //    路 B 删了之后那个对拍没了对手, 而且拿自家实现当 oracle 本来就弱一档 —— 换成 stdlib。
-func TestMatchScanBenchTableVsLongest(t *testing.T) {
+func TestRe2SetFllBenchTableVsLongest(t *testing.T) {
 	set, err := NewRegexpSet(benchPats)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ms, unsup, err := set.NewMatchScanner()
+	ms, err := set.NewRe2Set_fll()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ms.Close()
-	skip := map[int]bool{}
-	for _, i := range unsup {
-		skip[int(i)] = true // 能匹配空串的那几条走不了区间这条路, 不参与对拍
-	}
 	std := make([]*regexp.Regexp, len(benchPats))
 	for i, p := range benchPats {
-		if skip[i] {
-			continue
-		}
 		std[i] = regexp.MustCompile(p)
 		std[i].Longest()
 	}
 	spans := 0
 	for _, kind := range benchCorpusKinds {
 		text := benchCorpus(kind)
-		got := scanByPat(t, ms, text)
+		got, _ := scanFlat(t, ms.Scan, text)
 		for i := range benchPats {
-			if skip[i] {
-				continue
-			}
 			var flat []int32
 			for _, loc := range std[i].FindAllStringIndex(text, -1) {
 				flat = append(flat, int32(loc[0]), int32(loc[1]))
@@ -266,37 +254,41 @@ func TestViableStartsBufTooSmall(t *testing.T) {
 	}
 }
 
-// TestMatchScanViableNoAlloc —— 稳态零分配。
+// TestRe2SetFllViableNoAlloc —— 稳态零分配。
 //
 // 🔴 这不是洁癖: GetViableStarts 是"每个右端问一次"的调用形态, 那里漏一笔 4 字节就按右端数
 //    放大 (第一版在函数里开了个局部数组当"len(out)==0 时的落点", 地址交给 C 之后逃逸分析
 //    每次调用把它搬上堆 —— benchPats/命中稀疏 上 33 次回推正好 33 笔)。同一类账见
 //    spanresolve.go 走 _r 孪生那一段, 和 TestSpanPerf_NoAlloc。
-func TestMatchScanViableNoAlloc(t *testing.T) {
+func TestRe2SetFllViableNoAlloc(t *testing.T) {
 	set, err := NewRegexpSet(benchPats)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ms, _, err := set.NewMatchScanner()
+	ms, err := set.NewRe2Set_fll()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ms.Close()
 	text := benchCorpus("few")
 	sink := 0
+	// 🔴 req 和 alloc 都【建一次留着】—— 每遍现造一个就是每遍一笔分配, 那正是这一格要量的东西。
+	req := &Re2Set_req_t{
+		Allocer:          NewRe2Set_alloc(),
+		StartEndResultFn: func(rs []Re2Set_startEnd_t) bool { sink += len(rs); return true },
+	}
 	run := func() {
-		if err := ms.Scan(text, func(mm []SetMatch) { sink += len(mm) }); err != nil {
+		if err := ms.Scan(text, req); err != nil {
 			t.Fatal(err)
 		}
 	}
-	run() // 热身: 单条对象 (fwd1 / vp1) 惰性建 + 候选缓冲定型, 都只发生一次
+	run() // 热身: 补端点的单条对象惰性建 + 各处缓冲定型, 都只发生一次
 	run()
 	got := testing.AllocsPerRun(20, run)
 	if sink == 0 {
 		t.Fatal("一处命中都没有 —— 这个测试是空的")
 	}
-	// 2 笔是那个 Scan 闭包本身的固定开销, 回推那一步该是 0 笔。
-	if got > 2 {
-		t.Errorf("稳态 %.1f 笔/遍 —— 该是 2 笔 (闭包) 才对, 多出来的是回推那一步漏的", got)
+	if got > 0 {
+		t.Errorf("稳态 %.1f 笔/遍 —— 该是 0 笔: req/alloc 都是复用的, 回推那一步也不该漏", got)
 	}
 }
