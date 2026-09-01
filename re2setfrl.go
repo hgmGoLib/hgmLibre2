@@ -1,6 +1,10 @@
 // re2setfrl.go — Re2SetFrl: 一遍正向扫描, 直接交出不重叠的命中区间。
 //
-// 名字: F = first pass forward (第一趟正着扫), RL = rightmost-longest (去重叠的口径)。
+// 名字: F = first pass forward (第一趟正着扫), RL = 【最右终点最长】(去重叠的口径, 见下)。
+//
+// 🔴 不要把这一层说成 "rightmost-longest" —— 本库里那个词已经是【反向 MatchScanner】的
+//    口径 (matchscan_reverse.go), 那个挑的是【起点】最靠右, 与这里不是一回事。要么写全
+//    "最右终点最长", 要么用下面那句等价说法。
 //
 // 替的还是那套两段式 —— 先 Set.Match 扫一遍拿"哪几条命中", 再为了知道【在哪】把命中的
 // 每条各对整篇正文跑一遍 FindAllStringIndex (命中 k 条 = 1+k 遍全文)。与 MatchScanner
@@ -22,9 +26,25 @@
 // ── 口径 (逐字读) ────────────────────────────────────────────────────────────
 //	① text[Start:End] 是第 Index 条 pattern 的一个【真匹配】;
 //	② 【同一条 pattern】交出来的区间互不相交, 按 Start 升序;
-//	③ 去重叠的口径是 rightmost-longest —— 从右往左"谁先占坑", 与 MatchScanner 的
-//	   leftmost-longest 是照镜子的关系。两个真匹配不交叠的地方两者逐处相同; 交叠时
-//	   才分家 (ab|b 撞 "aab": 最左最长给 [1,3)="ab", 最右最长给 [2,3)="b")。
+//	③ 去重叠的口径是【最右终点最长】, 逐字是这样:
+//	     上界从正文末尾起 => 取"终点 <= 上界"里【终点最靠右】的那个匹配 => 同一个终点上
+//	     取【最长】(也就是起点最靠左) => 收下 => 把上界压到它的【起点】=> 继续往左。
+//	   等价的一句话 (更好记): 把正文倒过来看, 它就是普通的 leftmost-longest —— 倒过来
+//	   之后终点变起点, "终点最靠右"就是"起点最靠左", "同终点最长"就是"同起点最长"。
+//
+//	   🔴 三个口径, 锚点各挑一个坐标, 别混:
+//	       口径              锚点            谁
+//	       leftmost-longest  【起点】最靠左   stdlib Longest / MatchScanner
+//	       rightmost-longest 【起点】最靠右   MatchScannerReverse
+//	       最右终点最长      【终点】最靠右   本层 (Re2SetFrl)
+//	   三个真的会给出三个不同答案 (TestRe2SetFrl_Shape 就钉这一格, 否则对拍是空转):
+//	       aa|a 撞 "aaa":  本层 [[0,1) [1,3)]  反向MS [[2,3) [1,2) [0,1)]  stdlib [[0,2) [2,3)]
+//
+//	   🔴 为什么锚终点不锚起点 (当初的取舍, 不是随手):
+//	       b|abc 撞 "abc":  本层 [[0,3)="abc"]        反向MS [[1,2)="b"]
+//	     锚起点那一侧会把 "abc" 截成中间那个 "b" —— 下游拿这一段去过校验位 (身份证 ·
+//	     IBAN · Luhn) 会失败, 真命中被自己毙掉 = 无声漏报。
+//
 //	   要与 stdlib 的 re.Longest().FindAllStringIndex 逐字节对上就用 MatchScanner;
 //	   只是要"把这片正文里的东西都框出来"(脱敏 · 定位 · 计数), 这个更省。
 //	④ 跨 pattern 一概不合并, 两条 pattern 在同一片正文上照样重叠 —— 那不是重复,

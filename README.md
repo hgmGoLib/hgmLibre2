@@ -1003,9 +1003,10 @@ or the whole comparison is vacuous.
 `Re2SetFrl` answers the same question as `MatchScanner` — *where did each pattern
 match?* — but almost all of it lives in C++. Go only hands it three `[]int32` buffers
 and the C side writes `(Index, Start, End)` triples straight into them, a batch per
-`step`. The name: **F** = first pass forward, **RL** = the rightmost-longest family of
-de-overlap rules (the exact rule is spelled out below — it is *not* the same one
-`MatchScannerReverse` uses).
+`step`. The name: **F** = first pass forward, **RL** = **r**ightmost-end **l**ongest.
+Do not call this rule plain "rightmost-longest": in this library that name already means
+`MatchScannerReverse`'s rule, which anchors on the **start**. This one anchors on the
+**end** — spelled out below, and they give different answers.
 
 ```go
 s, _ := hgmLibre2.NewRe2SetFrl([]hgmLibre2.Re2SetFrlPattern_t{

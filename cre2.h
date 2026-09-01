@@ -309,7 +309,7 @@ cre2_rev_match_result cre2_partial_match_reverse(const cre2_re *h, const char *t
  * 语义细节和"为什么是轮询不是回调/不是一次吐完"见 re2_span_scan.h。 */
 typedef struct cre2_spanscan cre2_spanscan;
 
-/* ── Re2SetFrl: 一遍正向扫描, 直接交出不重叠的命中区间 (rightmost-longest) ────────
+/* ── Re2SetFrl: 一遍正向扫描, 直接交出不重叠的命中区间 (口径【最右终点最长】) ─────
  * 语义与分工见 cre2_frl.cpp 的文件头; Go 门面在 re2setfrl.go。
  * 用法:
  *   cre2_frl *f = cre2_frl_new(pats, patlens, boolonly, n, max_mem);

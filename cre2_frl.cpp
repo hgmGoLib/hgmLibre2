@@ -1,7 +1,11 @@
-// cre2_frl.cpp — Re2SetFrl 的引擎: 【F】irst-pass-forward + 【R】ightmost-【L】ongest。
+// cre2_frl.cpp — Re2SetFrl 的引擎: F = first pass forward, RL = 【最右终点最长】。
 //
 // 一遍正向 set 扫描, 直接交出【不重叠的命中区间】(index, start, end), 口径是
-// rightmost-longest。与 MatchScanner 的区别只在一件事上: 补起点那一步不再逐个右端
+// 【最右终点最长】: 上界从末尾起, 取终点最靠右的匹配, 同终点取最长 (起点最靠左), 收下
+// 之后把上界压到它的起点, 继续往左。等价说法: 把正文倒过来看就是普通的 leftmost-longest。
+// 🔴 别写成 "rightmost-longest" —— 那个词在本库里是【反向 MatchScanner】的口径, 挑的是
+//    【起点】最靠右, 不是一回事 (b|abc 撞 "abc": 这里给 "abc", 那里给中间的 "b")。
+// 与 MatchScanner 的区别只在一件事上: 补起点那一步不再逐个右端
 // 各问一次, 而是靠 DFA 状态里的【per-pattern 存活位】把一条 pattern 的命中切成
 // 若干【分量】, 分量内部一次结算 —— 一处命中定下来之后, 下一处的搜索上界立刻被压到
 // 它的左端, 所以一个分量里问几次反向锚定 = 这个分量里真的有几处不重叠的匹配。
@@ -77,7 +81,7 @@ static cre2_re *FrlReOf(cre2_frl *f, int id) {
 	return re;
 }
 
-// FrlCloseSeg: 把一个分量按 rightmost-longest 结算掉, 结果 (升序) 落进 f->seg。
+// FrlCloseSeg: 把一个分量按【最右终点最长】结算掉, 结果 (升序) 落进 f->seg。
 //
 // r.runs 是这一分量里【匹配右端】的游程 (升序, 互不相接), r.lo 是分量左界 ——
 // 上一次这条 pattern 断气的位置, 分量内任何匹配的左端都 >= r.lo, 所以它就是反向锚定的
