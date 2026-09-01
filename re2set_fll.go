@@ -67,8 +67,8 @@ type Re2Set_fll_t struct {
 
 // NewRe2Set_fll 给这张【正向】表编一个 fll 策略对象。
 //
-// 🔴 建一次留着, 跟策略同生共死 —— 别每遍新建 (见文件头"生命周期")。建的时候顺带把整表的
-// DFA 建出来, 那是建策略该付的钱。
+// 🔴 建一次留着, 跟策略同生共死 —— 别每遍新建 (见文件头"生命周期")。建的时候会探一遍扫描
+// 工作区, 所以"这张表根本扫不了"在这里就报错, 不必等第一篇正文。
 func (s *RegexpSet) NewRe2Set_fll() (*Re2Set_fll_t, error) {
 	if s == nil || s.h == nil {
 		return nil, errors.New("re2native: NewRe2Set_fll 的表是空的")

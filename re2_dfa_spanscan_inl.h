@@ -122,8 +122,9 @@ class DFASpanScan {
         limit_(0),
         lock_(NULL) {
     int n = nid > 0 ? nid : 1;
-    runlo_.resize(n);
-    runhi_.resize(n);
+    // 🔴 runlo_/runhi_ 【不在这里开】—— 它们只有 g1 档 (Note/Flush) 用, 而 g 档要到
+    //    Begin 才定得下来。工作区现在是一遍扫描一开一关的 (cre2_re2set.cpp 那两层),
+    //    每少开一张按 n 的表就是每篇正文少一次 malloc + 4n 字节。见 Begin 里那句补开。
     pend_.assign(n, 0);
     pendlist_.reserve(n);
     gbool_.assign(n, 0);
@@ -157,6 +158,13 @@ class DFASpanScan {
 #endif
     // g 档 (存活位切分量 + 游程留 native) 只在正向 set 上有意义 —— 反向 set 一律关掉。
     g_span_ = run_forward_ && gspan;
+    // g1 档那两张游程表在这里才开 (见构造函数)。开过就留着 —— 同一个工作区反复 Begin
+    // 的用法 (cre2_spanscan) 一样只付一次。
+    if (!g_span_ && runlo_.empty()) {
+      int n = nid_ > 0 ? nid_ : 1;
+      runlo_.resize(n);
+      runhi_.resize(n);
+    }
     for (int i = 0; i < nid_; i++)
       ghit_[i] = 0;
     for (int w = 0; w < DFA::kGW; w++) {
@@ -602,6 +610,7 @@ class DFASpanScan {
   size_t flushi_;            // kPhaseFlush 收口到 pendlist_ 的第几个了
 
   // 每条 pattern 当前挂着的游程 (原文坐标)。pend_[id]!=0 才有效。
+  // 🔴 只有 g1 档用 (g2 档的游程装在 g2_[id].p 里), 所以【惰性开在 Begin 里】。
   std::vector<int32_t> runlo_;
   std::vector<int32_t> runhi_;
   std::vector<uint8_t> pend_;

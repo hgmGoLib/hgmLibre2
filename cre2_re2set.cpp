@@ -106,8 +106,11 @@ struct cre2_re2set_scan {
 	cre2_re2set *own; // 【持有一份引用】: scan_new 时 +1, scan_free 时 -1
 	re2::DFASpanScan *ss;
 
-	std::vector<unsigned char> existonly; // 本遍的名单
-	std::vector<unsigned char> hit;       // rrl 自己维护的命中表 (g1 档 native 不管这个)
+	// 🔴 下面这些按 n 开的表【一律按 mode 只开自己那一档要的】: 这个结构一篇正文一开一关,
+	//    多开一张就是每篇正文多一次 malloc + n 字节 memset。谁归谁在各自的注释里写死了。
+
+	std::vector<unsigned char> existonly; // 〔rrl〕本遍的名单 (fll/frel 只在 scan_new 读参数)
+	std::vector<unsigned char> hit;       // 〔rrl〕自己维护的命中表 (g1 档 native 不管这个)
 
 	// 本单元 (一个分量 / 一条游程) 结算出来的区间, 3 个 int32 一条
 	std::vector<int32_t> seg;
@@ -117,15 +120,17 @@ struct cre2_re2set_scan {
 	const re2::DFASpanScanG2Rec *recs;
 	int nrec, reci;
 
-	// g1 档 (rrl): 上一次 step 收到的游程 (id, lo, hi)
+	// 〔rrl〕g1 档: 上一次 step 收到的游程 (id, lo, hi)
 	std::vector<int32_t> runbuf;
 	int nrun, runi;
 
-	// rrl 的逐条推进游标 (fll/frel 的游标是分量级的, 不跨分量, 所以不需要这一份)
+	// 〔rrl〕逐条推进游标 (fll/frel 的游标是分量级的, 不跨分量, 所以不需要这一份)
 	std::vector<int32_t> cur;
 	std::vector<unsigned char> started;
 
-	std::vector<int32_t> cands; // fll 收候选起点的缓冲, 不够翻倍, 翻上去就留着
+	// 〔fll〕收候选起点的缓冲, 不够翻倍, 翻上去这一遍里就留着。
+	// 惰性开 (见 FllViableStarts): 全是定长条 / 整篇没命中的正文一分不付。
+	std::vector<int32_t> cands;
 
 	int scandone, failed;
 	long long walks, ncand, tries, emits;
@@ -297,6 +302,11 @@ static bool FrelCloseSeg(cre2_re2set_scan *s, const char *text, int textlen,
 // 缓冲不够就翻倍重来一趟 —— 里面写下的是最大的那几个 (恰好最没用), 整批作废没有损失。
 static int FllViableStarts(cre2_re2set_scan *s, const cre2_set *vp, const char *text, int textlen,
                            int32_t from, int32_t bound, int id) {
+	if (s->cands.empty()) {
+		// 惰性开: 只有变长条才会走到这里, 定长条 (一句减法) 和整篇没命中的正文一分不付。
+		// 64 是"真表上一个右端的候选通常是个位数"来的, 这个数只是让下面那次翻倍基本不发生。
+		s->cands.assign(64, 0);
+	}
 	for (int round = 0; round < 2; round++) {
 		int need = cre2_set_viable_starts(vp, text, textlen, from, bound, 0,
 		                                  &s->cands[0], (int)s->cands.size());
@@ -468,9 +478,10 @@ cre2_re2set *cre2_re2set_new(cre2_set *set, int mode, const int32_t *minlen,
 	o->minlen.assign(minlen, minlen + (n > 0 ? n : 0));
 	o->maxlen.assign(maxlen, maxlen + (n > 0 ? n : 0));
 	if (n > 0) {
-		// 探一下就扔。两件事: ① 把整表的 kManyMatch DFA 建出来 (NewSpanScan 内部 GetDFA),
-		// 建策略的时候一次建完, 不留给第一篇正文; ② 建不出来的表在【建策略】这里就报错,
-		// 而不是等第一遍扫描才发现。真扫描用的那份是每遍自己开的。
+		// 探一下就扔, 图的是【建不出来的表在建策略这里就报错】, 而不是等第一篇正文才发现。
+		// 🔴 别指望它顺带热身: NewSpanScan 内部那句 GetDFA 只 new 出 DFA 对象和它的状态区
+		//    (re2_dfa.cc: Prog::GetDFA), 状态是搜索的时候才一个个造的 —— 第一篇正文那笔
+		//    状态构建照样要付, 挪不走。真扫描用的工作区也是每遍自己开的。
 		re2::DFASpanScan *probe = set->set->NewSpanScan();
 		if (probe == NULL) {
 			o->err = "re2 re2set: 扫描工作区建不出来 (没 Compile / DFA 建不出来 / OOM)";
@@ -579,15 +590,25 @@ cre2_re2set_scan *cre2_re2set_scan_new(cre2_re2set *o, int textlen,
 	s->emits = 0;
 	s->badidx = -1;
 	const int n = o->n > 0 ? o->n : 0;
-	// 🔴 这几张表先摆好再谈别的: 下面任何一条出错路都会让调用方接着调 hits/stats,
-	//    那些函数按 n 取地址, 表是空的就是越界。
-	s->existonly.assign(n, 0);
-	s->hit.assign(n > 0 ? n : 1, 0);
-	s->cur.assign(n, 0);
-	s->started.assign(n, 0);
-	s->cands.assign(64, 0); // 真表上一个右端的候选通常是个位数, 这个数只是让翻倍基本不发生
-	for (int i = 0; i < n; i++) {
-		s->existonly[i] = (existonly != NULL && existonly[i]) ? 1 : 0;
+	const int mode = o->mode;
+	// ── 这几张表【只有 rrl 用】────────────────────────────────────────────────
+	// fll/frel 一张都不碰: 它们的命中表在 spanscan 里 (ghit_), 游标是分量级的不跨分量,
+	// 游程也不过桥 (g2 档整块留 native)。而这几张是按 n 开的, 每篇正文一开一关 —— 白开
+	// 4 次 malloc + 18n 字节 memset, 在短正文上占得见 (见 doc 里那张固定开销表)。
+	//
+	// 🔴 摆在【出错路之前】: 下面任何一条早退都会让调用方接着调 hits/stats, 而
+	//    cre2_re2set_scan_hits 在 rrl 上是 &hit[0] 取地址, 表是空的就是越界。
+	//    (mode 不认识那条早退走的是 else, 那时 hits 会因为 ss==NULL 返回 NULL, 不取地址。)
+	if (mode == CRE2_RE2SET_rrl) {
+		s->hit.assign(n > 0 ? n : 1, 0);
+		s->cur.assign(n, 0);
+		s->started.assign(n, 0);
+		// existonly 只有 g1 档的 step 每条游程要查一次, 所以只有这一档留一份副本;
+		// fll/frel 那侧只在下面开 boolOnly 的时候读一遍参数, 读完就不再问了。
+		s->existonly.assign(n, 0);
+		for (int i = 0; i < n; i++) {
+			s->existonly[i] = (existonly != NULL && existonly[i]) ? 1 : 0;
+		}
 	}
 	if (!o->err.empty()) {
 		// 没建成的对象上开扫描: 把建的时候那句话原样带过来, 别让调用方去问另一个句柄。
@@ -607,16 +628,19 @@ cre2_re2set_scan *cre2_re2set_scan_new(cre2_re2set *o, int textlen,
 		s->failed = 1;
 		return s;
 	}
-	// g1 档 (rrl) 的 out 必须 >= 3*n, 见 re2_span_scan.h。
-	s->runbuf.assign((size_t)n * 3, 0);
 	bool ok;
-	if (o->mode == CRE2_RE2SET_rrl) {
+	if (mode == CRE2_RE2SET_rrl) {
+		// g1 档的 out 必须 >= 3*n, 见 re2_span_scan.h。g2 档一个字节都不往那儿写, 不用开。
+		s->runbuf.assign((size_t)n * 3, 0);
 		ok = re2::DFASpanScanBegin(s->ss, textlen);
 	} else {
 		// 工作区是新开的, gbool_ 本来就是全 0, 只把名单上的开起来即可。
-		for (int i = 0; i < n; i++) {
-			if (s->existonly[i]) {
-				re2::DFASpanScanG2BoolOnly(s->ss, i, 1);
+		// 名单直接读参数 —— 这是 fll/frel 唯一一次问它, 不必留副本。
+		if (existonly != NULL) {
+			for (int i = 0; i < n; i++) {
+				if (existonly[i]) {
+					re2::DFASpanScanG2BoolOnly(s->ss, i, 1);
+				}
 			}
 		}
 		ok = re2::DFASpanScanBeginG2(s->ss, textlen);

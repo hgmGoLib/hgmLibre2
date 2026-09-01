@@ -191,11 +191,9 @@ func re2setScan(mu *sync.RWMutex, hp **C.cre2_re2set, n int, name string, req Re
 		return errors.New("re2native: " + name + " 开不出这一遍的扫描暂存 (OOM)")
 	}
 	defer C.cre2_re2set_scan_free(sh)
-	// 🔴 先用 badidx=NULL 问一声有没有错, 有才走 re2setErr —— re2setErr 里那个 &bad 是要
-	//    交给 C 的, 逃逸分析会把它搬上堆, 每遍一笔。错误路上无所谓, 成功路上不能有。
-	if C.cre2_re2set_scan_error(sh, nil) != nil {
-		return re2setErr(sh, name, "开这一遍失败")
-	}
+	// 🔴 这里【不】单问一句"开成没开成"。C 那侧开不成的时候一定同时把 failed 置起来
+	//    (cre2_re2set_scan_new 的三条早退路 + begin 失败, 一条不落), 而 step 见 failed 就
+	//    返回 -1 —— 下面那趟 step 会原样把话带出来。多问那一句是每遍一次白花的过桥。
 	// ── step 循环 ───────────────────────────────────────────────────────────
 	// 不要区间的时候也得把正文走完 (命中表要扫到底才稳定), 只是 native 一处都不会写,
 	// 所以给一格占位缓冲就够。
@@ -252,8 +250,9 @@ func re2setScan(mu *sync.RWMutex, hp **C.cre2_re2set, n int, name string, req Re
 	return nil
 }
 
-// re2setErr 把 C 侧那句话取出来 (取不到就用 fallback)。只走错误路 —— 里面那个 &bad 交给 C
-// 之后会被搬上堆, 成功路上一笔都不能有 (见调用处的红字)。
+// re2setErr 把 C 侧那句话取出来 (取不到就用 fallback)。
+// 🔴 只许走错误路: 里面那个 &bad 是要交给 C 的, 逃逸分析会把它搬上堆 —— 成功路上一笔
+//    都不能有 (TestRe2SetFllViableNoAlloc 钉着"稳态 0 笔/遍")。
 func re2setErr(sh *C.cre2_re2set_scan, name, fallback string) error {
 	var bad C.int
 	if e := C.cre2_re2set_scan_error(sh, &bad); e != nil {

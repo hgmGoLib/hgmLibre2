@@ -3,16 +3,19 @@ package hgmLibre2
 // re2set_concurrent_test.go —— 钉住这次拆分的那条核心承诺:
 //
 //	Re2Set_*_t 是【进程级】的, 同一个对象上可以并发 Scan;
-//	Close 可以在别的 goroutine 正在 Scan 的时候调, 不崩、不 use-after-free。
+//	Close 可以在别的 goroutine 正在 Scan 的时候调, 不崩、不 use-after-free;
+//	*RegexpSet 被 GC 掉之后策略对象照样能扫 (表的命由引用计数管, 不由 GC 管)。
 //
-// 🔴 这两格必须带 -race 跑才算数。它们看的是"有没有共享可变状态漏在对象上"——
+// 🔴 这三格必须带 -race 跑才算数。前两格看的是"有没有共享可变状态漏在对象上"——
 //    2026-09-01 之前每遍扫描的暂存(spanscan 句柄 · 游程缓冲 · 候选缓冲 · 游标)全挂在
-//    对象身上, 那时候这两格是必红的。
+//    对象身上, 那时候它们是必红的。
 
 import (
 	"fmt"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -117,18 +120,21 @@ func TestRe2Set_CloseDuringScan(t *testing.T) {
 		t.Fatal(err)
 	}
 	texts := re2setConcTexts()
+	// running 是"已经进到扫描循环里"的腿数。Close 的那几条腿等它满了才动手 —— 不等的话
+	// 调度器完全可能把 4 个 Close 先跑完再跑扫描, 这一格想钉的窗口一次都打不到。
+	var running atomic.Int32
 	var wg sync.WaitGroup
 	for i := 0; i < 16; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
 			a := NewRe2Set_alloc()
+			running.Add(1)
 			for r := 0; r < 20; r++ {
-				n := 0
 				err := ms.Scan(Re2Set_req_t{
 					Body:             texts[i],
 					Allocer:          a,
-					StartEndResultFn: func(rs []Re2Set_startEnd_t) bool { n += len(rs); return true },
+					StartEndResultFn: func(rs []Re2Set_startEnd_t) bool { return true },
 				})
 				if err != nil && !strings.Contains(err.Error(), "已经 Close") {
 					t.Errorf("腿 %d 轮 %d 报了个意料之外的错: %v", i, r, err)
@@ -137,12 +143,70 @@ func TestRe2Set_CloseDuringScan(t *testing.T) {
 			}
 		}(i)
 	}
+	// 🔴 Close 的那几条腿也要 join: 不 join 的话这一格可能在它们跑起来之前就结束了, 还会
+	//    留下几条越过测试函数的 goroutine。
 	for i := 0; i < 4; i++ {
-		go ms.Close() // 幂等 · 可以并发调
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for running.Load() < 16 {
+				runtime.Gosched()
+			}
+			ms.Close() // 幂等 · 可以并发调
+		}()
 	}
 	wg.Wait()
 	ms.Close()
 	if err := ms.Scan(Re2Set_req_t{Body: "abc", StartEndResultFn: func([]Re2Set_startEnd_t) bool { return true }}); err == nil {
 		t.Fatal("Close 之后再 Scan 该报错")
+	}
+}
+
+// TestRe2Set_SetGoneStillScans —— 把 *RegexpSet 丢掉、GC 跑过之后, Re2Set_fll_t 还能照常扫。
+//
+// 🔴 这一格钉的是 C 那侧的 cre2_set_ref: 2026-09-01 拆两层之后 Re2Set_fll_t 【不再】在 Go
+//    这边存一份 set 引用, "表活得比策略对象久"这件事全靠引用计数。没有它的话, RegexpSet
+//    的 finalizer 一跑就把 RE2::Set 连同 DFA 拆了 —— 下面这一遍就是 use-after-free。
+func TestRe2Set_SetGoneStillScans(t *testing.T) {
+	text := re2setConcTexts()[0]
+	var want string
+	collected := make(chan struct{})
+	ms := func() *Re2Set_fll_t {
+		set, err := NewRegexpSet(re2setConcPats)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// sentinel 与 set 同作用域同死期, 用来确认"这一轮 GC 真把这个作用域的东西收了",
+		// 免得测试在 finalizer 还没跑的情况下过掉 = 白测。
+		sentinel := new(int)
+		runtime.SetFinalizer(sentinel, func(*int) { close(collected) })
+		_ = sentinel
+		m, err := set.NewRe2Set_fll()
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, hits, _ := scanFlat(t, m.Scan, text)
+		want = fmt.Sprint(got) + " hits=" + fmt.Sprint(hits)
+		return m
+	}()
+	defer ms.Close()
+wait:
+	for i := 0; i < 20; i++ {
+		runtime.GC() // finalizer 是异步跑的, 所以催几轮
+		select {
+		case <-collected:
+			break wait
+		default:
+			runtime.Gosched()
+		}
+	}
+	select {
+	case <-collected:
+	default:
+		t.Log("这一轮 GC 没把 set 那个作用域收掉 —— 下面这一遍照样该对, 只是没测到 finalizer 那条路")
+	}
+	got, hits, _ := scanFlat(t, ms.Scan, text)
+	if s := fmt.Sprint(got) + " hits=" + fmt.Sprint(hits); s != want {
+		t.Fatalf("set 被 GC 掉之后结果变了:\n 之后 %s\n 之前 %s", s, want)
 	}
 }

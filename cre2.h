@@ -452,7 +452,8 @@ typedef struct cre2_re2set_result {
 
 /* minlen/maxlen 是每条 pattern 的匹配字节长度区间 (Go 侧 regexp/syntax 算好传下来;
  * maxlen < 0 = 没上限)。恒返回句柄 (除非 OOM), 建没建成看 cre2_re2set_error。
- * 建成功时【顺带把整表的 kManyMatch DFA 建出来】—— 那是建策略该付的钱, 不留给第一篇正文。
+ * 建的时候探一遍工作区, 所以【表建不出扫描来这里就报错】, 不必等第一篇正文。
+ * (只是探错, 不是热身 —— DFA 的状态还是搜索时才造, 见 cre2_re2set.cpp 那句红字。)
  * 内部对 set 加一份引用, 所以 o 活着 set 就活着, 调用方不必再替它保命。 */
 cre2_re2set *cre2_re2set_new(cre2_set *set, int mode, const int32_t *minlen,
                              const int32_t *maxlen, int n);
@@ -477,7 +478,10 @@ void cre2_re2set_scan_free(cre2_re2set_scan *s);
 const char *cre2_re2set_scan_error(const cre2_re2set_scan *s, int *badidx);
 
 /* 取一批命中区间。返回本批条数 (>=0); <0 = 出错 (整遍作废, 原因看 cre2_re2set_scan_error)。
- * *more: 1 = 还没完, 取走这批再 step; 0 = 完了。cap 必须 >= pattern 条数。 */
+ * *more: 1 = 还没完, 取走这批再 step; 0 = 完了。
+ * cap 只要 >= 1 就对: 这一层是可续的, 一个单元结算出来的区间装不下就 *more=1 先交这一批,
+ * 下一趟接着倒。(g1 档那个"outcap >= 3*条数"是【另一层】spanscan 的规矩, 见上面 cre2.h:335,
+ * 那块缓冲在本层内部, 不是这里的 out。) */
 int cre2_re2set_scan_step(cre2_re2set_scan *s, const char *text, int textlen,
                           cre2_re2set_result *out, int cap, int *more);
 
