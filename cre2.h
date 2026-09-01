@@ -309,6 +309,44 @@ cre2_rev_match_result cre2_partial_match_reverse(const cre2_re *h, const char *t
  * 语义细节和"为什么是轮询不是回调/不是一次吐完"见 re2_span_scan.h。 */
 typedef struct cre2_spanscan cre2_spanscan;
 
+/* ── Re2SetFrl: 一遍正向扫描, 直接交出不重叠的命中区间 (rightmost-longest) ────────
+ * 语义与分工见 cre2_frl.cpp 的文件头; Go 门面在 re2setfrl.go。
+ * 用法:
+ *   cre2_frl *f = cre2_frl_new(pats, patlens, boolonly, n, max_mem);
+ *   if (cre2_frl_error(f, &bad)) { ... }
+ *   cre2_frl_begin(f, textlen);
+ *   for (;;) {
+ *       int more = 0;
+ *       int k = cre2_frl_step(f, text, textlen, index, start, end, cap, &more);
+ *       if (k < 0) { 整遍作废 }
+ *       // index[0..k) / start[0..k) / end[0..k): text[start:end] 是第 index 条的一处匹配
+ *       if (!more) break;
+ *   }
+ *   cre2_frl_free(f);                  // 工作区可以反复 begin, 不必每篇正文重开
+ */
+typedef struct cre2_frl cre2_frl;
+
+/* 建工作区。boolonly[i] 非零 = 第 i 条只要"有没有命中", 不要区间 (可传 NULL = 全要区间)。
+ * 恒返回句柄 (除非 OOM), 建没建成看 cre2_frl_error。 */
+cre2_frl *cre2_frl_new(const char **pats, const int *patlens, const unsigned char *boolonly,
+                       int n, int64_t max_mem);
+void cre2_frl_free(cre2_frl *f);
+/* NULL = 没错。出错时 *badidx 是出问题的那条 pattern 下标 (说不出具体哪条时 -1)。 */
+const char *cre2_frl_error(const cre2_frl *f, int *badidx);
+
+/* 开始扫一篇正文 (只绑长度; 正文指针每次 step 传, 与 spanscan 同一套规矩)。1=成功 0=失败。 */
+int cre2_frl_begin(cre2_frl *f, int textlen);
+/* 推进一步, 最多往三个数组各写 cap 条。返回本批条数 (>=0); <0 = 出错, 整遍作废。
+ * *more 非零 = 还有, 接着调。text/textlen 必须与 begin 时一致, 且每次传同一份正文。 */
+int cre2_frl_step(cre2_frl *f, const char *text, int textlen,
+                  int32_t *index, int32_t *start, int32_t *end, int cap, int *more);
+/* n 个字节, 第 i 个非零 = 第 i 条这一遍命中过 (含 boolonly 那几条)。每次 begin 清零。 */
+const unsigned char *cre2_frl_hits(const cre2_frl *f);
+/* 本遍的账: usedpeak = native 侧游程真正装着数据的字节峰值; heappeak = 真实堆高水位;
+ * poolbytes = 回收池里躺着的; nseg = 收口的分量条数; nresolve = 问了几次反向锚定。 */
+void cre2_frl_stats(const cre2_frl *f, long long *usedpeak, long long *heappeak,
+                    long long *poolbytes, long long *nseg, long long *nresolve);
+
 /* 开一个流式扫描工作区 (set 必须已 cre2_set_compile)。OOM / 没编译返回 NULL。
  * 工作区可以反复用于多次扫描 (游程表不重新分配), 但【不是并发安全的】: 一个线程一个。 */
 cre2_spanscan *cre2_set_spanscan_new(const cre2_set *h);

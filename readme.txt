@@ -572,6 +572,89 @@
       (?:ab)?[bc]{1,2} · (?:ab)*b{1,3}) —— 反向这一侧一处都不岔, 因为没有"猜"这一步。
       判据自身有一道自检: ab|b 撞 "aab" 两种口径必须给出不同答案, 否则整套对拍是空转。
 
+    - Re2SetFrl (re2setfrl.go · cre2_frl.cpp): 【一遍正着扫, 直接给不重叠的命中区间】,
+      几乎全部逻辑在 C++ 里, Go 侧只有一个门面。名字: F = first pass forward (第一趟正着扫),
+      RL = rightmost-longest 那一族的去重叠口径 (确切定义见下面那条红字, 与反向 MatchScanner
+      的口径【不是同一个】)。
+        s, err := NewRe2SetFrl([]Re2SetFrlPattern_t{
+            {Pattern: `\d{3}-\d{2}-\d{4}`},                 // 要区间
+            {Pattern: `(?i)authorization`, ExistOnly: true},  // 只要"有没有"
+        })
+        defer s.Close()
+        buf := NewRe2SetFrlBuf(1024)                 // 三个 []int32, 复用 => 稳态零分配
+        err = s.Scan(body, buf, func(Index, Start, End []int32) bool {
+            for k := range Index {
+                _ = body[Start[k]:End[k]]            // 第 Index[k] 条的一处真匹配
+            }
+            return true                              // 返 false = 提前停
+        })
+        // 之后 s.Hit(i) / s.HitIDs(nil) 是命中表 (ExistOnly 那几条唯一的产物)
+      🔴 交给回调的三个切片就是 buf 里那三块【内部缓冲本身】, 下一批原地覆写。要留自己拷。
+      🔴 【要么全给, 要么整遍不算数】: err != nil 就是这一遍作废 (已经交出去的批也不算),
+         整篇走老路 FindAll。没有"这几条没给全你自己补"的中间态 —— 与 MatchScanner 同规矩。
+
+      ── 它和 MatchScanner 差在哪 (为什么要多一个) ────────────────────────────
+      MatchScanner 是"每个没被游标盖住的【右端】回看一次"; 这一层是"每个【分量】结算一次"。
+      分量从哪来: DFA 状态里带一个 per-pattern【存活位】(re2_dfa.cc 的 State::live_ +
+      BuildGLive) —— 某条 pattern 在某个偏移上没有活线程, 就没有任何匹配能跨过这个偏移,
+      于是它左右两侧的命中互不影响。由活转死就当场把它挂着的那一段收口成一个分量。
+      分量的左界还白送给补起点那一步当 bound: 回看不必走到正文开头。
+      三段分工, 每一段都在它最便宜的地方:
+        ① 扫正文      整表正向 set 的 kManyMatch DFA, 一遍         re2_dfa_spanscan_inl.h
+        ② 攒 + 切分量 命中【不逐条过桥】: 每条 pattern 当前分量的右端游程攒在 native 侧
+                      (8 个 int32 起二倍扩, 收口后进按大小分档的回收池), 分量收口时整块
+                      挂进待取列表                                 同上, g2 档
+        ③ 补起点      这一条 pattern 自己的【单条】对象, 反向锚定  cre2_frl.cpp FrlCloseSeg
+      ③ 走单条不走 set 是本库那条总规矩 (2026-08-27, 理由见上面 MatchScanner 那节)。
+      真表上 ②③ 的账: Stats().NResolve / Stats().NSeg = 【每个分量问了几次反向锚定】,
+      10 条通用 pattern × 三档语料实测恒为 1.00 (一个分量一趟就结完); UsedPeak (native 侧
+      游程峰值) 是 16~64 字节量级, 与正文长度无关。Go 侧稳态 0 allocs/op。
+
+      ── 🔴 口径: 最右【终点】最长, 不是最右【起点】最长 ─────────────────────
+      上界从正文末尾起, 反复取"终点最靠右且 <= 上界"的匹配, 同终点取【最长】(= 起点最靠左),
+      收下之后把上界压到它的起点。这与反向 MatchScanner 的 rightmost-longest (先挑【起点】
+      最靠右的) 是【两个口径】, 与 stdlib 的 leftmost-longest 也是两个:
+          aa|a  撞 "aaa"   Re2SetFrl [[0,1) [1,3)]   反向MatchScanner [[2,3) [1,2) [0,1)]
+                           stdlib Longest [[0,2) [2,3)]              ← 三个都不一样
+          b|abc 撞 "abc"   Re2SetFrl [[0,3)="abc"]   反向MatchScanner [[1,2)="b"]
+      🔴 后面这一格就是选终点不选起点的理由: 挑起点那一侧会把 "abc" 截成中间那个 "b" ——
+         下游拿这一段去过校验位 (身份证 · IBAN · Luhn) 会失败, 真命中被自己毙掉 = 无声漏报。
+      🔴 要与 stdlib 的 re.Longest().FindAllStringIndex 逐字节等价的调用方【不要用这个】,
+         用 MatchScanner。只是要"把这片正文里的东西都框出来"(脱敏 · 定位 · 计数) 才用它。
+      钉法: re2setfrl_test.go 的 frlBrute 是与本库无关的穷举 (stdlib \A(?:pat)\z 逐 (e,s) 试),
+      语料按每条 pattern 自己的 AST 生成 (随机字节撞不出真匹配 = 空转绿); TestRe2SetFrl_Shape
+      里那一格 aa|a 撞 "aaa" 三个口径必须给出三个不同答案, 否则整套对拍是空转。
+      判据是【不分量】的全局穷举 ⇒ 它同时钉住了"存活位切分量不改变答案"。
+
+      ── ExistOnly 不是可选优化 ───────────────────────────────────────────────
+      配了它的那几条, 命中时只置一个字节: 不攒游程 · 不盯存活位 · 不收口 · 不补起点。
+      挡掉的是这一层真花钱的那步, 不只是少交几处结果 —— 门上很多位只当外层短路的 bool 用
+      (bgAPACCombined 那种), 从来没人问它在哪, 真表上光两条这样的 pattern 就占了 57% 的游程。
+      回调里自己过滤顶替不了: 那是钱已经花完了才扔。
+      🔴 能匹配空串的 pattern (PatternLenRange 的 min <= 0) 只允许配 ExistOnly, 否则
+         NewRe2SetFrl 【当场】报错 (与正文无关, 建的时候就定死, 能直接写成回归测试)。
+
+      ── 🔴 量它的时候: 这几条循环对【代码布局】极其敏感 ──────────────────────
+      2026-09-01 实测: 同一份 C++, Go 那侧只多编进一个【没人调用】的函数, 零命中 64KiB 上
+      Re2SetFrl 就在 98us 和 199us 之间来回跳, MatchScanner 也在 97us 和 142us 之间跳 ——
+      整整两倍, 而两个变体的最小值其实是一样的。所以:
+        · 单个二进制里量出来的差别【不可信】, 必须扫一遍布局 (往测试包里塞 0~7 个没用的
+          函数, 各建一个二进制) 然后【每个变体各取最小值】再比。
+        · doc/set性能优化经验.txt 早就写了这台机 ±20%~2倍的抖动, 这是目前见过最狠的一例。
+      按这个法子量出来的结果见 re2setfrl_bench_test.go 的注释。
+
+      ── 与 d2 (MatchScanner) 的实测对比 ──────────────────────────────────────
+      re2setfrl_bench_test.go 那三档语料只有 10 条手造 pattern, 【会低估】(few 打平 ·
+      most 慢 17%)。换成三张真门表 (从 asc 源码里静态收的 368 条字面量按形状分成
+      cred 64 / prompt 31 / body 160 条, 256KiB 正文 × 四档命中密度, 8 个布局各取最小,
+      尺子在 tmp/frlbench):
+        · 12 格里 11 格 Frl 更快, 端到端 1.06~2.24 倍 d2; 只看补起点那一层 2.2~2.4 倍。
+        · 唯一慢的一格是 prompt 表 1% 命中 (0.19ms vs 0.12ms): 命中稀 + 交替支多 ⇒
+          几乎一处一个分量, 省不出反向锚定的次数, 白付切分量的记账。密一点就反超。
+        · 省在哪: d2 【每个右端】问一次反向锚定, Frl 【每个分量】问一次。命中越密, 一个
+          分量里塞的右端越多, 差距越大 (body 90%: 25 万处命中 vs 14.5 万个分量)。
+      全表在 re2setfrl_bench_test.go 头注里。
+
     - 性能 (spanscan_bench_test.go · 64KiB 正文 · 10 条通用 pattern · Ryzen 5900X · 稳态复用):
       对照的"旧实现"就是今天调用方那一套 —— set.Match 当门 + 逐条命中 pattern 在整篇正文上
       FindAllStringIndex (命中 k 条 = 1+k 遍全文扫描, 而且后面那 k 遍是最贵的非锚定扫描)。
