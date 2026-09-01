@@ -67,7 +67,8 @@ type Re2Set_req_t struct {
 	// 🔴 默认档【故意不是 sync.Pool】: 池的存期是一轮 GC, 而这条路真正的用法是"下一个
 	//    ≥4KB 的正文", 中间必然隔着若干轮 GC ⟹ 池里一次都命中不了, 每遍照样现开一个,
 	//    等于把这条路上最大的一笔开销藏进默认档 (asc 那边实测过 7.30MB, 见
-	//    asc/engine/sd_body_gate_span_pool.go 头注)。要复用就自己持有一个 alloc, 显式。
+	//    asc/engine/sd_body_gate_span.go 头注"工作区不留池子")。要复用就自己持有一个
+	//    alloc, 显式 —— 库这层不替调用方决定缓冲活多久。
 	Allocer *Re2Set_alloc_t
 
 	// ExistOnlyIndexList 是【纯成本开关】: 这几条只报"命中没命中", 不花钱补端点
