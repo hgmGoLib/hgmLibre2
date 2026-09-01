@@ -33,12 +33,13 @@ func frelScan(t *testing.T, pats []string, text string, batch int) []Re2Set_star
 	return frelScanOn(t, frelOpen(t, pats), text, batch)
 }
 
-// frelScanOn 同上, 但用现成的工作区 (复用/不串味那几格要它)。
+// frelScanOn 同上, 但用现成的策略对象 (复用/不串味那几格要它)。
 func frelScanOn(t *testing.T, s *Re2Set_frel_t, text string, batch int) []Re2Set_startEnd_t {
 	t.Helper()
 	var got []Re2Set_startEnd_t
 	a := NewRe2Set_allocBatch(batch) // 只有对拍才去掐这个数, 生产走默认批
-	err := s.Scan(text, &Re2Set_req_t{
+	err := s.Scan(Re2Set_req_t{
+		Body:    text,
 		Allocer: a,
 		StartEndResultFn: func(rs []Re2Set_startEnd_t) bool {
 			if len(rs) > batch {
@@ -276,14 +277,15 @@ func TestRe2SetFrel_ExistOnly(t *testing.T) {
 	for _, text := range texts {
 		var got []Re2Set_startEnd_t
 		var hits []int32
-		if err := s.Scan(text, &Re2Set_req_t{
+		if err := s.Scan(Re2Set_req_t{
+			Body:               text,
 			Allocer:            a,
 			ExistOnlyIndexList: existOnly,
 			StartEndResultFn: func(rs []Re2Set_startEnd_t) bool {
 				got = append(got, rs...)
 				return true
 			},
-			HitIndexResultFn: func(h []int32) bool { hits = append(hits, h...); return true },
+			HitIndexResultFn: func(h []int32) { hits = append(hits, h...) },
 		}); err != nil {
 			t.Fatalf("Scan 失败 text=%q: %v", text, err)
 		}
@@ -308,11 +310,12 @@ func TestRe2SetFrel_ExistOnly(t *testing.T) {
 		// 换一张名单 (全表都要区间 / 全表都只要位), 命中位表必须逐位相同。
 		for _, list := range [][]int32{nil, {0, 1, 2, 3}, {3}} {
 			var h2 []int32
-			if err := s.Scan(text, &Re2Set_req_t{
+			if err := s.Scan(Re2Set_req_t{
+				Body:               text,
 				Allocer:            a,
 				ExistOnlyIndexList: list,
 				StartEndResultFn:   func([]Re2Set_startEnd_t) bool { return true },
-				HitIndexResultFn:   func(h []int32) bool { h2 = append(h2, h...); return true },
+				HitIndexResultFn:   func(h []int32) { h2 = append(h2, h...) },
 			}); err != nil {
 				t.Fatalf("Scan 失败 text=%q list=%v: %v", text, list, err)
 			}
@@ -330,7 +333,8 @@ func TestRe2SetFrel_EarlyStopAndReuse(t *testing.T) {
 	text := "111 222 333 444 555"
 	n := 0
 	a := NewRe2Set_allocBatch(1)
-	if err := s.Scan(text, &Re2Set_req_t{
+	if err := s.Scan(Re2Set_req_t{
+		Body:             text,
 		Allocer:          a,
 		StartEndResultFn: func(rs []Re2Set_startEnd_t) bool { n += len(rs); return n < 2 },
 	}); err != nil {
@@ -360,7 +364,7 @@ func TestRe2SetFrel_Closed(t *testing.T) {
 	}
 	s.Close()
 	s.Close() // 幂等
-	err = s.Scan("abc", &Re2Set_req_t{StartEndResultFn: func([]Re2Set_startEnd_t) bool { return true }})
+	err = s.Scan(Re2Set_req_t{Body: "abc", StartEndResultFn: func([]Re2Set_startEnd_t) bool { return true }})
 	if err == nil {
 		t.Fatal("Close 之后 Scan 应当报错")
 	}

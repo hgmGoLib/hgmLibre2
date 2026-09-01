@@ -327,7 +327,6 @@ class DFASpanScan {
     if (!bk.empty()) {
       G2Buf b = bk.back();
       bk.pop_back();
-      g2pool_ -= b.cap;
       *cap = b.cap;
       G2Acct(b.cap);
       return b.p;
@@ -505,7 +504,6 @@ class DFASpanScan {
       b.p = p;
       b.cap = g2closedcap_[i];
       g2live_ -= b.cap * 4;
-      g2pool_ += b.cap;
       g2bucket_[G2Bucket(b.cap)].push_back(b);
     }
     g2closed_.clear();
@@ -521,7 +519,6 @@ class DFASpanScan {
       }
       g2bucket_[b].clear();
     }
-    g2pool_ = 0;
     for (size_t i = 0; i < g2_.size(); i++) {
       if (g2_[i].p != NULL) {
         G2Heap(-static_cast<long long>(g2_[i].cap) * 4);
@@ -648,7 +645,6 @@ class DFASpanScan {
   long long g2ngrow_ = 0;           // 统计: 二倍扩容次数
   long long g2live_ = 0;            // 统计: 当前正在用的游程数组字节
   long long g2peak_ = 0;            // 统计: 峰值 (这就是 g2 相对 g1 要比的那个数)
-  long long g2pool_ = 0;            // 统计: 回收池里躺着的字节
   long long g2used_ = 0;            // 统计: 开着的分量里【真正装着数据】的字节 (8 * 游程条数)
   long long g2usedpeak_ = 0;        // 统计: 上面那个的峰值 —— 和 g1 的 maxPend*8 才是同一把尺
   long long g2nopen_ = 0;           // 统计: 当前同时开着几个分量 (最多 nid 个)
@@ -1292,12 +1288,11 @@ int DFASpanScanG2Closed(DFASpanScan* ss, const DFASpanScanG2Rec** recs) {
 // heappeak = 这一遍为游程数组真实 malloc 出来的高水位 (扫描期间只申请不释放, 收口的
 // 袋子进回收池等着被再发出去); usedpeak = 其中【真正装着结束位置】的那部分 (8 * 游程条数)。
 void DFASpanScanG2Stats(DFASpanScan* ss, long long* usedpeak, long long* heappeak,
-                        long long* poolbytes, long long* nseg) {
+                        long long* nseg) {
   if (ss == NULL)
     return;
   if (usedpeak != NULL) *usedpeak = ss->g2usedpeak_;
   if (heappeak != NULL) *heappeak = ss->g2heappeak_;
-  if (poolbytes != NULL) *poolbytes = ss->g2pool_ * 4;
   if (nseg != NULL) *nseg = ss->g2nseg_;
 }
 

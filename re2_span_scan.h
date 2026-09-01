@@ -82,9 +82,9 @@ struct DFASpanScanG2Rec {
 };
 int DFASpanScanG2Closed(DFASpanScan* ss, const DFASpanScanG2Rec** recs);
 
-// g2 的内存账 (字节; nseg 是条数)。每次 BeginG2 重算, 只有回收池的水位跨 scan 保留。
+// g2 的内存账 (字节; nseg 是条数)。工作区就活一遍扫描, 所以这几个数就是这一遍的全部。
 void DFASpanScanG2Stats(DFASpanScan* ss, long long* usedpeak, long long* heappeak,
-                        long long* poolbytes, long long* nseg);
+                        long long* nseg);
 
 // 推进一步。text/textlen 必须与 Begin 时的长度一致, 且每次传同一份正文。
 // out 写入 (id, lo, hi) 三元组, outcap 是 int32 个数, 必须 >= 3*nid。

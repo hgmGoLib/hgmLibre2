@@ -44,7 +44,7 @@ func TestPatternLenRangeTable(t *testing.T) {
 // fllScanAll 把一遍 fll 的输出按 pattern 收成扁平 (start,end) 表。
 func fllScanAll(t *testing.T, pats []string, text string) map[int32][]int32 {
 	t.Helper()
-	byPat, _ := scanFlat(t, newFll(t, pats).Scan, text)
+	byPat, _, _ := scanFlat(t, newFll(t, pats).Scan, text)
 	return byPat
 }
 
@@ -156,7 +156,7 @@ func TestRe2SetFllStrictVsFindAll(t *testing.T) {
 			sb.WriteString(alphabet[rng.Intn(len(alphabet))])
 		}
 		text := sb.String()
-		byPat, _ := scanFlat(t, ms.Scan, text)
+		byPat, _, _ := scanFlat(t, ms.Scan, text)
 		for id := range pats {
 			f := byPat[int32(id)]
 			// ① 每一段都是真匹配 · ② 互不相交且升序
@@ -206,7 +206,8 @@ func TestRe2SetFllExistOnly(t *testing.T) {
 	s := newFll(t, []string{`[A-Z]\d{3}`, `[a-f]{2,6}`})
 	byPat := map[int32][]int32{}
 	var hits []int32
-	err := s.Scan("A123 beef", &Re2Set_req_t{
+	err := s.Scan(Re2Set_req_t{
+		Body:               "A123 beef",
 		ExistOnlyIndexList: []int32{0},
 		StartEndResultFn: func(rs []Re2Set_startEnd_t) bool {
 			for _, r := range rs {
@@ -214,7 +215,7 @@ func TestRe2SetFllExistOnly(t *testing.T) {
 			}
 			return true
 		},
-		HitIndexResultFn: func(h []int32) bool { hits = append(hits, h...); return true },
+		HitIndexResultFn: func(h []int32) { hits = append(hits, h...) },
 	})
 	if err != nil {
 		t.Fatal(err)

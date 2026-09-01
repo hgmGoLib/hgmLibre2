@@ -33,7 +33,16 @@
 // 【没有】"这几条没给全你自己补"的中间态: 一个调用方造不出来的错误码不该出现在返回值里 ——
 // 它逼出的兜底跑不到 → 跑不到就没法测 → 没法测的代码基本是错的。
 //
-// 生命周期: 建一次留着反复 Scan;【不是】并发安全的, 一条腿一个或者池化。不用了 Close。
+// ── 生命周期: 【进程级】· 建一次留着 · 可以并发 Scan ────────────────────────
+// 一个策略一份, 跟策略同生共死。它身上一个字节的"这一遍"状态都没有 —— 每遍扫描的暂存
+// (native 那份 spanscan 工作区 · 游程缓冲 · 候选缓冲) 由 Scan 自己现开现关, 对调用方不可见;
+// Go 侧的输入输出缓冲走 Re2Set_req_t.Allocer (一条腿一个 alloc)。
+//
+// 它身上真正常驻的是【补端点用的单条正向/反向对象缓存】: 惰性建, 最大那张 158 条生产表
+// 实测 9.6MB。所以【别】每遍新建一个 —— 那是把 9.6MB 重编一遍再扔掉。
+//
+// 换策略的时候 Close 掉旧的: native 那侧是引用计数, 手上还在跑的那几遍照样安全跑完,
+// 最后一个走的人关灯。忘了 Close 也不漏 —— 有 finalizer 兜底, 只是释放时机交给了 GC。
 package hgmLibre2
 
 /*
@@ -41,36 +50,46 @@ package hgmLibre2
 */
 import "C"
 
-import "errors"
+import (
+	"errors"
+	"runtime"
+	"sync"
+)
 
 // Re2Set_fll_t 见文件头。
 type Re2Set_fll_t struct {
+	// mu 只护 h 这一个字段: Scan 拿【读锁】把这一遍的 native 暂存开出来就放手, Close 拿写锁。
+	// 读锁是共享的 ⟹ 并发 Scan 之间只在开头那一瞬碰一下, 之后互不相干。
+	mu   sync.RWMutex
 	h    *C.cre2_re2set
-	set  *RegexpSet // 🔴 必须存着: C 侧【借】它的 native 句柄, 不存就会被 finalizer 提前释放
 	size int
 }
 
-// NewRe2Set_fll 给这张【正向】表开一个 fll 工作区。热路径上建一次长期留着, 别每遍新建。
+// NewRe2Set_fll 给这张【正向】表编一个 fll 策略对象。
 //
-// 补端点要用的那些单条对象缓存在【表】上 (不在工作区里), 所以同一张表开多个工作区
-// (按 GOMAXPROCS 池化) 不会把那份缓存乘以份数。
+// 🔴 建一次留着, 跟策略同生共死 —— 别每遍新建 (见文件头"生命周期")。建的时候顺带把整表的
+// DFA 建出来, 那是建策略该付的钱。
 func (s *RegexpSet) NewRe2Set_fll() (*Re2Set_fll_t, error) {
 	if s == nil || s.h == nil {
 		return nil, errors.New("re2native: NewRe2Set_fll 的表是空的")
 	}
 	h, err := re2setNew(s.h, C.CRE2_RE2SET_fll, s.lens, "Re2Set_fll_t")
+	runtime.KeepAlive(s)
 	if err != nil {
 		return nil, err
 	}
-	return &Re2Set_fll_t{h: h, set: s, size: s.size}, nil
+	w := &Re2Set_fll_t{h: h, size: s.size}
+	runtime.SetFinalizer(w, func(x *Re2Set_fll_t) { x.Close() })
+	return w, nil
 }
 
-// Scan 扫 body 一遍 —— 这是【唯一】一遍全文。要什么见 Re2Set_req_t (传 nil = 什么都不要)。
-func (s *Re2Set_fll_t) Scan(body string, req *Re2Set_req_t) error {
+// Scan 扫 req.Body 一遍 —— 这是【唯一】一遍全文。要什么见 Re2Set_req_t (零值 = 什么都不要)。
+// 同一个对象上可以【并发】调, 每条腿带自己的 Allocer。
+func (s *Re2Set_fll_t) Scan(req Re2Set_req_t) error {
 	if s == nil {
 		return errors.New("re2native: Re2Set_fll_t 是 nil")
 	}
-	return re2setScan(s.h, s.size, "Re2Set_fll_t", body, req)
+	return re2setScan(&s.mu, &s.h, s.size, "Re2Set_fll_t", req)
 }
 
 // GetPatternLen 是 pattern 条数 (= Index 的上界)。
@@ -81,20 +100,42 @@ func (s *Re2Set_fll_t) GetPatternLen() int {
 	return s.size
 }
 
-// GetStats 是最近一次 Scan 的账, 见 Re2Set_stats_t。
-func (s *Re2Set_fll_t) GetStats() Re2Set_stats_t {
+// GetViableOneStats 报【已经被建出来】的那些"反向单条 set"的账: 几条 · 状态数合计 ·
+// 状态区实际字节合计。与 RegexpSet.GetMemInfo 同一个用途 (量内存去哪了), 不制造状态。
+//
+// 那些单条对象是补起点用的, 惰性建 ⟹ 没被真问过位置的 pattern 一条都不占。
+// 🔴 这是 fll 这条路的【常驻】开销 —— 挂新表之前先量这个数。
+//
+//	最大的那张 158 条生产表实测: 89 条被真问到位置, 合计 9.6MB。
+func (s *Re2Set_fll_t) GetViableOneStats() (n int, states, arenaCap int64) {
 	if s == nil {
-		return Re2Set_stats_t{}
+		return 0, 0, 0
 	}
-	return re2setStats(s.h)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.h == nil {
+		return 0, 0, 0
+	}
+	var cn C.int
+	var cs, ca C.longlong
+	C.cre2_re2set_one_viable_stats(s.h, &cn, &cs, &ca)
+	return int(cn), int64(cs), int64(ca)
 }
 
-// Close 放掉 native 那份扫描工作区。可重复调; 之后再 Scan 返回 err。
-// 表本身 (以及挂在表上的单条对象缓存) 不受影响 —— 那是表的事, 别的工作区还在用。
+// Close 放掉这个策略对象连同它身上的单条对象缓存 (那 9.6MB)。换策略的时候调它。
+//
+// 可重复调; 之后再 Scan 返回 err。native 那侧是引用计数, 所以【正在跑的 Scan 不受影响】——
+// 它们各攥着一份, 最后一个走的人才真拆。不调也不漏 (finalizer 兜底), 只是释放时机交给 GC。
 func (s *Re2Set_fll_t) Close() {
-	if s == nil || s.h == nil {
+	if s == nil {
 		return
 	}
-	C.cre2_re2set_free(s.h)
+	s.mu.Lock()
+	h := s.h
 	s.h = nil
+	s.mu.Unlock()
+	if h != nil {
+		runtime.SetFinalizer(s, nil)
+		C.cre2_re2set_free(h)
+	}
 }

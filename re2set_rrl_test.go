@@ -204,10 +204,11 @@ func TestRe2SetRrl_ExistOnly(t *testing.T) {
 	defer ms.Close()
 	var got []Re2Set_startEnd_t
 	var hits []int32
-	if err := ms.Scan("ab 123 cd", &Re2Set_req_t{
+	if err := ms.Scan(Re2Set_req_t{
+		Body:               "ab 123 cd",
 		ExistOnlyIndexList: []int32{1},
 		StartEndResultFn:   func(rs []Re2Set_startEnd_t) bool { got = append(got, rs...); return true },
-		HitIndexResultFn:   func(h []int32) bool { hits = append(hits, h...); return true },
+		HitIndexResultFn:   func(h []int32) { hits = append(hits, h...) },
 	}); err != nil {
 		t.Fatal(err)
 	}

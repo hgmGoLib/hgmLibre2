@@ -539,13 +539,19 @@ the hit table and de-duplicated match spans, in batches, with a fixed memory
 footprint.
 
 ```go
-ms, err := set.NewRe2Set_fll()    // reusable workspace: build once, keep it, Close it
-defer ms.Close()
+// Process-level: one per policy, built once and kept. It carries the lazily built
+// single-pattern objects used to resolve starts (9.6 MB on the largest production
+// table), so building one per pass means recompiling that much and throwing it away.
+// Scan is safe to call concurrently on one object; Close it when the policy changes
+// (refcounted on the native side, so in-flight scans are unaffected — and a finalizer
+// backs it up if you forget).
+ms, err := set.NewRe2Set_fll()
 
-// Build the request once too: a fresh one per pass (it carries closures) is an
-// allocation per pass. Passing nil is legal and means "I want nothing".
-req := &hgmLibre2.Re2Set_req_t{
-    Allocer:            hgmLibre2.NewRe2Set_alloc(),
+// The request is passed by value. The Allocer is the caller's Go-side buffer:
+// hold one per goroutine and reuse it (it is NOT safe to share between goroutines).
+err = ms.Scan(hgmLibre2.Re2Set_req_t{
+    Body:               body,
+    Allocer:            alloc,
     ExistOnlyIndexList: []int32{3, 7},   // optional: these only need "did it hit"
     StartEndResultFn: func(batch []hgmLibre2.Re2Set_startEnd_t) bool {
         for _, m := range batch {        // body[m.Start:m.End] is a real match of pattern m.Index
@@ -553,18 +559,20 @@ req := &hgmLibre2.Re2Set_req_t{
         }
         return true                      // return false to stop early (not an error)
     },
-    HitIndexResultFn: func(ids []int32) bool {
+    HitIndexResultFn: func(ids []int32) {
         // handed once, after the scan: the same hit table Set.Match would have returned
         // (ascending, including the ExistOnly rows)
-        return true
     },
-}
-err = ms.Scan(body, req)          // err != nil ⟹ the whole pass is void; redo it with FindAll
-st := ms.GetStats()                  // Walks / Cands / Tries / Emits for that pass
-// st.Tries/st.Walks is the number to watch: 1.00 means the first candidate start was
-// always the answer. Measured 1.00 on every production table. The first three counters
-// cover variable-length patterns only (fixed-length ones never look back); Emits counts
-// every span, so Tries/Emits is NOT "tries per look-back".
+    StatsResultFn: func(st hgmLibre2.Re2Set_stats_t) {
+        // Walks / Cands / Tries / Emits for this pass. Only called if you set it,
+        // so production paths pay nothing for it.
+        // st.Tries/st.Walks is the number to watch: 1.00 means the first candidate start
+        // was always the answer. Measured 1.00 on every production table. The first three
+        // counters cover variable-length patterns only (fixed-length ones never look back);
+        // Emits counts every span, so Tries/Emits is NOT "tries per look-back".
+    },
+})                                // err != nil ⟹ the whole pass is void; redo it with FindAll
+// A zero-value request is legal and means "I want nothing": nothing is scanned or allocated.
 ```
 
 **What it buys.** Two measurements, on **different tables and corpora** — do not
@@ -1065,9 +1073,9 @@ to the start of the body. Three stages, each where it is cheapest:
 | collect + split | native side, no per-hit bridge crossing | match ends are kept as run-lengths in a per-pattern buffer, handed over one component at a time |
 | resolve starts | that one pattern's **single** `Regexp`, reverse-anchored | one call per non-overlapping match in the component |
 
-`GetStats().Tries / GetStats().NSeg` is *how many reverse-anchored searches each component
-cost*; on the ten general-purpose patterns of the benchmark it is exactly 1.00 across
-all three corpora. `GetStats().UsedPeak` — the native-side run buffer — stays in the tens
+`Tries / NSeg` (from `StatsResultFn`) is *how many reverse-anchored searches each
+component cost*; on the ten general-purpose patterns of the benchmark it is exactly 1.00
+across all three corpora. `UsedPeak` — the native-side run buffer — stays in the tens
 of bytes and does not grow with the body.
 
 **The de-overlap rule — rightmost *end*, longest.** Start with the bound at the end of

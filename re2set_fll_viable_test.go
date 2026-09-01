@@ -67,7 +67,7 @@ func TestRe2SetFllViableIsLongest(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		byPat, _ := scanFlat(t, ms.Scan, c.text)
+		byPat, _, _ := scanFlat(t, ms.Scan, c.text)
 		got := byPat[0]
 		ms.Close()
 		if fmt.Sprint(got) != fmt.Sprint(flat) {
@@ -108,7 +108,7 @@ func TestRe2SetFllVsLongestFuzz(t *testing.T) {
 			buf[i] = rs[rnd(len(rs))]
 		}
 		text := string(buf)
-		byPat, _ := scanFlat(t, ms.Scan, text)
+		byPat, _, _ := scanFlat(t, ms.Scan, text)
 		for i := range viablePats {
 			var flat []int32
 			for _, loc := range std[i].FindAllStringIndex(text, -1) {
@@ -152,7 +152,7 @@ func TestRe2SetFllBenchTableVsLongest(t *testing.T) {
 	spans := 0
 	for _, kind := range benchCorpusKinds {
 		text := benchCorpus(kind)
-		got, _ := scanFlat(t, ms.Scan, text)
+		got, _, st := scanFlat(t, ms.Scan, text)
 		for i := range benchPats {
 			var flat []int32
 			for _, loc := range std[i].FindAllStringIndex(text, -1) {
@@ -164,7 +164,6 @@ func TestRe2SetFllBenchTableVsLongest(t *testing.T) {
 			}
 			spans += len(flat) / 2
 		}
-		st := ms.GetStats()
 		t.Logf("语料 %-4s · 账: walks=%d cands=%d tries=%d emits=%d (试/看=%.2f)",
 			kind, st.Walks, st.Cands, st.Tries, st.Emits,
 			float64(st.Tries)/float64(max1(st.Walks)))
@@ -273,12 +272,13 @@ func TestRe2SetFllViableNoAlloc(t *testing.T) {
 	text := benchCorpus("few")
 	sink := 0
 	// 🔴 req 和 alloc 都【建一次留着】—— 每遍现造一个就是每遍一笔分配, 那正是这一格要量的东西。
-	req := &Re2Set_req_t{
+	req := Re2Set_req_t{
+		Body:             text,
 		Allocer:          NewRe2Set_alloc(),
 		StartEndResultFn: func(rs []Re2Set_startEnd_t) bool { sink += len(rs); return true },
 	}
 	run := func() {
-		if err := ms.Scan(text, req); err != nil {
+		if err := ms.Scan(req); err != nil {
 			t.Fatal(err)
 		}
 	}

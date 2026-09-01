@@ -36,12 +36,15 @@
 ```go
 set, _ := hgmLibre2.NewRegexpSet(patterns)   // 包级变量, 建一次
 
-ms, _ := set.NewRe2Set_fll()               // 热路径上建一次留着; 不是并发安全的
-defer ms.Close()
+ms, _ := set.NewRe2Set_fll()               // 【进程级】: 一个策略一份, 建一次留着
+// 🔴 别每遍新建 —— 补端点用的单条正向/反向对象缓存挂在它身上 (最大那张生产表 9.6MB),
+//    每遍新建就是每篇正文把那 9.6MB 重编一遍再扔掉。换策略的时候 Close 旧的 (引用减一,
+//    正在跑的 Scan 不受影响); 忘了 Close 也不漏, 有 finalizer 兜底。
+// 🔴 同一个 ms 上可以【并发 Scan】。但 alloc 不是并发安全的, 一条腿一个自己持有复用。
 
-// req 和 alloc 都【建一次留着】—— 每遍现造一个 (带闭包) 就是每遍一笔分配。
-req := &hgmLibre2.Re2Set_req_t{
-    Allocer:            hgmLibre2.NewRe2Set_alloc(),
+err := ms.Scan(hgmLibre2.Re2Set_req_t{     // req 按值传, 不取地址
+    Body:               body,
+    Allocer:            alloc,
     ExistOnlyIndexList: []int32{3, 7},   // 可选: 这几条只要位, 别花钱补端点
     StartEndResultFn: func(batch []hgmLibre2.Re2Set_startEnd_t) bool {
         for _, m := range batch {
@@ -50,14 +53,12 @@ req := &hgmLibre2.Re2Set_req_t{
         }
         return true                       // 返 false = 提前收工 (不算错)
     },
-    HitIndexResultFn: func(ids []int32) bool {
+    HitIndexResultFn: func(ids []int32) {
         // 扫完【一次性】交全表命中位 (升序, 与 Set.Match 同解, 含 ExistOnly 的那几条)
-        return true
     },
-}
-err := ms.Scan(body, req)
+})
 // 🔴 要么全给, 要么整遍不算数: err != nil ⟹ 这一遍作废, 整篇走老路 FindAll
-// 🔴 req 传 nil 合法 = "什么都不要": 一遍都不扫, 一个字节都不分配
+// 🔴 零值 req 合法 = "什么都不要": 一遍都不扫, 一个字节都不分配
 ```
 
 `ExistOnlyIndexList` 是**纯成本开关**:
@@ -137,7 +138,8 @@ Lo = Hi - min
 所以"DFA 放弃"在它身上不发生。剩下反向那一趟还是 DFA 独一条(RE2 自己求匹配左端也只有这一条路),
 它放弃就整遍报错 —— 见 (c)。
 
-**这条路的钱全在"验了几个假候选"上**, 而那一笔从外面一个字都看不见, 所以有 `GetStats()`:
+**这条路的钱全在"验了几个假候选"上**, 而那一笔从外面一个字都看不见, 所以有
+`req.StatsResultFn`(配了才算才交, 生产路径上不配它):
 
 | 字段 | 是什么 |
 | --- | --- |

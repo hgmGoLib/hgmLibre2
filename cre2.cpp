@@ -754,104 +754,6 @@ int cre2_set_add(cre2_set *h, const char *pat, int patlen) {
 	return id;
 }
 
-// cre2_set_one_fwd: 第 i 条 pattern 自己那条【正向 · longest】对象 (惰性 · 加锁 · 表级共用)。
-// 建不出来返回 NULL 并记住, 不会每遍重编。语义见 cre2_internal.h 里 one_fwd 那段。
-const cre2_re *cre2_set_one_fwd(cre2_set *h, int i) {
-	if (h == nullptr || i < 0 || (size_t)i >= h->pats.size()) {
-		return nullptr;
-	}
-	std::lock_guard<std::mutex> lk(h->one_mu);
-	if (h->one_fwd.empty()) {
-		h->one_fwd.assign(h->pats.size(), nullptr);
-		h->one_fwd_no.assign(h->pats.size(), 0);
-	}
-	if (h->one_fwd[i] != nullptr) {
-		return h->one_fwd[i];
-	}
-	if (h->one_fwd_no[i]) {
-		return nullptr;
-	}
-	cre2_re *re = cre2_new_longest_max_mem(h->pats[i].data(), (int)h->pats[i].size(), h->max_mem);
-	if (re == nullptr) {
-		h->one_fwd_no[i] = 1;
-		return nullptr;
-	}
-	const char *e = cre2_error(re); // 没错时是空串, 不是 NULL
-	if (cre2_ok(re) == 0 || (e != nullptr && *e != 0)) {
-		cre2_free(re);
-		h->one_fwd_no[i] = 1;
-		return nullptr;
-	}
-	h->one_fwd[i] = re;
-	return re;
-}
-
-// cre2_set_one_viable: 第 i 条 pattern 自己那条【反向 · 只装这一条】的 set (惰性 · 加锁 ·
-// 表级共用), 给 cre2_set_viable_starts 用。建不出来返回 NULL 并记住。
-const cre2_set *cre2_set_one_viable(cre2_set *h, int i) {
-	if (h == nullptr || i < 0 || (size_t)i >= h->pats.size()) {
-		return nullptr;
-	}
-	std::lock_guard<std::mutex> lk(h->one_mu);
-	if (h->one_viable.empty()) {
-		h->one_viable.assign(h->pats.size(), nullptr);
-		h->one_viable_no.assign(h->pats.size(), 0);
-	}
-	if (h->one_viable[i] != nullptr) {
-		return h->one_viable[i];
-	}
-	if (h->one_viable_no[i]) {
-		return nullptr;
-	}
-	cre2_set *one = cre2_set_new_ex(h->max_mem, 1);
-	if (one == nullptr) {
-		h->one_viable_no[i] = 1;
-		return nullptr;
-	}
-	if (cre2_set_add(one, h->pats[i].data(), (int)h->pats[i].size()) != 0 ||
-	    cre2_set_compile(one) == 0) {
-		cre2_set_free(one);
-		h->one_viable_no[i] = 1;
-		return nullptr;
-	}
-	h->one_viable[i] = one;
-	return one;
-}
-
-// cre2_set_one_viable_stats: 【已经被建出来】的那些反向单条 set 的账 (条数 · 状态数 ·
-// 状态区字节)。不制造状态 —— 量具不制造被量的东西。
-void cre2_set_one_viable_stats(cre2_set *h, int *n, long long *states, long long *arenacap) {
-	if (n != nullptr) {
-		*n = 0;
-	}
-	if (states != nullptr) {
-		*states = 0;
-	}
-	if (arenacap != nullptr) {
-		*arenacap = 0;
-	}
-	if (h == nullptr) {
-		return;
-	}
-	std::lock_guard<std::mutex> lk(h->one_mu);
-	for (size_t k = 0; k < h->one_viable.size(); k++) {
-		if (h->one_viable[k] == nullptr) {
-			continue;
-		}
-		cre2_set_mem mi;
-		cre2_set_mem_info(h->one_viable[k], &mi);
-		if (n != nullptr) {
-			(*n)++;
-		}
-		if (states != nullptr) {
-			*states += mi.States;
-		}
-		if (arenacap != nullptr) {
-			*arenacap += mi.ArenaCap;
-		}
-	}
-}
-
 int cre2_set_compile(cre2_set *h) { return h->set->Compile() ? 1 : 0; }
 
 int cre2_set_match(const cre2_set *h, const char *text, int textlen, int *out, int outcap) {
@@ -935,19 +837,21 @@ void cre2_set_attrib_info(const cre2_set *h, cre2_set_attrib *agg,
 	memcpy(agg->BirthHist, ai.birth_hist, sizeof agg->BirthHist);
 }
 
+// cre2_set_ref: 再要一份引用 (给 cre2_re2set 这种要把表活过自己调用方的持有者)。
+void cre2_set_ref(cre2_set *h) {
+	if (h == nullptr) {
+		return;
+	}
+	h->ref.fetch_add(1, std::memory_order_relaxed);
+}
+
+// cre2_set_free: 引用【减一】, 减到 0 才真拆。可以对同一个句柄调多次 —— 每次配一份引用。
 void cre2_set_free(cre2_set *h) {
 	if (h == nullptr) {
 		return;
 	}
-	for (size_t i = 0; i < h->one_fwd.size(); i++) {
-		if (h->one_fwd[i] != nullptr) {
-			cre2_free(h->one_fwd[i]);
-		}
-	}
-	for (size_t i = 0; i < h->one_viable.size(); i++) {
-		if (h->one_viable[i] != nullptr) {
-			cre2_set_free(h->one_viable[i]);
-		}
+	if (h->ref.fetch_sub(1, std::memory_order_acq_rel) != 1) {
+		return; // 还有别人攥着
 	}
 	delete h->set;
 	delete h;

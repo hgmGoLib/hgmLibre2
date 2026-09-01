@@ -37,26 +37,6 @@ type RegexpSet struct {
 	maxMem int64
 }
 
-// GetViableOneStats 报【已经被建出来】的那些"反向单条 set"的账: 几条 · 状态数合计 ·
-// 状态区实际字节合计。与 GetMemInfo 同一个用途 (量内存去哪了), 不制造状态。
-//
-// 那些单条对象是补端点用的 (见 cre2_internal.h 里 one_fwd / one_viable 那段), 惰性建 ⟹
-// 没被 Re2Set_fll_t 问过位置的 pattern 一条都不占; 缓存挂在【表】上而不是扫描工作区里,
-// 所以同一张表开多少个工作区都只有这一份。
-//
-// 🔴 这是 fll 补起点这条路的【常驻】开销 —— 挂新表之前先量这个数。
-//    最大的那张 158 条生产表实测: 89 条被真问到位置, 合计 9.6MB。
-func (s *RegexpSet) GetViableOneStats() (n int, states, arenaCap int64) {
-	if s == nil || s.h == nil {
-		return 0, 0, 0
-	}
-	var cn C.int
-	var cs, ca C.longlong
-	C.cre2_set_one_viable_stats(s.h, &cn, &cs, &ca)
-	runtime.KeepAlive(s)
-	return int(cn), int64(cs), int64(ca)
-}
-
 // DefaultSetMaxMem 是 RE2 的默认内存预算 (RE2::Options::kDefaultMaxMem = 8MB)。
 // NewRegexpSet 用的就是它; NewRegexpSetMaxMem 传 <=0 也回落到它。
 const DefaultSetMaxMem int64 = DefaultMaxMem

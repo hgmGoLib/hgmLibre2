@@ -82,7 +82,8 @@ import (
 // frelBenchWork 是 frel 那条路的可复用工作区。
 type frelBenchWork struct {
 	s   *Re2Set_frel_t
-	req *Re2Set_req_t
+	req Re2Set_req_t
+	st  Re2Set_stats_t
 	n   int
 }
 
@@ -93,25 +94,27 @@ func newFrelBenchWork(tb testing.TB) *frelBenchWork {
 		tb.Fatalf("开 Re2Set_frel_t: %v", err)
 	}
 	w := &frelBenchWork{s: s}
-	w.req = &Re2Set_req_t{
+	w.req = Re2Set_req_t{
 		Allocer:          NewRe2Set_alloc(),
 		StartEndResultFn: func(rs []Re2Set_startEnd_t) bool { w.n += len(rs); return true },
+		StatsResultFn:    func(st Re2Set_stats_t) { w.st = st },
 	}
 	return w
 }
 
 func (w *frelBenchWork) run(tb testing.TB, text string) int {
 	w.n = 0
-	if err := w.s.Scan(text, w.req); err != nil {
+	w.req.Body = text
+	if err := w.s.Scan(w.req); err != nil {
 		tb.Fatalf("frel Scan: %v", err)
 	}
 	return w.n
 }
 
-// frelBenchMs 是 fll 那条路的可复用工作区。
+// frelBenchMs 是 fll 那条路的可复用策略对象。
 type frelBenchMs struct {
 	ms  *Re2Set_fll_t
-	req *Re2Set_req_t
+	req Re2Set_req_t
 	n   int
 }
 
@@ -122,7 +125,7 @@ func newFrelBenchMs(tb testing.TB) *frelBenchMs {
 		tb.Fatalf("开 Re2Set_fll_t: %v", err)
 	}
 	w := &frelBenchMs{ms: ms}
-	w.req = &Re2Set_req_t{
+	w.req = Re2Set_req_t{
 		Allocer:          NewRe2Set_alloc(),
 		StartEndResultFn: func(rs []Re2Set_startEnd_t) bool { w.n += len(rs); return true },
 	}
@@ -131,7 +134,8 @@ func newFrelBenchMs(tb testing.TB) *frelBenchMs {
 
 func (w *frelBenchMs) run(tb testing.TB, text string) int {
 	w.n = 0
-	if err := w.ms.Scan(text, w.req); err != nil {
+	w.req.Body = text
+	if err := w.ms.Scan(w.req); err != nil {
 		tb.Fatalf("fll Scan: %v", err)
 	}
 	return w.n
@@ -194,7 +198,7 @@ func TestRe2SetFrel_Cost(t *testing.T) {
 		nold := len(o.run(text)) / 3
 		nms := ms.run(t, text)
 		nfrel := w.run(t, text)
-		st := w.s.GetStats()
+		st := w.st
 		t.Logf("%-6s %8d %10d %10d %10d %8d %8d %10d",
 			kind, len(text), nold, nms, nfrel, st.NSeg, st.Tries, st.UsedPeak)
 	}

@@ -69,10 +69,11 @@ func TestRe2Set_AllocCrossObject(t *testing.T) {
 	collect := func(scan re2setScanFn, a *Re2Set_alloc_t) string {
 		var all []Re2Set_startEnd_t
 		var hits []int32
-		err := scan(text, &Re2Set_req_t{
+		err := scan(Re2Set_req_t{
+			Body:             text,
 			Allocer:          a,
 			StartEndResultFn: func(rs []Re2Set_startEnd_t) bool { all = append(all, rs...); return true },
-			HitIndexResultFn: func(h []int32) bool { hits = append(hits, h...); return true },
+			HitIndexResultFn: func(h []int32) { hits = append(hits, h...) },
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -109,7 +110,7 @@ func TestRe2Set_AllocCrossObject(t *testing.T) {
 	}
 }
 
-// TestRe2Set_NilReq —— req == nil (以及两个回调都是 nil) 是合法调用: 不报错、不回调、不分配。
+// TestRe2Set_NilReq —— 零值 req (三个回调全 nil) 是合法调用: 不报错、不回调、不分配。
 // 🔴 "零值是合法调用"这件事得钉住, 否则调用方会在每个调用点写一圈 nil 判断。
 func TestRe2Set_NilReq(t *testing.T) {
 	text := "abc 123 defg"
@@ -120,16 +121,15 @@ func TestRe2Set_NilReq(t *testing.T) {
 		name string
 		scan re2setScanFn
 	}{{"fll", fll.Scan}, {"rrl", rrl.Scan}, {"frel", frel.Scan}} {
-		if err := r.scan(text, nil); err != nil {
-			t.Fatalf("%s: Scan(body, nil) 不该报错: %v", r.name, err)
+		if err := r.scan(Re2Set_req_t{Body: text}); err != nil {
+			t.Fatalf("%s: 三个回调全 nil 不该报错: %v", r.name, err)
 		}
-		empty := &Re2Set_req_t{}
-		if err := r.scan(text, empty); err != nil {
-			t.Fatalf("%s: 两个回调都 nil 不该报错: %v", r.name, err)
+		if err := r.scan(Re2Set_req_t{}); err != nil {
+			t.Fatalf("%s: 连正文都没有不该报错: %v", r.name, err)
 		}
 		scan := r.scan
-		if n := testing.AllocsPerRun(20, func() { _ = scan(text, nil) }); n != 0 {
-			t.Errorf("%s: Scan(body, nil) 该是 0 笔分配, 实得 %.1f", r.name, n)
+		if n := testing.AllocsPerRun(20, func() { _ = scan(Re2Set_req_t{Body: text}) }); n != 0 {
+			t.Errorf("%s: 零回调的 Scan 该是 0 笔分配, 实得 %.1f", r.name, n)
 		}
 	}
 }
@@ -149,8 +149,11 @@ func TestRe2Set_HitsOnlyNoSpan(t *testing.T) {
 	defer fll.Close()
 	for _, text := range []string{"abc 123", "nothing", "", "ZZZQQQ 999 zz"} {
 		var hits []int32
-		if err := fll.Scan(text, &Re2Set_req_t{
-			HitIndexResultFn: func(h []int32) bool { hits = append(hits, h...); return true },
+		var st Re2Set_stats_t
+		if err := fll.Scan(Re2Set_req_t{
+			Body:             text,
+			HitIndexResultFn: func(h []int32) { hits = append(hits, h...) },
+			StatsResultFn:    func(s Re2Set_stats_t) { st = s },
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -163,7 +166,7 @@ func TestRe2Set_HitsOnlyNoSpan(t *testing.T) {
 		if fmt.Sprint(hits) != fmt.Sprint(want) {
 			t.Fatalf("text=%q 命中位表 %v, 该是 %v", text, hits, want)
 		}
-		if st := fll.GetStats(); st.Emits != 0 {
+		if st.Emits != 0 {
 			t.Fatalf("text=%q 只要位的时候不该收口, 却交了 %d 处", text, st.Emits)
 		}
 	}

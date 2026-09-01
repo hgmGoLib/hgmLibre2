@@ -68,6 +68,7 @@ func TestRe2SetFllAstFuzzVsLongest(t *testing.T) {
 	defer ms.Close()
 	rng := rand.New(rand.NewSource(20260827))
 	nSpan := 0
+	var st Re2Set_stats_t
 	for round := 0; round < 300; round++ {
 		var sb strings.Builder
 		target := 60 + rng.Intn(400)
@@ -80,7 +81,8 @@ func TestRe2SetFllAstFuzzVsLongest(t *testing.T) {
 			sb.WriteRune(noiseR[rng.Intn(len(noiseR))])
 		}
 		text := sb.String()
-		got, _ := scanFlat(t, ms.Scan, text)
+		var got map[int32][]int32
+		got, _, st = scanFlat(t, ms.Scan, text)
 		for id := range msAstPats {
 			var flat []int32
 			for _, loc := range std[id].FindAllStringIndex(text, -1) {
@@ -96,7 +98,6 @@ func TestRe2SetFllAstFuzzVsLongest(t *testing.T) {
 	if nSpan < 1000 {
 		t.Fatalf("只对账了 %d 处区间 —— 语料没造对, 这是空转绿", nSpan)
 	}
-	st := ms.GetStats()
 	t.Logf("300 轮 · 对账 %d 处区间, 与 Longest() 逐字节相同 (末轮账: walks=%d cands=%d tries=%d)",
 		nSpan, st.Walks, st.Cands, st.Tries)
 }

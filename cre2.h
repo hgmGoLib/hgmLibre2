@@ -219,6 +219,11 @@ int cre2_set_match(const cre2_set *h, const char *text, int textlen, int *out, i
  * 走的是同一份 kManyMatch DFA 缓存, 但不传 matches 集合 —— RE2 的 Prog::SearchDFA 见 matches==NULL
  * 就把 want_earliest_match 打开, DFA 扫到【第一个】命中位置立刻收工, 不再把正文剩下的部分扫完。 */
 int cre2_set_match_any(const cre2_set *h, const char *text, int textlen);
+/* cre2_set_ref: 再要一份引用。cre2_set_free: 引用【减一】, 减到 0 才真拆。
+ * 建出来是 1, 所以只有一个持有者的调用方照旧 new/free 配对, 什么都不用改。
+ * 🔴 有它是因为策略换表的时候旧表得能【确定地】释放, 而那一刻可能还有别人攥着它
+ *    (一个 cre2_re2set, 或者一遍正在跑的扫描)。 */
+void cre2_set_ref(cre2_set *h);
 void cre2_set_free(cre2_set *h);
 
 /* ── 按对象归因的 DFA 计数 (per-Set / per-scan) ────────────────────────────────
@@ -404,41 +409,38 @@ cre2_set *cre2_set_new_ex(int64_t max_mem, int reversed);
 /* 这个 set 是不是反向编译的。 */
 int cre2_set_reversed(const cre2_set *h);
 
-/* ── 补端点用的【单条对象】: 一张表一份, 惰性建, 内部加锁, 所有扫描工作区共用 ──────
- * 🔴 千万别把这两样挪进扫描工作区: 工作区是每 goroutine 一份 (生产上按 GOMAXPROCS 池化
- *    4~64 份), 挂进去就是把最大那张表 9.6MB 的反向单条缓存乘以份数。
- * cre2_set_one_fwd    第 i 条自己那条【正向 · longest】RE2 对象 (锚定取最长右端;
- *                     它的反向程序同时也是 cre2_resolve_span_reverse_r 用的那份)。
- * cre2_set_one_viable 第 i 条自己那条【反向 · 只装这一条】的 set (cre2_set_viable_starts 用)。
- * 建不出来返回 NULL 并记住, 不会每遍重编。返回的指针有效期到 cre2_set_free。 */
-const cre2_re *cre2_set_one_fwd(cre2_set *h, int i);
-const cre2_set *cre2_set_one_viable(cre2_set *h, int i);
-/* 【已经被建出来】的那些反向单条 set 的账。不制造状态。 */
-void cre2_set_one_viable_stats(cre2_set *h, int *n, long long *states, long long *arenacap);
-
 /* ── re2set: fll / rrl / frel 三个算法的同一台机器 (实现在 cre2_re2set.cpp) ──────────
  * 一遍扫正文, 直接交出【不重叠的命中区间】(index, start, end)。三个口径只差"分量/游程里
  * 从哪一端起算 + 上界往哪压", 底座 (正向 kManyMatch DFA · 存活位切分量 · 游程留 native ·
  * 反向锚定回推 · 正向锚定验证) 是同一套。语义见 cre2_re2set.cpp 头注, Go 门面在 re2set_*.go。
  *
- *   cre2_re2set *s = cre2_re2set_new(set, CRE2_RE2SET_fll, minlen, maxlen, n);
- *   if (cre2_re2set_error(s, &bad)) { ... }
- *   cre2_re2set_begin(s, textlen, existonly);
+ * ── 两层, 分得死死的 ────────────────────────────────────────────────────────
+ *   cre2_re2set       【进程级】· new 之后只读 · 可以【并发】开扫描 · 单条补端点缓存挂这里
+ *   cre2_re2set_scan  【一遍扫描一份】· 一遍完了就 free · 一个字节都不留给下一遍
+ *
+ *   cre2_re2set *o = cre2_re2set_new(set, CRE2_RE2SET_fll, minlen, maxlen, n);
+ *   if (cre2_re2set_error(o, &bad)) { ... }          // 建策略的时候一次
+ *   ...
+ *   cre2_re2set_scan *s = cre2_re2set_scan_new(o, textlen, existonly);   // 每篇正文一次
  *   cre2_re2set_result out[1024];
  *   for (;;) {
  *       int more = 0;
- *       int k = cre2_re2set_step(s, text, textlen, out, 1024, &more);
- *       if (k < 0) { ... }
+ *       int k = cre2_re2set_scan_step(s, text, textlen, out, 1024, &more);
+ *       if (k < 0) { ... cre2_re2set_scan_error(s, &bad) ... }
  *       if (!more) break;
  *   }
- *   cre2_re2set_free(s);            // 工作区可以反复 begin, 不必每篇正文重开
+ *   cre2_re2set_scan_free(s);
+ *   ...
+ *   cre2_re2set_free(o);                              // 换策略的时候一次
  *
- * 🔴 工作区【借】set, 不持有它: set 必须活得比工作区久 (Go 侧靠对象里存一份引用保住)。 */
+ * 🔴 两个 free 都是【引用减一】, 减到 0 才真拆: 手上还在跑的 scan 各攥着 o 一份, o 攥着
+ *    set 一份。所以换策略时 free 掉旧的尽管放手, 最后一个走的人关灯。 */
 #define CRE2_RE2SET_fll 0  /* 第一趟正向 · leftmost-longest      (正向 set) */
 #define CRE2_RE2SET_rrl 1  /* 第一趟反向 · rightmost-longest     (反向 set) */
 #define CRE2_RE2SET_frel 2 /* 第一趟正向 · rightmost-END-longest (正向 set) */
 
 typedef struct cre2_re2set cre2_re2set;
+typedef struct cre2_re2set_scan cre2_re2set_scan;
 
 /* 一处命中: text[start,end) 是第 index 条 pattern 的一个真匹配。
  * Go 那侧的 Re2Set_startEnd_t 与它同布局, 两边各有一条编译期断言钉住。 */
@@ -449,36 +451,49 @@ typedef struct cre2_re2set_result {
 } cre2_re2set_result;
 
 /* minlen/maxlen 是每条 pattern 的匹配字节长度区间 (Go 侧 regexp/syntax 算好传下来;
- * maxlen < 0 = 没上限)。恒返回句柄 (除非 OOM), 建没建成看 cre2_re2set_error。 */
+ * maxlen < 0 = 没上限)。恒返回句柄 (除非 OOM), 建没建成看 cre2_re2set_error。
+ * 建成功时【顺带把整表的 kManyMatch DFA 建出来】—— 那是建策略该付的钱, 不留给第一篇正文。
+ * 内部对 set 加一份引用, 所以 o 活着 set 就活着, 调用方不必再替它保命。 */
 cre2_re2set *cre2_re2set_new(cre2_set *set, int mode, const int32_t *minlen,
                              const int32_t *maxlen, int n);
-void cre2_re2set_free(cre2_re2set *s);
-const char *cre2_re2set_error(const cre2_re2set *s, int *badidx);
+/* 引用减一 (见上面那段红字)。可以对同一个句柄调多次 —— 每次配一份引用。 */
+void cre2_re2set_free(cre2_re2set *o);
+/* 【建对象】时的错误 (建成了返回 NULL)。这一遍扫描的错误看 cre2_re2set_scan_error。 */
+const char *cre2_re2set_error(const cre2_re2set *o, int *badidx);
+/* 挂在这个 o 上、【已经被建出来】的那些反向单条 set 的账 (条数 · 状态数 · 状态区字节)。
+ * 不制造状态 —— 量具不制造被量的东西。这是 fll 补起点那条路的【常驻】开销。 */
+void cre2_re2set_one_viable_stats(cre2_re2set *o, int *n, long long *states,
+                                  long long *arenacap);
 
 /* 开始扫一篇正文 (只绑长度; 正文指针每次 step 传, 与 spanscan 同一套规矩)。
  * existonly: n 个字节, 非零 = 这一条【只要位, 不要区间】—— 不补端点, 也不进 step 的输出。
- * 可为 NULL (= 全都要区间)。🔴 它是【每遍】的参数, 不是建对象时定死的属性。 1=成功 0=失败。 */
-int cre2_re2set_begin(cre2_re2set *s, int textlen, const unsigned char *existonly);
+ * 可为 NULL (= 全都要区间)。🔴 它是【每遍】的参数, 不是建对象时定死的属性。
+ * 恒返回句柄 (除非 OOM), 开没开成看 cre2_re2set_scan_error。
+ * 🔴 同一个 o 上可以【并发】开多份 scan 同时跑: 整表 DFA 和单条对象那边各自有锁, 而
+ *    这一遍的暂存全在 scan 自己身上, 两遍之间一个字节都不共享。 */
+cre2_re2set_scan *cre2_re2set_scan_new(cre2_re2set *o, int textlen,
+                                       const unsigned char *existonly);
+void cre2_re2set_scan_free(cre2_re2set_scan *s);
+const char *cre2_re2set_scan_error(const cre2_re2set_scan *s, int *badidx);
 
-/* 取一批命中区间。返回本批条数 (>=0); <0 = 出错 (整遍作废, 原因看 cre2_re2set_error)。
+/* 取一批命中区间。返回本批条数 (>=0); <0 = 出错 (整遍作废, 原因看 cre2_re2set_scan_error)。
  * *more: 1 = 还没完, 取走这批再 step; 0 = 完了。cap 必须 >= pattern 条数。 */
-int cre2_re2set_step(cre2_re2set *s, const char *text, int textlen,
-                     cre2_re2set_result *out, int cap, int *more);
+int cre2_re2set_scan_step(cre2_re2set_scan *s, const char *text, int textlen,
+                          cre2_re2set_result *out, int cap, int *more);
 
-/* n 个字节, 第 i 个非零 = 第 i 条这一遍命中过 (含 existonly 的那些条)。每次 begin 清零。
+/* n 个字节, 第 i 个非零 = 第 i 条这一遍命中过 (含 existonly 的那些条)。
  * 🔴 扫完 (step 报 more==0) 之后才稳定 —— 存活位要走到底才定得下来。 */
-const unsigned char *cre2_re2set_hits(const cre2_re2set *s);
+const unsigned char *cre2_re2set_scan_hits(const cre2_re2set_scan *s);
 
 /* 这一遍的账 (每个出参可为 NULL):
  *   walks    锚定回推了几趟 · cands 收到几个候选起点 (只有 fll 会涨) · tries 锚定验了几次 ·
  *   emits    交出去几处区间;
  *   nseg     存活位切出来几个分量 (fll/frel; rrl 不切分量恒 0) ——
  *            tries/nseg 就是"平均每个分量里有几处不重叠的匹配", 越接近 1 说明切得越干净;
- *   usedpeak native 游程里【真正装着结束位置】的字节峰值 · heappeak 真实堆高水位 ·
- *   poolbytes 回收池里躺着的字节 (跨 scan 保留)。 */
-void cre2_re2set_stats(const cre2_re2set *s, long long *walks, long long *cands,
-                       long long *tries, long long *emits, long long *nseg,
-                       long long *usedpeak, long long *heappeak, long long *poolbytes);
+ *   usedpeak native 游程里【真正装着结束位置】的字节峰值 · heappeak 真实堆高水位。 */
+void cre2_re2set_scan_stats(const cre2_re2set_scan *s, long long *walks, long long *cands,
+                            long long *tries, long long *emits, long long *nseg,
+                            long long *usedpeak, long long *heappeak);
 
 /* ── DFA 状态缓存计数 (可观测 · 进程级) ────────────────────────────────────────
  * RE2 的 DFA 状态缓存满了不是 LRU 淘汰, 而是【整表清空】重建 (DFA::ResetCache):

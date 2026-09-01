@@ -39,6 +39,7 @@ import (
 	"errors"
 	"runtime"
 	"strconv"
+	"sync"
 	"unsafe"
 )
 
@@ -57,18 +58,22 @@ const (
 	_ = uint(C.sizeof_cre2_re2set_result - unsafe.Sizeof(Re2Set_startEnd_t{}))
 )
 
-// Re2Set_req_t 是【一遍扫描】要什么。三个类型的 Scan 都吃它。
+// Re2Set_req_t 是【一遍扫描】要什么。三个类型的 Scan 都吃它, 【按值传】。
 //
-// 传 nil 合法 = "什么都不要": 两个回调都没有 ⟹ 这一遍没有任何可观测产物, 直接返回 nil,
+// 零值合法 = "什么都不要": 三个回调一个都没有 ⟹ 这一遍没有任何可观测产物, 直接返回 nil,
 // 正文一遍都不扫、一个字节都不分配。
 type Re2Set_req_t struct {
+	// Body 是这一遍要扫的正文。
+	Body string
+
 	// Allocer 是本遍要用的缓冲。nil = 现建一个用完就扔。
 	//
 	// 🔴 默认档【故意不是 sync.Pool】: 池的存期是一轮 GC, 而这条路真正的用法是"下一个
 	//    ≥4KB 的正文", 中间必然隔着若干轮 GC ⟹ 池里一次都命中不了, 每遍照样现开一个,
-	//    等于把这条路上最大的一笔开销藏进默认档 (asc 那边实测过 7.30MB, 见
-	//    asc/engine/sd_body_gate_span.go 头注"工作区不留池子")。要复用就自己持有一个
-	//    alloc, 显式 —— 库这层不替调用方决定缓冲活多久。
+	//    等于把这条路上最大的一笔开销藏进默认档 (asc 那边实测过 7.30MB)。要复用就自己
+	//    持有一个 alloc, 显式 —— 库这层不替调用方决定缓冲活多久。
+	// 🔴 它【不是】并发安全的: 一个 goroutine 一个。同一个 Re2Set_*_t 上可以并发 Scan,
+	//    但每条腿得带自己的 alloc。
 	Allocer *Re2Set_alloc_t
 
 	// ExistOnlyIndexList 是【纯成本开关】: 这几条只报"命中没命中", 不花钱补端点
@@ -86,10 +91,14 @@ type Re2Set_req_t struct {
 	StartEndResultFn func(resultList []Re2Set_startEnd_t) bool
 
 	// HitIndexResultFn 收【全表】命中位 (升序 · 不重复 · 含 ExistOnly 的那几条), 扫完
-	// 一次性交, 只调一次 (一条都没命中就不调)。返回值当前没有用处, 留着与上面那个同形。
+	// 一次性交, 只调一次 (一条都没命中就不调)。
 	// 🔴 为什么是扫完才交: 存活位只有扫完才稳定。一个在扫描中途交、一个在收尾交, 两路的
 	//    时序关系就是确定的, 不存在"谁先谁后靠运气"这种测不出来的东西。
-	HitIndexResultFn func(hitList []int32) bool
+	HitIndexResultFn func(hitList []int32)
+
+	// StatsResultFn 收这一遍的账 (见 Re2Set_stats_t), 扫完交, 只调一次。
+	// 🔴 配了才算才交 —— 账是给调参用的, 生产路径上不配它, 一个 cgo 调用都不多花。
+	StatsResultFn func(stats Re2Set_stats_t)
 }
 
 // Re2Set_alloc_t 是接口处的【纯缓冲】—— 里面只有 Go 侧那几块数组, 一个 native 句柄都没有。
@@ -123,14 +132,20 @@ func NewRe2Set_allocBatch(batch int) *Re2Set_alloc_t { return &Re2Set_alloc_t{ba
 const re2SetBatch = 1024
 
 // re2setScan 是三个 Scan 的同一份实现 —— 三者在 Go 这一侧【只差一个 mode】, 差别全在 C++。
+//
+// mu/hp 是调用方那个类型里护着 native 句柄的那两样: 读锁下把这一遍的 scan 句柄开出来就放手
+// (C 那侧在 scan 上给对象记了一份引用), 之后整遍扫描不再碰 hp —— 所以并发 Scan 之间只在
+// 开头那一瞬共享一把读锁, 而 Close 拿写锁, 不会把正在跑的那几遍拆掉。
 // name 只用来拼错误文案。
-func re2setScan(h *C.cre2_re2set, n int, name string, body string, req *Re2Set_req_t) error {
-	if h == nil {
-		return errors.New("re2native: " + name + " 已经 Close")
-	}
-	if req == nil || (req.StartEndResultFn == nil && req.HitIndexResultFn == nil) {
+//
+// 🔴 req 一路【按值】传, 不取地址: 它里面的 Allocer 会流进 cgo 调用参数, 而 cgo 参数在逃逸
+//    分析眼里一律逃逸 ⟹ 一旦有人写了 &req, 这个 req 就被判定逃逸, 每次 Scan 白搭一笔堆
+//    分配 (TestRe2SetFllViableNoAlloc 就是钉这一笔的)。按值传只是 72 字节的栈上拷贝。
+func re2setScan(mu *sync.RWMutex, hp **C.cre2_re2set, n int, name string, req Re2Set_req_t) error {
+	if req.StartEndResultFn == nil && req.HitIndexResultFn == nil && req.StatsResultFn == nil {
 		return nil // 什么都不要 ⟹ 没有可观测产物, 一遍都不扫
 	}
+	body := req.Body
 	if len(body) > maxCInt {
 		return errors.New("re2native: " + name + " 正文太大 (>2GiB)")
 	}
@@ -160,8 +175,26 @@ func re2setScan(h *C.cre2_re2set, n int, name string, body string, req *Re2Set_r
 		}
 		ep = (*C.uchar)(unsafe.Pointer(&a.existOnly[0]))
 	}
-	if C.cre2_re2set_begin(h, C.int(len(body)), ep) == 0 {
-		return re2setErr(h, name, "begin 失败")
+	// ── 开这一遍的 native 暂存 ──────────────────────────────────────────────
+	mu.RLock()
+	h := *hp
+	var sh *C.cre2_re2set_scan
+	if h != nil {
+		sh = C.cre2_re2set_scan_new(h, C.int(len(body)), ep)
+	}
+	mu.RUnlock()
+	runtime.KeepAlive(a)
+	if h == nil {
+		return errors.New("re2native: " + name + " 已经 Close")
+	}
+	if sh == nil {
+		return errors.New("re2native: " + name + " 开不出这一遍的扫描暂存 (OOM)")
+	}
+	defer C.cre2_re2set_scan_free(sh)
+	// 🔴 先用 badidx=NULL 问一声有没有错, 有才走 re2setErr —— re2setErr 里那个 &bad 是要
+	//    交给 C 的, 逃逸分析会把它搬上堆, 每遍一笔。错误路上无所谓, 成功路上不能有。
+	if C.cre2_re2set_scan_error(sh, nil) != nil {
+		return re2setErr(sh, name, "开这一遍失败")
 	}
 	// ── step 循环 ───────────────────────────────────────────────────────────
 	// 不要区间的时候也得把正文走完 (命中表要扫到底才稳定), 只是 native 一处都不会写,
@@ -181,11 +214,11 @@ func re2setScan(h *C.cre2_re2set, n int, name string, body string, req *Re2Set_r
 	tn := C.int(len(body))
 	pout := (*C.cre2_re2set_result)(unsafe.Pointer(&buf[0]))
 	for {
-		k := int(C.cre2_re2set_step(h, tp, tn, pout, C.int(want), &a.cmore))
+		k := int(C.cre2_re2set_scan_step(sh, tp, tn, pout, C.int(want), &a.cmore))
 		runtime.KeepAlive(body)
 		runtime.KeepAlive(a)
 		if k < 0 {
-			return re2setErr(h, name, "扫描失败")
+			return re2setErr(sh, name, "扫描失败")
 		}
 		if k > 0 && wantSpan {
 			if !req.StartEndResultFn(buf[:k]) {
@@ -198,7 +231,7 @@ func re2setScan(h *C.cre2_re2set, n int, name string, body string, req *Re2Set_r
 	}
 	// ── 全表命中位, 扫完一次性交 ────────────────────────────────────────────
 	if req.HitIndexResultFn != nil && n > 0 {
-		p := C.cre2_re2set_hits(h)
+		p := C.cre2_re2set_scan_hits(sh)
 		if p != nil {
 			hits := unsafe.Slice((*byte)(unsafe.Pointer(p)), n)
 			a.hitIndex = a.hitIndex[:0]
@@ -212,13 +245,18 @@ func re2setScan(h *C.cre2_re2set, n int, name string, body string, req *Re2Set_r
 			}
 		}
 	}
+	// ── 这一遍的账, 配了才算 ────────────────────────────────────────────────
+	if req.StatsResultFn != nil {
+		req.StatsResultFn(re2setStats(sh))
+	}
 	return nil
 }
 
-// re2setErr 把 C 侧那句话取出来 (取不到就用 fallback)。
-func re2setErr(h *C.cre2_re2set, name, fallback string) error {
+// re2setErr 把 C 侧那句话取出来 (取不到就用 fallback)。只走错误路 —— 里面那个 &bad 交给 C
+// 之后会被搬上堆, 成功路上一笔都不能有 (见调用处的红字)。
+func re2setErr(sh *C.cre2_re2set_scan, name, fallback string) error {
 	var bad C.int
-	if e := C.cre2_re2set_error(h, &bad); e != nil {
+	if e := C.cre2_re2set_scan_error(sh, &bad); e != nil {
 		msg := C.GoString(e)
 		if int(bad) >= 0 {
 			msg += " (第 " + strconv.Itoa(int(bad)) + " 条 pattern)"
@@ -228,7 +266,7 @@ func re2setErr(h *C.cre2_re2set, name, fallback string) error {
 	return errors.New("re2native: " + name + " " + fallback)
 }
 
-// Re2Set_stats_t 是最近一次 Scan 的账。加它是因为变长条的钱全在"验了几个假候选"上,
+// Re2Set_stats_t 是【这一遍】Scan 的账 (走 Re2Set_req_t.StatsResultFn 交出来)。加它是因为变长条的钱全在"验了几个假候选"上,
 // 而那一笔从外面一个字都看不见 —— 没有这几个数就没法判断某张表的形状适不适合这条路。
 //
 // 🔴 Walks/Cands/Tries 【只统计变长条】: 定长条走一句加减法, 一次锚定都不做, 不进这三个
@@ -241,21 +279,20 @@ type Re2Set_stats_t struct {
 	Emits int64 // 交出去几处区间 (含定长条)
 
 	// 下面这几个是【存活位切分量】那一档的账, 只有 fll/frel 有 (rrl 不切分量, 恒 0)。
-	NSeg      int64 // 切出来几个分量。Tries/NSeg = "平均每个分量里有几处不重叠的匹配",
-	//               越接近 1 说明存活位把分量切得越干净, 一个分量一趟锚定就结完。
-	UsedPeak  int64 // native 游程里【真正装着结束位置】的字节峰值 (8 × 游程条数)
-	HeapPeak  int64 // 这一遍为游程数组真实持有的堆字节高水位 (含回收池)
-	PoolBytes int64 // 当前躺在回收池里等着被再发出去的字节 (跨 Scan 保留)
+	NSeg int64 // 切出来几个分量。Tries/NSeg = "平均每个分量里有几处不重叠的匹配",
+	//          越接近 1 说明存活位把分量切得越干净, 一个分量一趟锚定就结完。
+	UsedPeak int64 // native 游程里【真正装着结束位置】的字节峰值 (8 × 游程条数)
+	HeapPeak int64 // 这一遍为游程数组真实持有的堆字节高水位 (含回收池)
 }
 
-// re2setStats 是三个 GetStats 的同一份实现。
-func re2setStats(h *C.cre2_re2set) Re2Set_stats_t {
+// re2setStats 把这一遍的账从 native 取出来。
+func re2setStats(sh *C.cre2_re2set_scan) Re2Set_stats_t {
 	var st Re2Set_stats_t
-	if h == nil {
+	if sh == nil {
 		return st
 	}
-	var w, c, t, e, ns, up, hp, pb C.longlong
-	C.cre2_re2set_stats(h, &w, &c, &t, &e, &ns, &up, &hp, &pb)
+	var w, c, t, e, ns, up, hp C.longlong
+	C.cre2_re2set_scan_stats(sh, &w, &c, &t, &e, &ns, &up, &hp)
 	st.Walks = int64(w)
 	st.Cands = int64(c)
 	st.Tries = int64(t)
@@ -263,13 +300,12 @@ func re2setStats(h *C.cre2_re2set) Re2Set_stats_t {
 	st.NSeg = int64(ns)
 	st.UsedPeak = int64(up)
 	st.HeapPeak = int64(hp)
-	st.PoolBytes = int64(pb)
 	return st
 }
 
 // re2setNew 是三个构造函数的同一份实现: 把长度区间表摊成两个 int32 数组交给 C++。
-// 🔴 工作区【借】set 的 native 句柄, 所以调用方那三个类型必须各自存一份 Go 侧的 set 引用
-//    把它保住 —— 不存的话 finalizer 会在工作区还活着的时候把 set 释放掉。
+// 🔴 C 那侧自己给 set 记了一份引用 (cre2_set_ref), 所以调用方【不必】再存一份 Go 侧的
+//    set 引用替它保命 —— 表活得比这个对象久这件事由引用计数保证, 不由 GC 的时间表保证。
 func re2setNew(setH *C.cre2_set, mode C.int, lens []patLen_t, name string) (*C.cre2_re2set, error) {
 	n := len(lens)
 	minl := make([]C.int32_t, n+1) // +1: n==0 时也有个合法地址可以取

@@ -21,22 +21,24 @@ import (
 // msPerfRun 跑一遍并返回交出去的区间数 (拿它当 sink, 免得被优化掉)。
 func msPerfRun(tb testing.TB, ms *msPerfWork, text string) int {
 	ms.n = 0
-	if err := ms.s.Scan(text, ms.req); err != nil {
+	ms.req.Body = text
+	if err := ms.s.Scan(ms.req); err != nil {
 		tb.Fatal(err)
 	}
 	return ms.n
 }
 
-// msPerfWork 是工作区 + 那一份建一次留着的请求 (每遍现造一个 req 就是每遍一笔分配)。
+// msPerfWork 是策略对象 + 那一份建一次留着的请求 (每遍现造一个 req 就是每遍一笔分配)。
 type msPerfWork struct {
 	s   *Re2Set_fll_t
-	req *Re2Set_req_t
+	req Re2Set_req_t
+	st  Re2Set_stats_t
 	n   int
 }
 
 func (w *msPerfWork) Close() { w.s.Close() }
 
-// msPerfOpen 开一个工作区并热身一遍 —— 补端点的单条对象都是惰性建的, 不热身的话
+// msPerfOpen 开一个策略对象并热身一遍 —— 补端点的单条对象都是惰性建的, 不热身的话
 // 第一次计时会把编译价算进去。
 func msPerfOpen(tb testing.TB, set *RegexpSet, warm string) *msPerfWork {
 	s, err := set.NewRe2Set_fll()
@@ -44,9 +46,10 @@ func msPerfOpen(tb testing.TB, set *RegexpSet, warm string) *msPerfWork {
 		tb.Fatal(err)
 	}
 	w := &msPerfWork{s: s}
-	w.req = &Re2Set_req_t{
+	w.req = Re2Set_req_t{
 		Allocer:          NewRe2Set_alloc(),
 		StartEndResultFn: func(rs []Re2Set_startEnd_t) bool { w.n += len(rs); return true },
+		StatsResultFn:    func(st Re2Set_stats_t) { w.st = st },
 	}
 	msPerfRun(tb, w, warm)
 	return w
@@ -91,18 +94,21 @@ func TestRe2SetFllPerfTable(t *testing.T) {
 	set, _, _ := benchObjects(t)
 	fmt.Printf("\n── Re2Set_fll_t · benchPats(%d 条) × 64KiB 语料 · 取 7 轮最小值 ──\n", len(benchPats))
 	fmt.Printf("%-6s %10s %8s   %s\n", "语料", "墙钟", "试/看", "账")
+	// 🔴 三档语料共用【同一个】策略对象 —— 单条对象缓存挂在它身上, 每档新开一个的话
+	//    最后那行常驻只报得出最后一档的量。
+	ms := msPerfOpen(t, set, benchCorpus(benchCorpusKinds[0]))
+	defer ms.Close()
 	for _, kind := range benchCorpusKinds {
 		text := benchCorpus(kind)
-		ms := msPerfOpen(t, set, text)
+		msPerfRun(t, ms, text) // 热身这一档语料
 		var n int
 		d := msPerfTime(7, func() { n = msPerfRun(t, ms, text) })
-		st := ms.s.GetStats()
+		st := ms.st
 		fmt.Printf("%-6s %10s %8.2f   walks=%d cands=%d tries=%d emits=%d (交出 %d 处)\n",
 			kind, d, float64(st.Tries)/float64(max1(st.Walks)),
 			st.Walks, st.Cands, st.Tries, st.Emits, n)
-		ms.Close()
 	}
-	nVp, sVp, aVp := set.GetViableOneStats()
+	nVp, sVp, aVp := ms.s.GetViableOneStats()
 	fmt.Printf("常驻: 反向单条 set %d 条 / %d 状态 / %.2fMB —— 这是这条路相对老的路 B 净增的那一笔\n\n",
 		nVp, sVp, float64(aVp)/(1<<20))
 }
@@ -137,7 +143,7 @@ func TestRe2SetFllPerfHard(t *testing.T) {
 		}
 		ms := msPerfOpen(t, set, text)
 		d := msPerfTime(3, func() { msPerfRun(t, ms, text) })
-		st := ms.s.GetStats()
+		st := ms.st
 		fmt.Printf("%-22s %10s %8.2f   walks=%d cands=%d tries=%d emits=%d\n",
 			hp.name, d, float64(st.Tries)/float64(max1(st.Walks)),
 			st.Walks, st.Cands, st.Tries, st.Emits)

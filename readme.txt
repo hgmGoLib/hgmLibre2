@@ -309,35 +309,54 @@
          而且回答的会变成另一个问题。
       代价 = 这处命中能往回够多远 (可行前缀集合空了机器就死), 与正文长度无关 —— 与 ResolveSpan
       同一个量级、同一个道理。上面那层 Re2Set_fll_t 就是靠它换来严格 leftmost-longest。
-    - RegexpSet.NewRe2Set_fll + (*Re2Set_fll_t).Scan / GetPatternLen / GetStats / Close
-      + Re2Set_req_t / Re2Set_alloc_t / Re2Set_startEnd_t (三个算法共用, 见 re2set_common.go)
-      + RegexpSet.GetPatternLenRange / GetViableOneStats:
+    - RegexpSet.NewRe2Set_fll + (*Re2Set_fll_t).Scan / GetPatternLen / GetViableOneStats / Close
+      + Re2Set_req_t / Re2Set_alloc_t / Re2Set_startEnd_t / Re2Set_stats_t (三个算法共用,
+      见 re2set_common.go) + RegexpSet.GetPatternLenRange:
       【一遍扫, 直接给不重复的命中区间】—— 把上面两件 (游程扫 + 锚定解析) 拼成调用方真正要的
       形状, 顺带把"同一处命中报出一串右端"那种重复在库里就解决掉。替的是这套两段式:
       先 Set.Match 扫一遍拿"哪几条命中", 再为了知道【在哪】把命中的每条各对整篇正文跑一遍
       FindAllStringIndex —— 命中 k 条就是 1+k 遍全文。
-        ms, _ := set.NewRe2Set_fll()   // 热路径上建一次留着; 不是并发安全的
-        defer ms.Close()
-        req := &Re2Set_req_t{               // req 和 alloc 都【建一次留着】: 现造一个就是一笔分配
-            Allocer:            NewRe2Set_alloc(),
+        ms, _ := set.NewRe2Set_fll()   // 【进程级】: 一个策略一份, 建一次留着 (见下)
+        …
+        err := ms.Scan(Re2Set_req_t{        // ← 唯一一遍全文。req 按值传, 不取地址
+            Body:               body,
+            Allocer:            alloc,                  // 一个 goroutine 一个, 自己持有复用
             ExistOnlyIndexList: []int32{3, 7},          // 这几条只要位, 别花钱补端点 (见下)
             StartEndResultFn: func(rs []Re2Set_startEnd_t) bool {   // 结果【一批一批】来
                 for _, r := range rs { … r.Index / r.Start / r.End … } // body[Start:End] 是第 Index 条的真匹配
                 return true                                          // 返 false = 提前收工 (不算错)
             },
-            HitIndexResultFn: func(hit []int32) bool {  // 扫完【一次性】交全表命中位 (升序)
+            HitIndexResultFn: func(hit []int32) {       // 扫完【一次性】交全表命中位 (升序)
                 … // 等价于 Set.Match 那张表, 含 ExistOnly 的那几条
-                return true
             },
-        }
-        err := ms.Scan(body, req)           // ← 唯一一遍全文
-        // 🔴 req 传 nil 合法 = "什么都不要": 两个回调都没有 ⟹ 一遍都不扫, 一个字节都不分配。
+            StatsResultFn: func(st Re2Set_stats_t) { … }, // 这一遍的账; 配了才算才交 (调参用)
+        })
+        // 🔴 零值 req 合法 = "什么都不要": 三个回调都没有 ⟹ 一遍都不扫, 一个字节都不分配。
         // 🔴 【要么全给, 要么整遍不算数】: err != nil 就是这一遍作废, 整篇走老路 FindAll。
         //    没有"这几条没给全, 你自己补"的中间态 —— 原委见下面那一节。
         // 🔴 交给回调的切片是 Allocer 里那块缓冲本身, 下一批原地覆写; 各条 pattern 的结果
         //    【交错】着来 (同一条内部按 Start 升序), 想按条归拢是调用方一句 append 的事
       🔴 库【故意不给】"一次性物化成数组"的接口 (AppendAllMatches 2026-08-27 删了)。要数组的
          自己在回调里 append 一行 —— 那一行写在调用方家里, 谁写谁看得见代价 (内存 ∝ 命中数)。
+
+      ── 两层, 分得死死的 (2026-09-01) ─────────────────────────────────────────
+        RegexpSet       整表那一份 kManyMatch DFA                            进程级
+        Re2Set_*_t      策略对象: set 引用 + mode + 长度区间表 +【补端点用的
+                        单条正向/反向对象缓存】(惰性建, 最大那张生产表 9.6MB)  进程级 · 并发安全
+        Scan(req)       这一遍的全部暂存 (native 的 spanscan 工作区 · 游程缓冲 ·
+                        候选缓冲 · 游标) 由它自己现开现关, 对调用方不可见      每次调用一份
+        req.Allocer     Go 侧的输入输出缓冲                                  调用方持有 · 一腿一个
+      🔴 【别每遍新建 Re2Set_*_t】—— 那是每篇正文把那 9.6MB 单条缓存重编一遍再扔掉。
+      🔴 同一个 Re2Set_*_t 上可以【并发 Scan】(整表 DFA 与单条对象缓存各自有锁, 两遍之间
+         一个字节都不共享)。但一条腿要带自己的 Allocer —— alloc 不是并发安全的。
+      🔴 每遍那份 native 暂存走 malloc/free, 【不池化】: 二十来次分配, 最大一块几 KB, 离
+         glibc 那道 128KB 的 mmap 门槛远得很, tcache/smallbin 直接就是 sync.Pool 的效果,
+         而且不欠 GC。2026-08~09 在调用方那侧试过"带上限的空闲链"和"每遍现开现关"两版,
+         前者池的是暂存 (只涨不缩, 常驻按并发份数乘), 后者扔的是缓存 —— 拆成两层之后
+         两难就没了。
+      🔴 Close 是【引用减一】(native 那侧计数), 手上还在跑的 Scan 各攥着一份, 最后一个走的
+         人才真拆。所以换策略的时候尽管 Close 旧的。忘了 Close 也不漏: 有 finalizer 兜底,
+         只是释放时机交给了 GC。Close 幂等, 之后再 Scan 返回 err。
 
       ── ExistOnlyIndexList: 纯成本开关 ────────────────────────────────────────
       名单上的那几条只报"命中没命中" (照样进 HitIndexResultFn 的全表命中位), 但一处区间都
@@ -359,7 +378,9 @@
       ── Re2Set_alloc_t: 接口处的纯缓冲 ────────────────────────────────────────
       里面只有 Go 侧那几块数组 (区间批缓冲 · 命中位缓冲 · ExistOnly 位图), 一个 native 句柄
       都没有 ⟹ 同一个 alloc 可以【跨对象、跨表】自由传, 不存在"这个 alloc 不是这张表的"
-      这种运行期错误。native 侧的工作区 (扫描挂起点 · 游程池 · 候选缓冲) 归 Re2Set_*_t 自己。
+      这种运行期错误。native 侧那份每遍的暂存 (扫描挂起点 · 游程池 · 候选缓冲) 归 Scan 自己
+      现开现关, 调用方看不见。
+      🔴 alloc【不是】并发安全的: 一个 goroutine 一个。
       🔴 Allocer 传 nil 的默认档 = 【现建一个用完就扔】, 【不是】 sync.Pool: 池的存期是一轮
          GC, 而这条路真正的用法是"下一个 ≥4KB 的正文", 中间必然隔着若干轮 GC ⟹ 一次都命中
          不了, 等于把这条路上最大的一笔开销藏进默认档。要复用就自己持有一个, 显式。
@@ -391,13 +412,14 @@
                              ② 一个都没验过 ⟹ [游标,e) 里根本没有起点 (①的逆否) ⟹ 游标直接
                                 推到 e。"全军覆没"不是放弃, 是【证明了这一段是空的】。
                            代价: 各轮的回看窗口两两【不交】且递增, 反向那一趟累加封顶 = 多扫
-                           一遍正文; 真正多出来的是"验了几个假候选", 用 GetStats() 量 (见下)。
+                           一遍正文; 真正多出来的是"验了几个假候选", 用 StatsResultFn 量 (见下)。
                            🔴 不需要 maxL: 回看的下界是反向那一趟【自己走到死的地方】,
                               动态的。老的默认档靠 maxL 抬下界, 没上界就塌回游标白扫一段。
         补不出来的         Scan 整遍报错, 请调用方整篇照老路 FindAll —— 宁可退回去也不给
                            "像是对的"答案。
 
-      ── 🔴 GetStats(): "试/看"是这条路唯一要盯的那个数 ────────────────────────────
+      ── 🔴 Re2Set_stats_t: "试/看"是这条路唯一要盯的那个数 ───────────────────────
+        走 req.StatsResultFn 交, 【配了才算才交】—— 生产路径上不配它, 一个 cgo 调用都不多花。
         Walks 回看了几趟 (= 处理了几个没被游标盖住的右端) · Cands 收到几个候选起点 ·
         Tries 正向锚定验了几次 · Emits 吐了几处区间。
         试/看 = Tries/Walks = 每次回看验了几次。1.00 = 升序第一个候选就是答案, 一次假候选
@@ -418,7 +440,7 @@
       各条路要几趟:
         定长      0 趟 (一句减法)
         变长      1 趟反向 (GetViableStarts, 一条 pattern 自己的反向 set) + N 趟正向单条 longest
-                  锚定 (FindStringIndexAtWithin), N = GetStats().Tries/Walks, 真表上恒为 1
+                  锚定 (FindStringIndexAtWithin), N = Tries/Walks, 真表上恒为 1
         反向那侧  1 趟  正向单条 longest 锚定 (FindStringIndexAtWithin, bound 掐在游标上)
 
       ── 老账: 2026-08-28 之前这里有三条路 ────────────────────────────────────
@@ -550,7 +572,7 @@
         按正文长度: 真语料 8KB 以下打平 (1.0×) · 32KB 3.1× · 512KB 6.1× · 2MB 14×
         最坏 (每 38 字节一处命中的合成串): 0.94×, 即 6% 慢 —— 每处命中要两次 cgo 往返,
         正文短到几乎全是命中时这笔固定开销赢不了。真 base64 碎片不长这样 (打平)。
-    - RegexpSetReverse.NewRe2Set_rrl + (*Re2Set_rrl_t).Scan / GetPatternLen / GetStats / Close:
+    - RegexpSetReverse.NewRe2Set_rrl + (*Re2Set_rrl_t).Scan / GetPatternLen / Close:
       【Re2Set_rrl_t】—— 与上面那个是镜像, 从正文末尾往前一遍扫, 同样一批一批交出不重叠的
       命中区间。函数签名【同形】(同一个 Re2Set_req_t / Re2Set_alloc_t / Re2Set_startEnd_t),
       用法逐字相同 (换成 rs.NewRe2Set_rrl() 即可), 只有两处不一样:
@@ -603,7 +625,7 @@
       (?:ab)?[bc]{1,2} · (?:ab)*b{1,3}) —— 反向这一侧一处都不岔, 因为没有"猜"这一步。
       判据自身有一道自检: ab|b 撞 "aab" 两种口径必须给出不同答案, 否则整套对拍是空转。
 
-    - RegexpSet.NewRe2Set_frel + (*Re2Set_frel_t).Scan / GetPatternLen / GetStats / Close
+    - RegexpSet.NewRe2Set_frel + (*Re2Set_frel_t).Scan / GetPatternLen / Close
       (re2set_frel.go · cre2_re2set.cpp): 【一遍正着扫, 直接给不重叠的命中区间】,
       全部逻辑在 C++ 里, Go 侧只有一层薄壳。名字: f = first pass forward (第一趟正着扫),
       rel = 【最右终点最长】(rightmost-END-longest, 那个 e 就是"锚终点"的标记)。
@@ -611,10 +633,11 @@
          的口径, 挑的是【起点】最靠右, 不是一回事。
       函数签名与另外两个【同形】(同一个 Re2Set_req_t / Re2Set_alloc_t / Re2Set_startEnd_t):
         set, _ := NewRegexpSet([]string{`\d{3}-\d{2}-\d{4}`, `(?i)authorization`})
-        s, err := set.NewRe2Set_frel()
+        s, err := set.NewRe2Set_frel()   // 同样是进程级的策略对象, 建一次留着
         defer s.Close()
-        req := &Re2Set_req_t{
-            Allocer:            NewRe2Set_alloc(),
+        err = s.Scan(Re2Set_req_t{
+            Body:               body,
+            Allocer:            alloc,             // 一个 goroutine 一个, 自己持有复用
             ExistOnlyIndexList: []int32{1},        // 第 1 条只要"有没有", 不补端点
             StartEndResultFn: func(rs []Re2Set_startEnd_t) bool {
                 for _, r := range rs {
@@ -622,9 +645,8 @@
                 }
                 return true                          // 返 false = 提前停
             },
-            HitIndexResultFn: func(hit []int32) bool { … ; return true }, // 扫完一次性交全表命中位
-        }
-        err = s.Scan(body, req)
+            HitIndexResultFn: func(hit []int32) { … }, // 扫完一次性交全表命中位
+        })
       🔴 Re2Set_startEnd_t 与 C 的 cre2_re2set_result 是【同一个内存布局】(三个 int32, 无洞):
          Scan 把 Allocer 里那块缓冲的地址直接交给 C 写, 不做逐字段搬运。所以那三个字段不许加、
          不许换序、不许换类型 —— Go 侧两条 const 断言 + C++ 侧一条 static_assert 钉着。
@@ -645,7 +667,7 @@
                       挂进待取列表                                 同上, g2 档
         ③ 补起点      这一条 pattern 自己的【单条】对象, 反向锚定  cre2_re2set.cpp FrelCloseSeg
       ③ 走单条不走 set 是本库那条总规矩 (2026-08-27, 理由见上面 Re2Set_fll_t 那节)。
-      真表上 ②③ 的账: GetStats().Tries / GetStats().NSeg = 【每个分量问了几次反向锚定】,
+      真表上 ②③ 的账: Tries / NSeg = 【每个分量问了几次反向锚定】,
       10 条通用 pattern × 三档语料实测恒为 1.00 (一个分量一趟就结完); UsedPeak (native 侧
       游程峰值) 是 16~64 字节量级, 与正文长度无关。Go 侧稳态 0 allocs/op。
 

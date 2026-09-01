@@ -7,6 +7,7 @@
 #include "re2_re2.h"
 #include "re2_set.h"
 
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -14,30 +15,21 @@
 struct cre2_re; // 定义在 cre2.cpp
 
 struct cre2_set {
+	// ── 引用计数 ────────────────────────────────────────────────────────────
+	// 建出来是 1; cre2_set_free 是【减一】, 减到 0 才真拆。持有方一律 cre2_set_ref /
+	// cre2_set_free 配对 (目前唯一的持有方是 cre2_re2set)。
+	//
+	// 🔴 为什么要它: 策略换表的时候旧表得能【确定地】释放, 而那一刻可能还有别人攥着它
+	//    (一个 re2set 对象, 或者一遍正在跑的扫描)。靠调用方那侧存引用只解决"不早死",
+	//    解决不了"该死的时候死得掉" —— 那是 GC 的时间表, 不是策略的时间表。
+	std::atomic<int> ref{1};
+
 	re2::RE2::Set *set;
 	int64_t max_mem;               // 建这张表时的预算, 派生的单条对象跟着它走
 	std::vector<std::string> pats; // 逐条源串: 惰性建单条对象要它
 
-	// ── 补端点用的【单条对象】缓存 (惰性 · 加锁 · 一张表一份) ──────────────────
-	//
-	// 🔴 它必须挂在【表】上, 不能挂进扫描工作区: 工作区是【一条腿一份、用完就 Close】的
-	//    短命东西, 挂进去就是把最大那张表 9.6MB 的反向单条缓存按并发份数复制一遍, 而且
-	//    每关一个工作区就白扔一份。一张表一份则是所有工作区共用, 表活多久它就活多久
-	//    (与 2026-08-28 那版 Go 侧 fwd1/vp1 同解)。
-	//
-	// one_fwd[i]    第 i 条 pattern 自己那条【正向 · longest 口径】的 RE2 对象。
-	//               fll/rrl 拿它锚定取最长右端; frel 拿它的【反向程序】做反向锚定
-	//               (cre2_resolve_span_reverse_r) —— longest 只改搜索 kind 不改 ParseFlags,
-	//               所以那条反向程序与默认口径编出来的逐字相同, 一份够三家用。
-	// one_viable[i] 第 i 条 pattern 自己那条【反向 · 只装这一条】的 set, fll 收候选起点用。
-	//               必须是 set 不是单条: 单条 Compile 会把 ^/$ 摘成标志, 自己驱动 DFA 查不到。
-	//
-	// *_no[i] = 试过且建不出来, 记下来免得每遍扫描重编一次 (失败是确定性的)。
-	std::mutex one_mu;
-	std::vector<cre2_re *> one_fwd;
-	std::vector<unsigned char> one_fwd_no;
-	std::vector<cre2_set *> one_viable;
-	std::vector<unsigned char> one_viable_no;
+	// 🔴 补端点用的【单条正向/反向对象】不在这里 —— 它们挂在 cre2_re2set 上
+	//    (定义在 cre2_re2set.cpp)。表只管这一张 set 的 DFA。
 };
 
 #endif // CRE2_INTERNAL_H

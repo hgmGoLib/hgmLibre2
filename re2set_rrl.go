@@ -45,7 +45,14 @@
 //    155 条的反向表在 6.4MB 正文上实测 65 秒 / arena 顶满 254MB 还在 flush。这一层不改变
 //    那件事 —— 它只是把"扫出来的左端"补成完整区间。
 //
-// 生命周期: 建一次留着反复 Scan;【不是】并发安全的, 一条腿一个或者池化。不用了 Close。
+// ── 生命周期: 【进程级】· 建一次留着 · 可以并发 Scan ────────────────────────
+// 一个策略一份, 跟策略同生共死。它身上一个字节的"这一遍"状态都没有 —— 每遍扫描的暂存
+// (native 那份 spanscan 工作区 · 游程缓冲) 由 Scan 自己现开现关, 对调用方不可见; Go 侧的
+// 输入输出缓冲走 Re2Set_req_t.Allocer (一条腿一个 alloc)。身上常驻的是补端点用的单条对象
+// 缓存 (惰性建), 所以【别】每遍新建一个。
+//
+// 换策略的时候 Close 掉旧的: native 那侧是引用计数, 手上还在跑的那几遍照样安全跑完。
+// 忘了 Close 也不漏 —— 有 finalizer 兜底, 只是释放时机交给了 GC。
 package hgmLibre2
 
 /*
@@ -53,33 +60,43 @@ package hgmLibre2
 */
 import "C"
 
-import "errors"
+import (
+	"errors"
+	"runtime"
+	"sync"
+)
 
 // Re2Set_rrl_t 见文件头。
 type Re2Set_rrl_t struct {
+	// mu 只护 h 这一个字段: Scan 拿【读锁】把这一遍的 native 暂存开出来就放手, Close 拿写锁。
+	mu   sync.RWMutex
 	h    *C.cre2_re2set
-	set  *RegexpSetReverse // 🔴 必须存着: C 侧【借】它的 native 句柄
 	size int
 }
 
-// NewRe2Set_rrl 给这张【反向】表开一个 rrl 工作区。热路径上建一次长期留着, 别每遍新建。
+// NewRe2Set_rrl 给这张【反向】表编一个 rrl 策略对象。
+// 🔴 建一次留着, 跟策略同生共死 —— 别每遍新建 (见文件头"生命周期")。
 func (r *RegexpSetReverse) NewRe2Set_rrl() (*Re2Set_rrl_t, error) {
 	if r == nil || r.s == nil || r.s.h == nil {
 		return nil, errors.New("re2native: NewRe2Set_rrl 的表是空的")
 	}
 	h, err := re2setNew(r.s.h, C.CRE2_RE2SET_rrl, r.s.lens, "Re2Set_rrl_t")
+	runtime.KeepAlive(r)
 	if err != nil {
 		return nil, err
 	}
-	return &Re2Set_rrl_t{h: h, set: r, size: r.s.size}, nil
+	w := &Re2Set_rrl_t{h: h, size: r.s.size}
+	runtime.SetFinalizer(w, func(x *Re2Set_rrl_t) { x.Close() })
+	return w, nil
 }
 
-// Scan 从末尾往前扫 body 一遍 —— 这是【唯一】一遍全文。要什么见 Re2Set_req_t (nil = 什么都不要)。
-func (s *Re2Set_rrl_t) Scan(body string, req *Re2Set_req_t) error {
+// Scan 从末尾往前扫 req.Body 一遍 —— 这是【唯一】一遍全文。要什么见 Re2Set_req_t (零值 = 什么都不要)。
+// 同一个对象上可以【并发】调, 每条腿带自己的 Allocer。
+func (s *Re2Set_rrl_t) Scan(req Re2Set_req_t) error {
 	if s == nil {
 		return errors.New("re2native: Re2Set_rrl_t 是 nil")
 	}
-	return re2setScan(s.h, s.size, "Re2Set_rrl_t", body, req)
+	return re2setScan(&s.mu, &s.h, s.size, "Re2Set_rrl_t", req)
 }
 
 // GetPatternLen 是 pattern 条数 (= Index 的上界)。
@@ -90,19 +107,20 @@ func (s *Re2Set_rrl_t) GetPatternLen() int {
 	return s.size
 }
 
-// GetStats 是最近一次 Scan 的账, 见 Re2Set_stats_t (rrl 的 Cands 恒 0: 它没有候选这一步)。
-func (s *Re2Set_rrl_t) GetStats() Re2Set_stats_t {
-	if s == nil {
-		return Re2Set_stats_t{}
-	}
-	return re2setStats(s.h)
-}
-
-// Close 放掉 native 那份扫描工作区。可重复调; 之后再 Scan 返回 err。
+// Close 放掉这个策略对象连同它身上的单条对象缓存。换策略的时候调它。
+//
+// 可重复调; 之后再 Scan 返回 err。native 那侧是引用计数, 所以【正在跑的 Scan 不受影响】。
+// 不调也不漏 (finalizer 兜底), 只是释放时机交给 GC。
 func (s *Re2Set_rrl_t) Close() {
-	if s == nil || s.h == nil {
+	if s == nil {
 		return
 	}
-	C.cre2_re2set_free(s.h)
+	s.mu.Lock()
+	h := s.h
 	s.h = nil
+	s.mu.Unlock()
+	if h != nil {
+		runtime.SetFinalizer(s, nil)
+		C.cre2_re2set_free(h)
+	}
 }
