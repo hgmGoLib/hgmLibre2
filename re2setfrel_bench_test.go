@@ -192,7 +192,7 @@ func TestRe2SetFrel_Cost(t *testing.T) {
 		nold := len(o.run(text)) / 3
 		nms := ms.run(t, text)
 		nfrel := w.run(t, text)
-		st := w.s.Stats()
+		st := w.s.GetStats()
 		t.Logf("%-6s %8d %10d %10d %10d %8d %8d %10d",
 			kind, len(text), nold, nms, nfrel, st.NSeg, st.NResolve, st.UsedPeak)
 	}

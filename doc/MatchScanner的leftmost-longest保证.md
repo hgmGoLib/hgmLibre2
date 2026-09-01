@@ -50,7 +50,7 @@ err := ms.Scan(body, func(batch []hgmLibre2.SetMatch) {
         handle(m.Index, body[m.Lo:m.Hi])
     }
 })   // 🔴 要么全给, 要么整遍不算数: err != nil ⟹ 这一遍作废, 整篇走老路 FindAll
-ids := ms.HitIDs()      // 与 Set.Match 同解的那张命中表; ms.Hit(i) 是 O(1) 的同一个答案
+ids := ms.GetHitIDs()      // 与 Set.Match 同解的那张命中表; ms.IsHit(i) 是 O(1) 的同一个答案
 ```
 
 三态旋钮:
@@ -93,7 +93,7 @@ Lo = Hi - min
 拿到一个右端 `e` 之后两步:
 
 1. **反向 · 种全部状态 · 回看不越过游标**: 从 `e` 往左走到死, 把起点落在 `[游标, e)` 里的
-   **全部可行前缀起点**一次收齐(`RegexpSetReverse.ViableStarts`, 走的是这一条 pattern 自己
+   **全部可行前缀起点**一次收齐(`RegexpSetReverse.GetViableStarts`, 走的是这一条 pattern 自己
    那份"反向 · 只装这一条的 set" = `RegexpSet.viableOne`)。缓冲里是**降序**的。
 2. **候选从小到大逐个验**: 拿正向单条 longest 锚定在候选上跑一次
    (`RegexpSet.forwardOne` → `Regexp.FindStringIndexAtWithin`), 第一个验过的就是答案。
@@ -102,7 +102,7 @@ Lo = Hi - min
 
 > ① **候选集不漏。** 设真答案是 `[s, E)` 且 `s ∈ [游标, e)`。`E` 是一个匹配右端且 `E > s >= 游标`,
 > 而 `e` 是**大于游标的最小右端** ⟹ `E >= e` ⟹ `text[s, e)` 是 `text[s, E)` 的前缀 ⟹ 它是一个
-> **可行前缀** ⟹ `s` 一定在 `ViableStarts` 给的候选里。∎
+> **可行前缀** ⟹ `s` 一定在 `GetViableStarts` 给的候选里。∎
 > 升序试 ⟹ 第一个通过的必然是 leftmost; `fwd` 是 longest 口径编的, 锚定在 `s` 上给的就是最长
 > 右端 ⟹ 严格 leftmost-longest。
 >
@@ -127,7 +127,7 @@ Lo = Hi - min
 所以"DFA 放弃"在它身上不发生。剩下反向那一趟还是 DFA 独一条(RE2 自己求匹配左端也只有这一条路),
 它放弃就整遍报错 —— 见 (c)。
 
-**这条路的钱全在"验了几个假候选"上**, 而那一笔从外面一个字都看不见, 所以有 `Stats()`:
+**这条路的钱全在"验了几个假候选"上**, 而那一笔从外面一个字都看不见, 所以有 `GetStats()`:
 
 | 字段 | 是什么 |
 | --- | --- |
@@ -156,7 +156,7 @@ Lo = Hi - min
 
 | 在哪儿交代 | 说的是什么 |
 |---|---|
-| `NewMatchScanner` 的 `unsupported` | `[]int32` —— 走不了区间这条路的那几条 pattern 下标。当下只有一个原因: 这条能匹配空串 (`PatternLenRange` 的 `min <= 0`), 每个位置都是一处零长命中, 游标压不住。 |
+| `NewMatchScanner` 的 `unsupported` | `[]int32` —— 走不了区间这条路的那几条 pattern 下标。当下只有一个原因: 这条能匹配空串 (`GetPatternLenRange` 的 `min <= 0`), 每个位置都是一处零长命中, 游标压不住。 |
 | `Scan` 的 `err` | 这一遍不算数 (已经交出去的批次也不算), 整篇走老路 `FindAll`。 |
 
 `unsupported` **与正文无关**, 建工作区那一刻就定死、扫多少遍都不变 ⟹ 它能直接写成回归测试
@@ -204,7 +204,7 @@ DFA-only (`re2_set.cc:216`, `dfa_failed` ⟹ 直接 `return false`) —— NFA �
 | | 趟数 | 走谁 |
 |---|---|---|
 | 定长 | 0 | 一句减法, 不进引擎 |
-| 变长 | 1 反向 + N 正向 | `RegexpSetReverse.ViableStarts`(一条 pattern 自己的反向 set)→ 正向单条 longest 锚定 `FindStringIndexAtWithin`, N = `Tries/Walks`, 真表上恒为 1 |
+| 变长 | 1 反向 + N 正向 | `RegexpSetReverse.GetViableStarts`(一条 pattern 自己的反向 set)→ 正向单条 longest 锚定 `FindStringIndexAtWithin`, N = `Tries/Walks`, 真表上恒为 1 |
 | 反向 MatchScanner | 1 | 正向单条 longest 锚定 `FindStringIndexAtWithin`(bound 掐在游标上) |
 
 **三条理由**:
@@ -303,7 +303,7 @@ locs := want.FindAllStringIndex(text, -1)
 
 **内存**: D2 要"反向单条 set"(`vp1`), 路 A 要"反向单条"(`rev1`), 同一量级 —— 最大那张 158 条
 表上 89 条被真问到位置, `vp1` 9.6MB vs `rev1` 7.6MB(1.26x)。相对路 B 是**净增**(B 一条反向
-都不建), 这一笔是换路的全部代价, 量它用 `ViableOneStats()`。
+都不建), 这一笔是换路的全部代价, 量它用 `GetViableOneStats()`。
 
 ### 一起删掉的东西
 
@@ -439,7 +439,7 @@ break 把低优先级线程整段截掉(`re2_dfa.cc:1197`), `kLongestMatch` 干�
 还得正向再扫一遍全文 —— 而"把 1+k 遍压成 1 遍"正是 MatchScanner 存在的全部意义。
 
 🔴 方向是**每条 pattern 各自**的决定, 不是一张表的属性: 各建一个单条正/反向 set, 拿真语料
-比 `MemInfo().States`, 小的那边就是它该去的那一组。反向 set 本身仍然必须**一条一个或者很小
+比 `GetMemInfo().States`, 小的那边就是它该去的那一组。反向 set 本身仍然必须**一条一个或者很小
 一张表** —— set 里状态数是相乘的, 155 条的反向表在 6.4MB 上是 65 秒 / arena 顶满 254MB。
 
 ### 8.3 反向【更好】做, 不是更难做

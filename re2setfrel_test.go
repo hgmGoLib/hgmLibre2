@@ -279,9 +279,9 @@ func TestRe2SetFrel_ExistOnly(t *testing.T) {
 			want[id] = true
 		}
 		for i := range pats {
-			if s.Hit(i) != want[int32(i)] {
+			if s.IsHit(i) != want[int32(i)] {
 				t.Fatalf("text=%q 第 %d 条命中表不对: Frel=%v set.Match=%v",
-					text, i, s.Hit(i), want[int32(i)])
+					text, i, s.IsHit(i), want[int32(i)])
 			}
 		}
 	}
@@ -304,7 +304,7 @@ func TestRe2SetFrel_EmptyMatchRejected(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Scan: %v", err)
 	}
-	if !s.Hit(0) {
+	if !s.IsHit(0) {
 		t.Fatal("a* 在任何正文上都命中")
 	}
 }
@@ -352,7 +352,7 @@ func TestRe2SetFrel_Closed(t *testing.T) {
 	if err := s.Scan("abc", make([]Re2SetFrel_result_t, 4), nil); err == nil {
 		t.Fatal("Close 之后 Scan 应当报错")
 	}
-	if s.Hit(0) {
-		t.Fatal("Close 之后 Hit 应当是 false")
+	if s.IsHit(0) {
+		t.Fatal("Close 之后 IsHit 应当是 false")
 	}
 }

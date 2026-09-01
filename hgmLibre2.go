@@ -75,7 +75,7 @@ func Compile(pattern string) (*Regexp, error) { return CompileMaxMem(pattern, 0)
 //     这一条不花内存, 但只回答"命中没有"。
 //
 // 怎么标定: 拿一批【互不相同】的真语料单线程跑一遍, 看 RegexpReverse.MatchStats/ScanStats 的
-// Flushes 或进程级 DFAStats().Resets 增量; >0 就翻倍重来, 直到增量归零。
+// Flushes 或进程级 GetDFAStats().Resets 增量; >0 就翻倍重来, 直到增量归零。
 func CompileMaxMem(pattern string, maxMem int64) (*Regexp, error) {
 	return compileMaxMem(pattern, maxMem, false)
 }
@@ -179,8 +179,8 @@ func (re *Regexp) FreeC() {
 	runtime.SetFinalizer(re, nil)
 }
 
-// MaxMem 返回这条 Regexp 编译时实际生效的内存预算 (字节)。Compile 出来的就是 DefaultMaxMem。
-func (re *Regexp) MaxMem() int64 {
+// GetMaxMem 返回这条 Regexp 编译时实际生效的内存预算 (字节)。Compile 出来的就是 DefaultMaxMem。
+func (re *Regexp) GetMaxMem() int64 {
 	n := int64(C.cre2_max_mem(re.h))
 	runtime.KeepAlive(re)
 	return n

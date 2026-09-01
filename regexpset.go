@@ -60,14 +60,14 @@ type RegexpSet struct {
 	fwd1No []bool // 第 i 条试过且【建不出来】—— 记下来免得每遍扫描重编一次
 	fwd1Mu sync.Mutex
 	// vp1[i] = 第 i 条 pattern 自己那条【反向 · 只装这一条的 set】, MatchScanner 补起点用:
-	//          ViableStarts(锚定在右端往左, 种全部状态) 给【全部候选起点】。
+	//          GetViableStarts(锚定在右端往左, 种全部状态) 给【全部候选起点】。
 	//
 	// 🔴 反向必须是【一条一个】: set 里的状态数是【相乘】的 (doc/状态数为什么会相乘.txt),
 	//    155 条的反向表实测 6.4MB 正文 65 秒 / arena 顶满 254MB 还在 flush, 而正向同一张表
 	//    18ms 零 flush。一条一个就没有这个乘法; 而且它只做锚定回推、从不扫正文, 那条 `.*?`
 	//    前缀引起的状态爆炸机制从根上就不存在。
 	//
-	// 🔴 为什么这一份是 set 而不是单条 RegexpReverse: ViableStarts 是自己驱动
+	// 🔴 为什么这一份是 set 而不是单条 RegexpReverse: GetViableStarts 是自己驱动
 	//    kManyMatch 的 DFA 走的 (与 ResolveSpan 同一条路), 而单条 Compile 会把 ^ / $ 从程序里
 	//    【摘掉】记成 anchor_start_/anchor_end_ 两个标志 —— 只有 SearchDFA 会去查那两个标志,
 	//    自己驱动 DFA 就查不到, `^foo` 会在正文中间也认。CompileSet 不摘, ^ / $ 留在程序里
@@ -77,21 +77,21 @@ type RegexpSet struct {
 	vp1Mu sync.Mutex
 }
 
-// ViableOneStats 报【已经被建出来】的那些"反向单条 set"的账: 几条 · 状态数合计 ·
-// 状态区实际字节合计。与 MemInfo 同一个用途 (量内存去哪了), 不制造状态。
+// GetViableOneStats 报【已经被建出来】的那些"反向单条 set"的账: 几条 · 状态数合计 ·
+// 状态区实际字节合计。与 GetMemInfo 同一个用途 (量内存去哪了), 不制造状态。
 // 惰性建 ⟹ 没被 MatchScanner 问过位置的 pattern 一条都不占。
 //
 // 🔴 这是补起点这条路的【常驻】开销, 也是它相对 2026-08-28 之前那条老默认档 ("路 B",
 //    只要正向单条, 一条反向都不建) 净增的那一笔 —— 挂新表之前先量这个数。
 //    最大的那张 158 条生产表实测: 89 条被真问到位置, 合计 9.6MB。
-func (s *RegexpSet) ViableOneStats() (n int, states, arenaCap int64) {
+func (s *RegexpSet) GetViableOneStats() (n int, states, arenaCap int64) {
 	s.vp1Mu.Lock()
 	defer s.vp1Mu.Unlock()
 	for _, r := range s.vp1 {
 		if r == nil {
 			continue
 		}
-		mi := r.MemInfo()
+		mi := r.GetMemInfo()
 		n++
 		states += mi.States
 		arenaCap += mi.ArenaCap
@@ -100,7 +100,7 @@ func (s *RegexpSet) ViableOneStats() (n int, states, arenaCap int64) {
 }
 
 // viableOne 返回第 i 条 pattern 自己那条【反向 · 只装这一条的 set】(惰性建, 建不出来返回 nil)。
-// 只读用途 (ViableStarts), 并发安全。为什么是 set 不是单条 RegexpReverse: 见上面 vp1 那段注释。
+// 只读用途 (GetViableStarts), 并发安全。为什么是 set 不是单条 RegexpReverse: 见上面 vp1 那段注释。
 func (s *RegexpSet) viableOne(i int) *RegexpSetReverse {
 	if i < 0 || i >= len(s.pats) {
 		return nil
@@ -257,7 +257,7 @@ func (s *RegexpSet) Match(text string, buf []int32) []int32 {
 
 // ScanStats 是【一次 Match 调用】的 DFA 计数 (字段名与 C 侧 cre2_scan_stats 逐字一致)。
 //
-// 跟 DFAStats() 那份【进程级】计数是两回事: 那份挂在 re2 的全局钩子上, 回调不带上下文,
+// 跟 GetDFAStats() 那份【进程级】计数是两回事: 那份挂在 re2 的全局钩子上, 回调不带上下文,
 // 只能回答"这个进程里有人在 thrash"; 这份是调用方自己在栈上开的对象, 沿调用链传下去,
 // 能回答"这一次调用发生了什么"。没有全局状态, 没有 thread_local, 并发下各算各的。
 // 做法照搬 Rust regex-automata 的 per-Cache 计数 (clear_count / 已扫字节数)。
@@ -349,8 +349,8 @@ type SetMemInfo struct {
 	StatesBuiltTotal int64
 }
 
-// Used 返回状态缓存已用额度 (字节)。Built=false 时返回 0。
-func (m SetMemInfo) Used() int64 {
+// GetUsedBytes 返回状态缓存已用额度 (字节)。Built=false 时返回 0。
+func (m SetMemInfo) GetUsedBytes() int64 {
 	if !m.Built {
 		return 0
 	}
@@ -407,12 +407,12 @@ type AttribInfo struct {
 //
 // 典型用法 (找出该从表里拎走的那几条):
 //
-//	a := set.Attrib()
+//	a := set.GetAttrib()
 //	for _, p := range a.Pats[:10] {
 //	    fmt.Printf("#%d 多塞了 %d 个零件 (平均每状态 %.2f 个)\n",
 //	        p.Index, p.Excess, float64(p.Excess)/float64(a.StatesTotal))
 //	}
-func (s *RegexpSet) Attrib() AttribInfo {
+func (s *RegexpSet) GetAttrib() AttribInfo {
 	var agg C.cre2_set_attrib
 	n := s.size
 	if n <= 0 {
@@ -462,9 +462,9 @@ func (s *RegexpSet) Attrib() AttribInfo {
 	return out
 }
 
-// MemInfo 查这个 Set 当前的 DFA 缓存水位: 额度用掉多少、装了多少状态、生涯清空过几次。
+// GetMemInfo 查这个 Set 当前的 DFA 缓存水位: 额度用掉多少、装了多少状态、生涯清空过几次。
 // 只读, 内部短暂拿一次 DFA 读锁, 可以和扫描并发调 (会和正在 flush 的写锁互斥, 别在热路径上高频调)。
-func (s *RegexpSet) MemInfo() SetMemInfo {
+func (s *RegexpSet) GetMemInfo() SetMemInfo {
 	var mi C.cre2_set_mem
 	C.cre2_set_mem_info(s.h, &mi)
 	runtime.KeepAlive(s)

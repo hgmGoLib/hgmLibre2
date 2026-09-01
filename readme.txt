@@ -95,15 +95,15 @@
       hex 解码腿上 Builder 累计 329MB = 每输入字节 4.9 字节。现在按 len(src) 一次开够
       (stdlib replaceAll 和本库 []byte 门面 ReplaceAllFunc 本来就是这么开的), 实测 1.02×。
       详见 README.md#appendreplaceallstringfunc。
-    - MatchStats() / MemInfo(): 【按次调用】与【按 Set】的 DFA 计数 (清空次数/新建状态数/
-      正文字节数/额度水位), 没有全局状态, 并发下各算各的。调预算就看 MemInfo().FlushesTotal
+    - MatchStats() / GetMemInfo(): 【按次调用】与【按 Set】的 DFA 计数 (清空次数/新建状态数/
+      正文字节数/额度水位), 没有全局状态, 并发下各算各的。调预算就看 GetMemInfo().FlushesTotal
       是不是 0; 判"这张表贵不贵"看 StatesBuiltTotal 和 ScanStats 的 Bytes/StatesBuilt。
       不传 st 时 C 侧完全不统计, 热路径继续用 Match 即可。详见 set性能优化经验.txt。
-    - Attrib(): 回答"这几万个状态是哪几条 pattern 造的 / 单个状态多宽 / 正文哪一段造的"。
+    - GetAttrib(): 回答"这几万个状态是哪几条 pattern 造的 / 单个状态多宽 / 正文哪一段造的"。
       要 CGO_CXXFLAGS="-O2 -DRE2_DFA_ATTRIB=1" 编译才有数据, 默认构建里这套代码根本不存在。
       排序看 Excess 不要看 States (非锚定搜索下 States 会饱和成 100%)。
       榜单有消融验证 (按榜摘 20 条降 5.4×, 随机摘 20 条只降 1.4×) 且跨语料稳定。
-    - DFAStats() / DFAStatsZero(): 进程级计数 —— DFA 状态缓存被【整表清空重建】了几次
+    - GetDFAStats() / ResetDFAStats(): 进程级计数 —— DFA 状态缓存被【整表清空重建】了几次
       (RE2 的 DFA 缓存满了不是 LRU 淘汰, 是 ResetCache 全清)。结果仍然正确, 所以这件事本来
       在调用方眼里没有任何信号, 但它是【悬崖不是斜坡】: 实测 60 条 gap 型 pattern × 16 份互不
       相同的 64KB body, 1MB 预算 79 次 flush → 8.1MB/s, 8MB 预算 3 次 flush → 18.6MB/s,
@@ -133,11 +133,11 @@
       只想自己拼的, 底座也在: FindAllIndex 给匹配左端, 正向 set 的 ResolveSpan 取右端。
       🔴 正向 RegexpSet 和反向 RegexpSetReverse 是【两个类型】, 不是一个类型上的 Reverse() 开关
       (2026-08-25 拆的; 单条那边 Regexp / RegexpReverse 本来就是两个)。理由三条: 两份完全不同的
-      DFA 状态缓存混在一个对象里 MemInfo() 说不清是哪份; 两边贵法差三个数量级 (155 条表扫 6.4MB:
+      DFA 状态缓存混在一个对象里 GetMemInfo() 说不清是哪份; 两边贵法差三个数量级 (155 条表扫 6.4MB:
       正向 18ms 零 flush, 反向 65 秒 · arena 顶满 254MB 还在 flush), 藏在 bool 后面看不见; 两边
       吐的位置【含义相反】(右端 vs 左端), 同名方法返回意思相反的数字最容易写错。
       ⚠ 方向是【每条 pattern 各自】的决定: (?s).{20}key 正向 21 状态 / 反向 1,
-      key(?s).{20} 正好反过来。拿真语料各建一个单条 set 比 MemInfo().States 就知道该往哪边放。
+      key(?s).{20} 正好反过来。拿真语料各建一个单条 set 比 GetMemInfo().States 就知道该往哪边放。
       ⚠ 这跟"自己把 pattern 倒着写 + 把正文倒过来"不是一回事, 而且库这条更省: RE2 的 Simplify
       把 x{2,19} 展成"必需拷贝在前", 反序之后可选嵌套跑到读取顺序前面, 活跃起点集合互相嵌套
       而不是任意子集。同一条语言同一串字节实测 17 状态 vs 手写反转 25247 状态。
@@ -168,32 +168,32 @@
       🔴 别拿"一条 pattern 的 set"去凑: 那是 kManyMatch 的 DFA (每个状态多背一张 id 表), 而且
          set 与单条对 ^ / $ 的处理【不是同一条代码路】—— 单条 Compile 会把 ^ / $ 摘成两个
          标志, 只有 SearchDFA 会去查它们。
-    - RegexpReverse.MemInfo(): 这条 pattern 的反向程序那份 DFA 缓存水位 (字段同 RegexpSet.MemInfo)。
+    - RegexpReverse.GetMemInfo(): 这条 pattern 的反向程序那份 DFA 缓存水位 (字段同 RegexpSet.GetMemInfo)。
       没走过反向就 Built=false —— 量具不制造被量的东西。
-    - CompileMaxMem(pattern, maxMem) / MaxMem(): 单条 Regexp 的内存预算 (以前只有 Set 能调,
+    - CompileMaxMem(pattern, maxMem) / GetMaxMem(): 单条 Regexp 的内存预算 (以前只有 Set 能调,
       单条硬吃 RE2 默认 8MB)。同一个旋钮抬两条天花板 (编译期指令数上限 + 运行期 DFA 状态缓存额度),
       口径与 NewRegexpSetMaxMem 完全一致。实测同上那条 pattern × 60 份 16KB 语料:
       默认 8MB 下 flush 6 次, 256MB 下 0 次; 而反着扫在默认预算下就 0 次 (状态峰值 9)。
       —— 调预算是拿内存换, 换方向不花钱, 形状允许就先换方向。
-    - Prefilter (NewPrefilter / Atoms / Potentials / Unfiltered): RE2 自己的「必需字面量」推导
+    - Prefilter (NewPrefilter / GetAtoms / GetPotentials / GetUnfiltered): RE2 自己的「必需字面量」推导
       (FilteredRE2 + PrefilterTree, 本来就 vendored 在这, 现在接出来了)。回答三件事:
-      这批 pattern 想命中【必须】先出现哪些字面量 (Atoms, 已小写去重) · 正文里找到了这几个原子
-      之后还有哪几条【可能】命中 (Potentials, 没进名单的保证不命中) · 以及最要紧的反问:
-      哪几条【没有】必需字面量因而任何粗筛都筛不掉 (Unfiltered)。
+      这批 pattern 想命中【必须】先出现哪些字面量 (GetAtoms, 已小写去重) · 正文里找到了这几个原子
+      之后还有哪几条【可能】命中 (GetPotentials, 没进名单的保证不命中) · 以及最要紧的反问:
+      哪几条【没有】必需字面量因而任何粗筛都筛不掉 (GetUnfiltered)。
       本身不做匹配 —— 原子表交给调用方自己的字符串匹配器 (AC / memmem) 去找。
-      🔴 Unfiltered 才是接它出来的动机: 「先用便宜的字面量门挡掉大多数正文」是唯一能抬吞吐上限的
+      🔴 GetUnfiltered 才是接它出来的动机: 「先用便宜的字面量门挡掉大多数正文」是唯一能抬吞吐上限的
       方向 (见 doc §4 G), 但天花板就是这批筛不掉的条数 —— 做之前先量, 别做完才发现天花板在 3%。
       🔴 这个数只有 RE2 的 prefilter 算得准: 手写抽取器在 `(?:foo|[A-Z]{5})` 上会答错 (含字面量 foo,
       但另一支不需要它 ⇒ 整条不可过滤)。minAtomLen 是真旋钮不是细节: 调大 ⇒ 原子更少更长 (匹配器更快)
       但更多 pattern 掉进不可过滤集。实测 112 条生产表: RE2 默认 1654 原子 / 4 条不可过滤, 但原子短到
       几乎每份正文都能找到 ⇒ 一条都筛不掉; minAtomLen=6 是 216 原子 / 38 条不可过滤, 筛得动但底线 34%。
-      对拍见 prefilter_test.go (健全性: 真命中的必须一条不落地出现在 Potentials 里)。
+      对拍见 prefilter_test.go (健全性: 真命中的必须一条不落地出现在 GetPotentials 里)。
     - FreeC: 显式释放 native 句柄 (否则靠 finalizer)。
     - RegexpSet: N 条正则编进一个 DFA, 一遍扫回答"哪几条命中"。详见 README.md#regexpset。
       条数多到 NewRegexpSet 报 "set compile failed (out of memory)" 时,【不要拆成两个 set】
       (两个 set = 正文扫两遍), 改用 NewRegexpSetMaxMem(patterns, maxMem) 把 RE2 预算翻倍到装下为止。
       ⚠ "编得过" ≠ "预算够": 那只过了编译期那道天花板。运行期那一半够不够是另一个问题,
-      只能靠数 flush 次数(见下面 DFAStats)。真的在 thrash 的 set, 拆开反而更快 —— 上面这条
+      只能靠数 flush 次数(见下面 GetDFAStats)。真的在 thrash 的 set, 拆开反而更快 —— 上面这条
       "不要拆" 只管编译期天花板。
       Match/MatchAny/MatchBytes/MatchAnyBytes 不返回 error: Compile 过了之后运行期 DFA 不会爆
       (RE2 对 set 的 DFA 只 flush 缓存不 bail; 且 CompileSet 编译期就跑过 DFA 冒烟测试) —— 依据与
@@ -274,7 +274,7 @@
       代价 = 这处命中能延伸多远, 1KB 和 6.4MB 的正文上一样贵; 反向扫全表在 6.4MB 上是 65 秒
       (正向 18ms), 拆成一条一条反着扫倒是便宜, 可命中 k 条就是 k 遍全文 —— 正好是 FindAllIndex
       存在的意义 (把 1+k 遍压成 1 遍) 原样赔回去。两个 API 长得对称, 用途不对称。
-    - RegexpSetReverse.ViableStarts(text, from, bound, id, out) (spanviable.go):
+    - RegexpSetReverse.GetViableStarts(text, from, bound, id, out) (spanviable.go):
       【可行前缀回推】—— 给一个匹配右端 from, 把 [bound, from) 里【全部候选起点】一次收齐:
       即那些位置 s 使 text[s, from) 是第 id 条的一个【可行前缀】(还能被某个后缀补成真匹配,
       不一定当场就是匹配)。写进 out 的是【降序】, 返回找到的总条数 (可能 > len(out),
@@ -292,8 +292,8 @@
          而且回答的会变成另一个问题。
       代价 = 这处命中能往回够多远 (可行前缀集合空了机器就死), 与正文长度无关 —— 与 ResolveSpan
       同一个量级、同一个道理。上面那层 MatchScanner 就是靠它换来严格 leftmost-longest。
-    - RegexpSet.NewMatchScanner + (*MatchScanner).SetModes / Scan / HitIDs / Hit / Stats / Close
-      + RegexpSet.PatternLenRange / ViableOneStats:
+    - RegexpSet.NewMatchScanner + (*MatchScanner).SetModes / Scan / GetHitIDs / IsHit / GetStats / Close
+      + RegexpSet.GetPatternLenRange / GetViableOneStats:
       【一遍扫, 直接给不重复的命中区间】—— 把上面两件 (游程扫 + 锚定解析) 拼成调用方真正要的
       形状, 顺带把"同一处命中报出一串右端"那种重复在库里就解决掉。替的是这套两段式:
       先 Set.Match 扫一遍拿"哪几条命中", 再为了知道【在哪】把命中的每条各对整篇正文跑一遍
@@ -305,7 +305,7 @@
         ms.SetModes(modes)                  // 每条要什么, 两态 (见下); 不调 = 全默认档
         err := ms.Scan(body, func(ms []SetMatch) {   // ← 唯一一遍全文, 结果【一批一批】来
             for _, m := range ms { … m.Index / m.Lo / m.Hi … }   // text[Lo:Hi] 是第 Index 条的真匹配
-        })                                  // 之后 Hit(i)/HitIDs() 就是门那张 bool 表
+        })                                  // 之后 IsHit(i)/GetHitIDs() 就是门那张 bool 表
         // 🔴 【要么全给, 要么整遍不算数】: err != nil 就是这一遍作废, 整篇走老路 FindAll。
         //    没有"这几条没给全, 你自己补"的中间态 —— 原委见下面那一节。
         // 🔴 交给回调的切片是内部缓冲本身, 下一批原地覆写; 各条 pattern 的结果【交错】着来
@@ -341,7 +341,7 @@
         定长 (min == max)  Lo = Hi - min, 一句减法, 不进正则引擎。起点唯一 ⟹ 可论证。
         变长 (min < max)   【两步】:
                            ① 反向 · 种全部状态 · 从右端 e 往左走到死, 把起点落在 [游标, e) 里的
-                              【全部可行前缀起点】一次收齐 (RegexpSetReverse.ViableStarts,
+                              【全部可行前缀起点】一次收齐 (RegexpSetReverse.GetViableStarts,
                               走的是这一条 pattern 自己那份"反向 · 只装这一条的 set");
                            ② 候选【从小到大】逐个拿正向单条 longest 锚定去验
                               (FindStringIndexAtWithin), 第一个验过的就是答案。
@@ -353,13 +353,13 @@
                              ② 一个都没验过 ⟹ [游标,e) 里根本没有起点 (①的逆否) ⟹ 游标直接
                                 推到 e。"全军覆没"不是放弃, 是【证明了这一段是空的】。
                            代价: 各轮的回看窗口两两【不交】且递增, 反向那一趟累加封顶 = 多扫
-                           一遍正文; 真正多出来的是"验了几个假候选", 用 Stats() 量 (见下)。
+                           一遍正文; 真正多出来的是"验了几个假候选", 用 GetStats() 量 (见下)。
                            🔴 不需要 maxL: 回看的下界是反向那一趟【自己走到死的地方】,
                               动态的。老的默认档靠 maxL 抬下界, 没上界就塌回游标白扫一段。
         补不出来的         Scan 整遍报错, 请调用方整篇照老路 FindAll —— 宁可退回去也不给
                            "像是对的"答案。
 
-      ── 🔴 Stats(): "试/看"是这条路唯一要盯的那个数 ────────────────────────────
+      ── 🔴 GetStats(): "试/看"是这条路唯一要盯的那个数 ────────────────────────────
         Walks 回看了几趟 (= 处理了几个没被游标盖住的右端) · Cands 收到几个候选起点 ·
         Tries 正向锚定验了几次 · Emits 吐了几处区间。
         试/看 = Tries/Walks = 每次回看验了几次。1.00 = 升序第一个候选就是答案, 一次假候选
@@ -379,8 +379,8 @@
         ③ 状态更小: 单条不必背 kManyMatch 每个状态那张 id 表。
       各条路要几趟:
         定长      0 趟 (一句减法)
-        变长      1 趟反向 (ViableStarts, 一条 pattern 自己的反向 set) + N 趟正向单条 longest
-                  锚定 (FindStringIndexAtWithin), N = Stats().Tries/Walks, 真表上恒为 1
+        变长      1 趟反向 (GetViableStarts, 一条 pattern 自己的反向 set) + N 趟正向单条 longest
+                  锚定 (FindStringIndexAtWithin), N = GetStats().Tries/Walks, 真表上恒为 1
         反向那侧  1 趟  正向单条 longest 锚定 (FindStringIndexAtWithin, bound 掐在游标上)
 
       ── 老账: 2026-08-28 之前这里有三条路 ────────────────────────────────────
@@ -390,7 +390,7 @@
                              也不是 leftmost-longest: 随机撒 3000 条变长 pattern × 40 段正文
                              = 12 万处对账, 与 FindAll 相同 119940, 与 Longest 相同 119972,
                              两个都不是 28。病根是"只种 accept 只看得见正好在 e 结束的起点"
-                             (\b(?:ab cd ef|cd)\b 撞 "ab cd ef" 那个例子, 见 ViableStarts 那节)。
+                             (\b(?:ab cd ef|cd)\b 撞 "ab cd ef" 那个例子, 见 GetViableStarts 那节)。
         路 B (旧默认档)      从 max(游标, e-maxL) 起做一次正向【非锚定】longest 搜索。一趟,
                              口径严, 贵在【没有上界的条要走完空隙】(封顶 2.00x 正文)。
         路 D2 (MatchScanner2) 就是现在这一条, 当时挂在一个独立类型上专门用来比价。
@@ -405,7 +405,7 @@
               "试/看"在 99 格里全是 1.00。
         内存  D2 要"反向单条 set"(vp1), 路 A 要"反向单条"(rev1), 同一量级 —— 最大那张 158 条
               表上 89 条被真问到位置, vp1 9.6MB vs rev1 7.6MB (1.26x)。相对路 B 是【净增】
-              (B 一条反向都不建), 这一笔是换路的全部代价, 量它用 ViableOneStats()。
+              (B 一条反向都不建), 这一笔是换路的全部代价, 量它用 GetViableOneStats()。
       于是: 路 A / 路 B / MatchScanMode_spanFast / MatchScanner2 这个类型, 全部删除。
       更早那一笔 (2026-08-27) 换的是"补端点回不回 set", 与这次是两件事: 那次把两条老路的
       第二趟从整表 set.ResolveSpan 换成单条对象, 答案一字不差而价钱降了 27~36%。
@@ -414,7 +414,7 @@
       🔴 这一层没有"扫到一半反悔、这几条你自己补"的中间态 (2026-08-27 拆掉的)。只有:
 
         NewMatchScanner 的 unsupported   []int32, 走不了区间这条路的那几条 pattern 下标。
-                                         当下只有一个原因: 这条能匹配空串 (PatternLenRange
+                                         当下只有一个原因: 这条能匹配空串 (GetPatternLenRange
                                          的 min <= 0), 每个位置都是一处零长命中, 游标压不住。
                                          🔴 【与正文无关】, 建工作区那一刻就定死, 扫多少遍
                                             都不变 —— 所以它能直接写成回归测试 (扔一条 a*
@@ -484,7 +484,7 @@
          整表反向 65 秒 / arena 顶满 254MB 还在 flush。一条一个就没有这个乘法; 而且这些
          反向对象【从不用来扫正文】, 只做锚定解析, 起点只有一个, 爆炸机制从根上不存在。
          惰性建: 只有真被问到位置的那几条才建得出来 —— 最大那张 158 条生产表上是 89 条,
-         合计 9.6MB (ViableOneStats)。
+         合计 9.6MB (GetViableOneStats)。
 
       🔴 【只在同一条 pattern 内部去重, 跨 pattern 一概不合并】: 两条 pattern 撞在同一片正文上
          不是重复, 是两个问题各要一个答案 (带空格的和不带空格的两条, 下游正是靠"这段里有没有
@@ -520,7 +520,7 @@
         按正文长度: 真语料 8KB 以下打平 (1.0×) · 32KB 3.1× · 512KB 6.1× · 2MB 14×
         最坏 (每 38 字节一处命中的合成串): 0.94×, 即 6% 慢 —— 每处命中要两次 cgo 往返,
         正文短到几乎全是命中时这笔固定开销赢不了。真 base64 碎片不长这样 (打平)。
-    - RegexpSetReverse.NewMatchScanner + (*MatchScannerReverse).SetModes / Scan / HitIDs / Hit / Close:
+    - RegexpSetReverse.NewMatchScanner + (*MatchScannerReverse).SetModes / Scan / GetHitIDs / IsHit / Close:
       【反向 MatchScanner】—— 与上面那个是镜像, 从正文末尾往前一遍扫, 同样一批一批交出不重叠的
       命中区间。用法逐字相同 (换成 rs.NewMatchScanner() 即可), 只有两处不一样:
         ① 交出来的区间按 Lo 【降序】(正向是升序);
@@ -540,7 +540,7 @@
       在这一层补上之前, 这种表反着扫只能当【门】(Match 回答哪几条命中), 要位置还得正向再扫
       一遍全文 —— 而"把 1+k 遍压成 1 遍"正是 MatchScanner 存在的全部意义。
       🔴 方向是【每条 pattern 各自】的决定, 不是一张表的属性: 各建一个单条正/反向 set, 拿真
-         语料比 MemInfo().States, 小的那边就是它该去的那一组。反向 set 本身仍然必须【一条一个
+         语料比 GetMemInfo().States, 小的那边就是它该去的那一组。反向 set 本身仍然必须【一条一个
          或者很小一张表】—— set 里状态数是相乘的, 155 条的反向表在 6.4MB 上是 65 秒。
 
       ── 为什么反向【更好】做, 不是更难做 ──────────────────────────────────────
@@ -589,7 +589,7 @@
             }
             return true                              // 返 false = 提前停
         })
-        // 之后 s.Hit(i) / s.HitIDs(nil) 是命中表 (ExistOnly 那几条唯一的产物)
+        // 之后 s.IsHit(i) / s.GetHitIDs(nil) 是命中表 (ExistOnly 那几条唯一的产物)
       buf 的长度只决定一批交多少条 (过桥次数), 不影响结果; 几百到几千都行。
       🔴 Re2SetFrel_result_t 与 C 的 cre2_frel_result 是【同一个内存布局】(三个 int32, 无洞):
          Scan 把调用方这个切片的地址直接交给 C 写, 不做逐字段搬运。所以那三个字段不许加、
@@ -611,7 +611,7 @@
                       挂进待取列表                                 同上, g2 档
         ③ 补起点      这一条 pattern 自己的【单条】对象, 反向锚定  cre2_frel.cpp FrelCloseSeg
       ③ 走单条不走 set 是本库那条总规矩 (2026-08-27, 理由见上面 MatchScanner 那节)。
-      真表上 ②③ 的账: Stats().NResolve / Stats().NSeg = 【每个分量问了几次反向锚定】,
+      真表上 ②③ 的账: GetStats().NResolve / GetStats().NSeg = 【每个分量问了几次反向锚定】,
       10 条通用 pattern × 三档语料实测恒为 1.00 (一个分量一趟就结完); UsedPeak (native 侧
       游程峰值) 是 16~64 字节量级, 与正文长度无关。Go 侧稳态 0 allocs/op。
 
@@ -636,7 +636,7 @@
       挡掉的是这一层真花钱的那步, 不只是少交几处结果 —— 门上很多位只当外层短路的 bool 用
       (bgAPACCombined 那种), 从来没人问它在哪, 真表上光两条这样的 pattern 就占了 57% 的游程。
       回调里自己过滤顶替不了: 那是钱已经花完了才扔。
-      🔴 能匹配空串的 pattern (PatternLenRange 的 min <= 0) 只允许配 ExistOnly, 否则
+      🔴 能匹配空串的 pattern (GetPatternLenRange 的 min <= 0) 只允许配 ExistOnly, 否则
          NewRe2SetFrel 【当场】报错 (与正文无关, 建的时候就定死, 能直接写成回归测试)。
 
       ── 🔴 量它的时候: 这几条循环对【代码布局】极其敏感 ──────────────────────

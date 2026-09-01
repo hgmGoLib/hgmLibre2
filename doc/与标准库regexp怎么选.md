@@ -199,7 +199,7 @@ DFA 状态缓存的读锁(见 [README#concurrency](../README.md#concurrency-shar
 | | 只编译不扫 | 再扫 16×100KiB 最坏形状语料 |
 |---|---:|---:|
 | stdlib | +0.93 MB | +0.16 MB |
-| 本库 | **+0.79 MB** | +1.68 MB(`DFAStats().Resets = 0`) |
+| 本库 | **+0.79 MB** | +1.68 MB(`GetDFAStats().Resets = 0`) |
 
 读法:**常驻这一格本库还略省**(正则实体在 C 侧,比标准库的 Go 侧程序表小)。
 扫起来之后多出来的 ~1.5 MB 是 DFA 状态缓存 —— 这是本库拿内存换时间的地方,
@@ -207,7 +207,7 @@ DFA 状态缓存的读锁(见 [README#concurrency](../README.md#concurrency-shar
 
 ⚠ 但这一格**会随 pattern 形状爆炸**,不能外推:`S B{m,n} L` 那类
 (起始类窄于重复类的计数重复)正向 DFA 状态数对界指数增长,单条就能吃掉几 MB。
-真怕内存就量 `Resets`(`>0` 就是在 thrash)和 `MemInfo()`,别猜;
+真怕内存就量 `Resets`(`>0` 就是在 thrash)和 `GetMemInfo()`,别猜;
 形状允许的话**换个方向扫比调预算便宜**,见 [README#scanning-backwards](../README.md#scanning-backwards)。
 
 ---
@@ -285,7 +285,7 @@ DFA 状态缓存的读锁(见 [README#concurrency](../README.md#concurrency-shar
   过桥价(67 ns)与编译价随平台/Go 版本漂移,**§2.1 和 §2.3 这两档换平台要重量**;
   §1 那些 10 倍以上的差距是算法级的(DFA vs 回溯),不会因为换机器翻盘。
 * pattern 是**按形状合成的**。真表里如果有 `S B{m,n} L` 那类状态数对界指数的形状,
-  §3.2 的内存结论不适用 —— 那种要单独量 `Resets` / `MemInfo()`,并考虑反着扫。
+  §3.2 的内存结论不适用 —— 那种要单独量 `Resets` / `GetMemInfo()`,并考虑反着扫。
 * 本文只比了**单条 `Regexp`**。N 条正则要一起扫的话,正确的比较对象根本不是"N 条标准库正则",
   而是一个 `RegexpSet`(一遍 DFA 回答"哪几条命中"),那是另一个数量级的话题 ——
   见 [README#regexpset](../README.md#regexpset) 与 [set性能优化经验.txt](set性能优化经验.txt)。

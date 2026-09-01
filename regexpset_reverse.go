@@ -3,7 +3,7 @@
 //
 // ── 为什么必须拆成两个类型 ──────────────────────────────────────────────────
 // ① 两份完全不同的 DFA 状态缓存。正向和反向是两套程序 (Prog / ReverseProg), 各自挂各自的
-//    状态缓存。混在一个对象里, MemInfo() 报的是哪一份就说不清了 —— 而"状态缓存有多大"
+//    状态缓存。混在一个对象里, GetMemInfo() 报的是哪一份就说不清了 —— 而"状态缓存有多大"
 //    正是这个库唯一真正要盯的成本。
 // ② 两边的贵法差着三个数量级, 而这件事必须写在类型上让人看见。真表实测: 155 条正向 set
 //    扫 6.4MB = 18ms / 零 flush; 同一张表反向 = 65 秒 / arena 顶满 254MB 还在 flush
@@ -22,7 +22,7 @@
 //	ResolveSpan*          给一个右端, 锚定回推出左端 (不扫正文)
 //
 // 反向 set 最主要的用途【不是】扫正文, 是最后那个 ResolveSpan*: 单点、锚定、有界,
-// 代价只跟"回看多远"有关, 与正文长度无关。要拿它扫全文之前先量一遍 MemInfo().Flushes。
+// 代价只跟"回看多远"有关, 与正文长度无关。要拿它扫全文之前先量一遍 GetMemInfo().Flushes。
 package hgmLibre2
 
 // RegexpSetReverse 是反向编译的多正则集合 (构建期一次编译 · 扫描期只读 · 并发安全)。
@@ -64,9 +64,9 @@ func (r *RegexpSetReverse) MatchStatsBytes(text []byte, buf []int32, st *ScanSta
 	return r.s.MatchStatsBytes(text, buf, st)
 }
 
-// MemInfo 查这个 set 当前的 DFA 缓存水位 (额度用掉多少 · 装了多少状态 · 生涯清空过几次)。
+// GetMemInfo 查这个 set 当前的 DFA 缓存水位 (额度用掉多少 · 装了多少状态 · 生涯清空过几次)。
 // 反向 set 上这个数尤其该看 —— 反向的状态数是每条各自最坏情况【相乘】出来的。
-func (r *RegexpSetReverse) MemInfo() SetMemInfo { return r.s.MemInfo() }
+func (r *RegexpSetReverse) GetMemInfo() SetMemInfo { return r.s.GetMemInfo() }
 
 // Attrib 查建状态的归因 (要 -DRE2_DFA_ATTRIB=1 编译), 含义同 (*RegexpSet).Attrib。
-func (r *RegexpSetReverse) Attrib() AttribInfo { return r.s.Attrib() }
+func (r *RegexpSetReverse) GetAttrib() AttribInfo { return r.s.GetAttrib() }

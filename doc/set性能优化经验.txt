@@ -30,7 +30,7 @@ hgmLibre2 性能优化经验 —— 给【调用者】看的
 一、心智模型: 三个旋钮 + 一道悬崖
 ================================================================================
 1.1 maxMem 是一个旋钮, 同时抬两条完全不同的天花板
-    单条: CompileMaxMem(pat, maxMem) / re.MaxMem()      集合: NewRegexpSetMaxMem(pats, maxMem)
+    单条: CompileMaxMem(pat, maxMem) / re.GetMaxMem()      集合: NewRegexpSetMaxMem(pats, maxMem)
     默认都是 DefaultMaxMem = 8MB (RE2::Options::kDefaultMaxMem), 传 <=0 回落到它。
     · 【编译期】程序 (NFA 指令) 条数上限。撞了 = 构造函数直接返回 error
       ("pattern too large - compile failed" / "set compile failed (out of memory)")。
@@ -76,20 +76,20 @@ hgmLibre2 性能优化经验 —— 给【调用者】看的
 ================================================================================
 二、怎么量 (四个读数, 按粒度从粗到细)
 ================================================================================
-2.1 进程级: DFAStats() / DFAStatsZero()
+2.1 进程级: GetDFAStats() / ResetDFAStats()
     挂在 re2 全局钩子上, 回答"这个进程里有人在 thrash"。归不了因 (一个进程几十个 Set 分不开),
     但零成本、随时能读。适合放在监控里当报警指标, 也是**单条 Regexp 正向路径唯一的读数**
-    (单条没有 MemInfo)。
-        hgmLibre2.DFAStatsZero()
+    (单条没有 GetMemInfo)。
+        hgmLibre2.ResetDFAStats()
         ...跑一批真正文...
-        st := hgmLibre2.DFAStats()   // st.Resets == 0 才叫预算够
+        st := hgmLibre2.GetDFAStats()   // st.Resets == 0 才叫预算够
     字段: Resets (整表清空次数) · SearchFailures (DFA 放弃, 退回 NFA, 慢一个量级但结果仍对) ·
           LastStateBudget / LastCacheStates (最近一次清空时的额度与状态数 = working set 的下界样本)。
 
-2.2 按 Set: set.MemInfo()
+2.2 按 Set: set.GetMemInfo()
     回答"这一个 Set 现在什么水位、生涯清空过几次"。只读, 不会因为查询而建状态。
-        mi := set.MemInfo()
-        mi.StateBudget / mi.MemLeft   // 额度与剩余; Used() = 两者之差
+        mi := set.GetMemInfo()
+        mi.StateBudget / mi.MemLeft   // 额度与剩余; GetUsedBytes() = 两者之差
         mi.States                     // 当前缓存里有多少个状态
         mi.ArenaCap                   // 实际占的内存 (远小于 StateBudget 说明"额度给多了也不花钱")
         mi.FlushesTotal               // 生涯整表清空次数 —— 这个是不是 0, 就是调预算的判据
@@ -114,7 +114,7 @@ hgmLibre2 性能优化经验 —— 给【调用者】看的
 2.4 排障档: 谁在造状态 (要专门编译)
     默认构建里没有这套代码。排障时:
         CGO_CXXFLAGS="-O2 -DRE2_DFA_ATTRIB=1" go build ./...
-        a := set.Attrib()
+        a := set.GetAttrib()
         for _, p := range a.Pats[:20] { ... }   // 已按 Excess 降序, p.Index 就是 patterns 的下标
     · a.Pats 是**每条 pattern 造状态的责任排行榜**。排序键是 Excess, 不是 States ——
       非锚定搜索下几乎每条 pattern 都出现在几乎每个状态里, States 会饱和成 100%, 没有分辨力。
@@ -126,9 +126,9 @@ hgmLibre2 性能优化经验 —— 给【调用者】看的
     这个榜单可信, 有消融验证: 按榜单摘掉前 20 条 → 状态数降 5.4 倍; 随机摘 20 条 → 只降 1.4 倍。
     而且**跨语料稳定**: 三份形态完全不同的语料, 前 12 名有 10~11 名是同一批 pattern。
     🔴 但它是【归因】不是【因果】, 而且这两者实测会**排出不同的顺序**: 在一张 65 条的真表上,
-      Attrib 榜首那条的因果贡献只排第 2, 而因果第 1 名 (一条摘掉就省 88% 额度) 在 Attrib 榜上排第 3。
+      GetAttrib 榜首那条的因果贡献只排第 2, 而因果第 1 名 (一条摘掉就省 88% 额度) 在 GetAttrib 榜上排第 3。
       原因见 §3.1 —— Excess 数的是状态的【单价】, 而额度是按状态的【数量】收的。
-      ⇒ Attrib 用来**快速缩小范围** (一遍就出), 定死病灶要用**留一消融** (N 条跑 N+1 遍, 见 §2.5)。
+      ⇒ GetAttrib 用来**快速缩小范围** (一遍就出), 定死病灶要用**留一消融** (N 条跑 N+1 遍, 见 §2.5)。
 
 2.5 因果版: 留一消融
     逐条摘掉再量全表, 差值 = 这条的真实成本。慢 (N+1 遍) 但这是唯一能读出因果的方法。
@@ -271,9 +271,9 @@ B. **少问一点: 只要"有没有命中"就用 MatchAny** —— 改一行调�
      真需要"哪几条"就老老实实用 Match —— 早退和"命中集完整"本来就不可兼得。
 
 C. **把预算调到 0 flush** —— 必做, 最便宜。
-   翻倍法: 8→16→32→64MB, 每档单线程扫一批互不相同的真正文, 看 FlushesTotal / DFAStats().Resets 增量。
+   翻倍法: 8→16→32→64MB, 每档单线程扫一批互不相同的真正文, 看 FlushesTotal / GetDFAStats().Resets 增量。
    代价基本是零: 额度给多了也不占物理内存 (状态区按需增长, 用不到的页根本不进 RSS),
-   MemInfo().ArenaCap 就是实际花掉的内存, 可以直接对着看。
+   GetMemInfo().ArenaCap 就是实际花掉的内存, 可以直接对着看。
    ⚠ 别卡在"刚好够"那一档 —— 语料一变就掉下去。留一档余量。
    ⚠ 这一步**一个状态都不会少造**。它买的是"别掉悬崖", 不是"变快"。真要省状态看 A / D。
 
@@ -285,7 +285,7 @@ D. **改 pattern** —— 收益与 A 同量级, 但要改判据, 而且会动�
      ④ 削窗口: `A[^。\n]{0,80}B` 的 N 往小了调 —— 线性可定价, 最高 11.9 倍 (§3.3), 但也是收窄。
    ⇒ ②③ 是超集不用重新评审召回, 应该先试; ①④ 动了判据面, 得规则作者点头。
 
-E. **按归因榜单定位病灶** —— 用 §2.4 的 Attrib 排行榜缩范围, 用 §2.5 的留一消融定死。
+E. **按归因榜单定位病灶** —— 用 §2.4 的 GetAttrib 排行榜缩范围, 用 §2.5 的留一消融定死。
    前几条通常就吃掉一半以上的代价 (真表上一条占 88% 的额度)。拿到 Index 之后四种处置:
      ① 翻方向 (A);  ② 改写 (D);  ③ 单独拎成一片 (F);
      ④ 确认业务价值 —— 有时候最贵的那几条召回也最低, 直接下掉最划算。
@@ -315,7 +315,7 @@ G. **前置粗筛** —— §1.4 说了生产上限就是"每份新正文都要�
     建两张 Set: 一张 NewRegexpSet (正向), 一张 NewRegexpSetReverseMaxMem (反向), 各扫一趟, 命中集求并。
     真表 65 条上只有 1 条值得翻, 就把总账从 27949 状态 / 23.52MB / 96 MB/s 打到
     4701 / 3.06MB / 186 MB/s (有效吞吐, 两趟都算进去了), **2285 处命中一处不差**。
-    怎么分组: 逐条单跑两个方向 (各建一张单条 set, 量 MemInfo().States), 便宜 4 倍以上才翻。
+    怎么分组: 逐条单跑两个方向 (各建一张单条 set, 量 GetMemInfo().States), 便宜 4 倍以上才翻。
     没样本时看形状 —— 必需字面量靠尾巴的翻, 靠头的不翻。
 
 5.2 按代价形状切 —— 有效, 但要先认出病灶条
@@ -449,17 +449,17 @@ G. **前置粗筛** —— §1.4 说了生产上限就是"每份新正文都要�
 ================================================================================
 症状 → 动作:
   编译报 "compile failed (out of memory)"       → 预算翻倍 (CompileMaxMem / NewRegexpSetMaxMem), 别拆表
-  吞吐忽高忽低 / 偶发超时                        → 量 FlushesTotal / DFAStats().Resets, >0 就翻倍预算 (§4C)
+  吞吐忽高忽低 / 偶发超时                        → 量 FlushesTotal / GetDFAStats().Resets, >0 就翻倍预算 (§4C)
   预算已经 0 flush 但还是慢                      → 你在 §1.4 那个上限上。看 §4A 能不能翻方向, 或 §4E 找病灶
   某条 pattern 形如 `S B{m,n} LIT` 且 S ⊊ B     → 先试 CompileReverse / NewRegexpSetReverseMaxMem (§4A), 不改语义
-  想知道钱花在哪几条 pattern 上                  → -DRE2_DFA_ATTRIB=1 编译看 Attrib().Pats, 再用留一消融定死 (§2.5)
+  想知道钱花在哪几条 pattern 上                  → -DRE2_DFA_ATTRIB=1 编译看 GetAttrib().Pats, 再用留一消融定死 (§2.5)
   想知道正文哪一段在烧状态                       → 同上, 看 a.BirthHist / RE2_DFA_BIRTH_FILE
   换了新语料就变慢                               → 找字符类驱动的分支 (§3.6), 那种 pattern 对语料形态最敏感
   只想知道"有没有命中", 不要"哪几条"        → set.MatchAny / MatchAnyBytes (§4B), 命中即收工, 不用传 buf
   要拆片                                        → 先确认整表【真的被状态卡住】(§5.4), 再按方向切 (§5.1),
                                                   然后按形状切 (§5.2), 绝对不要按下标轮转
-  单条 Regexp 想看水位                           → 单条没有 MemInfo; 用 (*RegexpReverse).MatchStats 的 ScanStats,
-                                                  正向路径只能看进程级 DFAStats()
+  单条 Regexp 想看水位                           → 单条没有 GetMemInfo; 用 (*RegexpReverse).MatchStats 的 ScanStats,
+                                                  正向路径只能看进程级 GetDFAStats()
 
 一句话总纲:
   **先看能不能翻方向 (不改语义, 收益最大); 病根是"谁能当起点"而不是"重复有多长";

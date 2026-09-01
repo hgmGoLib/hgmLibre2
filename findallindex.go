@@ -210,7 +210,7 @@ func (s *RegexpSet) FindAllIndexBytes(text []byte, alloc *RegexpSet_FindAllIndex
 //
 // 🔴 与正向的差别不只是"端点换了一头": 反向 set 的状态数是每条 pattern 各自最坏情况
 //    【相乘】出来的。真表实测 155 条反向扫 6.4MB = 65 秒 / arena 顶满 254MB 还在 flush,
-//    正向同一张表 18ms / 零 flush。拿反向 set 扫全文之前先量一遍 MemInfo().FlushesTotal;
+//    正向同一张表 18ms / 零 flush。拿反向 set 扫全文之前先量一遍 GetMemInfo().FlushesTotal;
 //    只是想补一处命中的左端, 用 ResolveSpanWithin (单点锚定, 代价与正文长度无关)。
 //
 // 其余 (alloc 语义 · 闭区间 · 顺序 · 缓冲原地复用 · error) 与正向那个完全一致。

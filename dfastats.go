@@ -40,8 +40,8 @@ type DFAStats_t struct {
 	LastCacheStates int64
 }
 
-// DFAStats 取一份当前快照。开销 = 四次原子读, 可以随便调。
-func DFAStats() DFAStats_t {
+// GetDFAStats 取一份当前快照。开销 = 四次原子读, 可以随便调。
+func GetDFAStats() DFAStats_t {
 	s := C.cre2_dfa_stats_get()
 	return DFAStats_t{
 		Resets:          uint64(s.Resets),
@@ -51,6 +51,6 @@ func DFAStats() DFAStats_t {
 	}
 }
 
-// DFAStatsZero 把四个计数归零, 便于分段测量 (标定循环每轮开头调一次)。
+// ResetDFAStats 把四个计数归零, 便于分段测量 (标定循环每轮开头调一次)。
 // 进程级共享: 并发跑多组测量时归零会互相踩, 那种场合请改用取差值。
-func DFAStatsZero() { C.cre2_dfa_stats_zero() }
+func ResetDFAStats() { C.cre2_dfa_stats_zero() }

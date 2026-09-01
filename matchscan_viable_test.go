@@ -7,7 +7,7 @@ import (
 )
 
 // matchscan_viable_test.go —— MatchScanner 补起点那条路 (反向种全部状态收候选 + 升序逐个
-// 正向锚定验) 的回归。ViableStarts 本身的单元测试也在这里。
+// 正向锚定验) 的回归。GetViableStarts 本身的单元测试也在这里。
 //
 // 🔴 2026-08-28 之前这条路叫"路 D2", 挂在一个独立类型 MatchScanner2 上, 与老的路 A
 //    (spanFast) / 路 B (默认档) 并存比价。比完了, A/B 和那个类型一起删了, 这几个用例
@@ -176,7 +176,7 @@ func TestMatchScanBenchTableVsLongest(t *testing.T) {
 			}
 			spans += len(flat) / 2
 		}
-		st := ms.Stats()
+		st := ms.GetStats()
 		t.Logf("语料 %-4s · 账: walks=%d cands=%d tries=%d emits=%d (试/看=%.2f)",
 			kind, st.Walks, st.Cands, st.Tries, st.Emits,
 			float64(st.Tries)/float64(max1(st.Walks)))
@@ -227,7 +227,7 @@ func TestViableStartsBasics(t *testing.T) {
 			t.Fatalf("%q: %v", c.pat, err)
 		}
 		buf := make([]int32, 64)
-		n, err := rs.ViableStarts(c.text, c.from, 0, 0, buf)
+		n, err := rs.GetViableStarts(c.text, c.from, 0, 0, buf)
 		if err != nil {
 			t.Fatalf("%q: %v", c.pat, err)
 		}
@@ -249,7 +249,7 @@ func TestViableStartsBufTooSmall(t *testing.T) {
 	}
 	text := "abcdefghijklmnopqrst"
 	small := make([]int32, 3)
-	n, err := rs.ViableStarts(text, int32(len(text)), 0, 0, small)
+	n, err := rs.GetViableStarts(text, int32(len(text)), 0, 0, small)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -257,7 +257,7 @@ func TestViableStartsBufTooSmall(t *testing.T) {
 		t.Fatalf("[a-z]{1,} 撞 %d 个小写字母, 候选该是 %d 条, 给的是 %d", len(text), len(text), n)
 	}
 	big := make([]int32, n)
-	n2, err := rs.ViableStarts(text, int32(len(text)), 0, 0, big)
+	n2, err := rs.GetViableStarts(text, int32(len(text)), 0, 0, big)
 	if err != nil || n2 != n {
 		t.Fatalf("换大缓冲重来一次该给同样的 %d 条, 给的是 %d (err=%v)", n, n2, err)
 	}
@@ -268,7 +268,7 @@ func TestViableStartsBufTooSmall(t *testing.T) {
 
 // TestMatchScanViableNoAlloc —— 稳态零分配。
 //
-// 🔴 这不是洁癖: ViableStarts 是"每个右端问一次"的调用形态, 那里漏一笔 4 字节就按右端数
+// 🔴 这不是洁癖: GetViableStarts 是"每个右端问一次"的调用形态, 那里漏一笔 4 字节就按右端数
 //    放大 (第一版在函数里开了个局部数组当"len(out)==0 时的落点", 地址交给 C 之后逃逸分析
 //    每次调用把它搬上堆 —— benchPats/命中稀疏 上 33 次回推正好 33 笔)。同一类账见
 //    spanresolve.go 走 _r 孪生那一段, 和 TestSpanPerf_NoAlloc。

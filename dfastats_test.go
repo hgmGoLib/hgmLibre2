@@ -1,4 +1,4 @@
-// dfastats_test.go — DFAStats 的两道门: 该动的时候真的动, 不该动的时候一次都不动。
+// dfastats_test.go — GetDFAStats 的两道门: 该动的时候真的动, 不该动的时候一次都不动。
 //
 // 这两条合起来才说明计数有用: 只验"会涨", 一个恒 +1 的假计数也过; 只验"不涨", 一个恒 0 的死
 // 计数也过。所以【同一批 pattern · 同一批 body】只改预算, 跑两遍对照。
@@ -87,11 +87,11 @@ func TestDFAStats_ThrashIsVisible(t *testing.T) {
 		t.Fatalf("建集失败: %v", err)
 	}
 	buf := make([]int32, set.GetPatternLen())
-	DFAStatsZero()
+	ResetDFAStats()
 	for _, b := range bodies {
 		set.Match(b, buf)
 	}
-	st := DFAStats()
+	st := GetDFAStats()
 	t.Logf("starved: %+v", st)
 	if st.Resets == 0 {
 		t.Fatalf("预算饿到 %d bytes 扫 %d 份互不相同的 body 都没有一次 ResetCache —— "+
@@ -117,19 +117,19 @@ func TestDFAStats_QuietWhenBudgetFits(t *testing.T) {
 	for _, b := range bodies { // 热身: 先把这批语料的状态集走出来
 		set.Match(b, buf)
 	}
-	DFAStatsZero()
+	ResetDFAStats()
 	for _, b := range bodies {
 		set.Match(b, buf)
 	}
-	if st := DFAStats(); st.Resets != 0 {
+	if st := GetDFAStats(); st.Resets != 0 {
 		t.Fatalf("64MB 预算下热身后仍有 %d 次 ResetCache: %+v", st.Resets, st)
 	}
 }
 
 // TestDFAStats_ZeroClears — 归零是真归零 (分段测量靠它)。
 func TestDFAStats_ZeroClears(t *testing.T) {
-	DFAStatsZero()
-	if st := DFAStats(); st != (DFAStats_t{}) {
-		t.Fatalf("DFAStatsZero 之后不是全零: %+v", st)
+	ResetDFAStats()
+	if st := GetDFAStats(); st != (DFAStats_t{}) {
+		t.Fatalf("ResetDFAStats 之后不是全零: %+v", st)
 	}
 }

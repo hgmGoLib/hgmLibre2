@@ -99,7 +99,7 @@ func TestMatchScanAstFuzzVsLongest(t *testing.T) {
 	if nSpan < 1000 {
 		t.Fatalf("只对账了 %d 处区间 —— 语料没造对, 这是空转绿", nSpan)
 	}
-	st := ms.Stats()
+	st := ms.GetStats()
 	t.Logf("300 轮 · 对账 %d 处区间, 与 Longest() 逐字节相同 (末轮账: walks=%d cands=%d tries=%d)",
 		nSpan, st.Walks, st.Cands, st.Tries)
 }

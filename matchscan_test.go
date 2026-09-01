@@ -34,7 +34,7 @@ func TestPatternLenRangeTable(t *testing.T) {
 		{`.`, 1, 4},
 	}
 	for _, c := range cases {
-		lo, hi := PatternLenRange(c.pat)
+		lo, hi := GetPatternLenRange(c.pat)
 		if lo != c.min || hi != c.max {
 			t.Errorf("%q: 得到 (%d,%d), 要 (%d,%d)", c.pat, lo, hi, c.min, c.max)
 		}
@@ -137,7 +137,7 @@ func TestMatchScanUnboundedTail(t *testing.T) {
 	}
 }
 
-// TestMatchScanStrictVsFindAll —— 随机语料上的差分对账。两档两个口径, 按 PatternLenRange 分:
+// TestMatchScanStrictVsFindAll —— 随机语料上的差分对账。两档两个口径, 按 GetPatternLenRange 分:
 //
 //	定长 (min == max)  【逐字节等于 FindAll】。这一档是可以论证的 (右端定了起点就唯一),
 //	                   也是唯一能拿去切片过校验位 (身份证 / IBAN mod-97 / Luhn) 的一档。
@@ -168,7 +168,7 @@ func TestMatchScanStrictVsFindAll(t *testing.T) {
 	fixed := make([]bool, len(pats))
 	wantUnres := map[int32]bool{}
 	for i, p := range pats {
-		lo, hi := PatternLenRange(p)
+		lo, hi := GetPatternLenRange(p)
 		fixed[i] = lo == hi && hi >= 0
 		if lo <= 0 {
 			wantUnres[int32(i)] = true
@@ -291,7 +291,7 @@ func TestMatchScanEmptyCapableFallback(t *testing.T) {
 	}
 }
 
-// TestMatchScanBoolOnly —— 配了 boolOnly 的那几条: 位照样亮 (Hit/HitIDs), 但一处区间都不收口、
+// TestMatchScanBoolOnly —— 配了 boolOnly 的那几条: 位照样亮 (IsHit/GetHitIDs), 但一处区间都不收口、
 // 一次端点都不补, 一处都不交出来 (也【不】进 unresolved —— 那是调用方自己关掉的)。
 func TestMatchScanBoolOnly(t *testing.T) {
 	set, err := NewRegexpSet([]string{`[A-Z]\d{3}`, `[a-f]{2,6}`})
@@ -307,8 +307,8 @@ func TestMatchScanBoolOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	byPat := scanByPat(t, ms, "A123 beef")
-	if !ms.Hit(0) || !ms.Hit(1) {
-		t.Fatalf("两条都该命中: %v", ms.HitIDs())
+	if !ms.IsHit(0) || !ms.IsHit(1) {
+		t.Fatalf("两条都该命中: %v", ms.GetHitIDs())
 	}
 	if len(byPat[0]) != 0 {
 		t.Errorf("第 0 条配的是 boolOnly, 不该交出任何区间, 却给了 %v", byPat[0])

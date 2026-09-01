@@ -15,7 +15,7 @@ import (
 func TestCompileMaxMem_Readback(t *testing.T) {
 	re := MustCompile(`abc`)
 	defer re.FreeC()
-	if got := re.MaxMem(); got != DefaultMaxMem {
+	if got := re.GetMaxMem(); got != DefaultMaxMem {
 		t.Fatalf("Compile 出来的 MaxMem=%d, want DefaultMaxMem=%d", got, DefaultMaxMem)
 	}
 	for _, mm := range []int64{1 << 20, 64 << 20, 1 << 30} {
@@ -23,8 +23,8 @@ func TestCompileMaxMem_Readback(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CompileMaxMem(%d): %v", mm, err)
 		}
-		if got := r.MaxMem(); got != mm {
-			t.Fatalf("CompileMaxMem(%d).MaxMem()=%d", mm, got)
+		if got := r.GetMaxMem(); got != mm {
+			t.Fatalf("CompileMaxMem(%d).GetMaxMem()=%d", mm, got)
 		}
 		r.FreeC()
 	}
@@ -34,8 +34,8 @@ func TestCompileMaxMem_Readback(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CompileMaxMem(%d): %v", mm, err)
 		}
-		if got := r.MaxMem(); got != DefaultMaxMem {
-			t.Fatalf("CompileMaxMem(%d).MaxMem()=%d, want 默认 %d", mm, got, DefaultMaxMem)
+		if got := r.GetMaxMem(); got != DefaultMaxMem {
+			t.Fatalf("CompileMaxMem(%d).GetMaxMem()=%d, want 默认 %d", mm, got, DefaultMaxMem)
 		}
 		r.FreeC()
 	}
@@ -109,7 +109,7 @@ func sameIdx(a, b []int) bool {
 // TestCompileMaxMem_BiggerBudgetStopsThrash 是这个旋钮存在的理由本身:
 // 同一条 pattern、同一批【互不相同】的正文, 默认 8MB 下 DFA 反复整表清空, 预算给够就一次都不清。
 //
-// 口径: DFAStats() 是【进程级】计数, 所以这个用例必须单线程跑 (Go test 默认同包串行, 且本用例
+// 口径: GetDFAStats() 是【进程级】计数, 所以这个用例必须单线程跑 (Go test 默认同包串行, 且本用例
 // 不调 t.Parallel)。断言只看 Resets 的方向, 不看吞吐 —— 吞吐在跑测试的机器上不稳。
 func TestCompileMaxMem_BiggerBudgetStopsThrash(t *testing.T) {
 	const pat = `[A-Za-z][A-Za-z0-9]{2,19}key`
@@ -121,13 +121,13 @@ func TestCompileMaxMem_BiggerBudgetStopsThrash(t *testing.T) {
 			t.Fatalf("CompileMaxMem(%d): %v", mm, err)
 		}
 		defer re.FreeC()
-		DFAStatsZero()
+		ResetDFAStats()
 		t0 := time.Now()
 		for _, s := range bodies {
 			re.MatchString(s)
 		}
 		d = time.Since(t0)
-		return DFAStats().Resets, d
+		return GetDFAStats().Resets, d
 	}
 
 	small, dSmall := run(DefaultMaxMem)
@@ -144,20 +144,20 @@ func TestCompileMaxMem_BiggerBudgetStopsThrash(t *testing.T) {
 	// 反着扫是同一个问题的另一条出路, 而且不花内存: 默认预算下就一次都不 flush。
 	rev := MustCompileReverse(pat)
 	defer rev.FreeC()
-	DFAStatsZero()
+	ResetDFAStats()
 	var st ScanStats
 	worst := int64(0)
 	for _, s := range bodies {
 		rev.MatchStats(s, &st)
 		if st.FellBack {
-			t.Fatalf("反向本不该在这条 pattern 上放弃 (预算 %d)", rev.MaxMem())
+			t.Fatalf("反向本不该在这条 pattern 上放弃 (预算 %d)", rev.GetMaxMem())
 		}
 		if st.StatesEnd > worst {
 			worst = st.StatesEnd
 		}
 	}
-	t.Logf("同一条 pattern 反着扫 (默认 8MB): resets=%d 状态峰值=%d", DFAStats().Resets, worst)
-	if got := DFAStats().Resets; got != 0 {
+	t.Logf("同一条 pattern 反着扫 (默认 8MB): resets=%d 状态峰值=%d", GetDFAStats().Resets, worst)
+	if got := GetDFAStats().Resets; got != 0 {
 		t.Fatalf("反向在默认预算下 flush 了 %d 次 —— 反着扫这条路没生效", got)
 	}
 }

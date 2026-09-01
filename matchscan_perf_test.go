@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// matchscan_perf_test.go —— MatchScanner 补起点那条路的价钱与它的账 (Stats / 常驻内存)。
+// matchscan_perf_test.go —— MatchScanner 补起点那条路的价钱与它的账 (GetStats / 常驻内存)。
 //
 // 🔴 2026-08-28 之前这里是【三条路的对照台】(A=spanFast · B=默认档 · D2=MatchScanner2),
 //    整个文件的骨架就是"同一个 set 上开三个工作区各跑一遍比倍数"。三条路合成一条之后
@@ -82,13 +82,13 @@ func TestMatchScanPerfTable(t *testing.T) {
 		ms := msPerfOpen(t, set, text)
 		var n int
 		d := msPerfTime(7, func() { n = msPerfRun(t, ms, text) })
-		st := ms.Stats()
+		st := ms.GetStats()
 		fmt.Printf("%-6s %10s %8.2f   walks=%d cands=%d tries=%d emits=%d (交出 %d 处)\n",
 			kind, d, float64(st.Tries)/float64(max1(st.Walks)),
 			st.Walks, st.Cands, st.Tries, st.Emits, n)
 		ms.Close()
 	}
-	nVp, sVp, aVp := set.ViableOneStats()
+	nVp, sVp, aVp := set.GetViableOneStats()
 	fmt.Printf("常驻: 反向单条 set %d 条 / %d 状态 / %.2fMB —— 这是这条路相对老的路 B 净增的那一笔\n\n",
 		nVp, sVp, float64(aVp)/(1<<20))
 }
@@ -123,7 +123,7 @@ func TestMatchScanPerfHard(t *testing.T) {
 		}
 		ms := msPerfOpen(t, set, text)
 		d := msPerfTime(3, func() { msPerfRun(t, ms, text) })
-		st := ms.Stats()
+		st := ms.GetStats()
 		fmt.Printf("%-22s %10s %8.2f   walks=%d cands=%d tries=%d emits=%d\n",
 			hp.name, d, float64(st.Tries)/float64(max1(st.Walks)),
 			st.Walks, st.Cands, st.Tries, st.Emits)

@@ -133,7 +133,7 @@ as `regexp.Compile` (RE2's default Perl mode), *not* leftmost-longest — e.g.
 `(a|aa)` on `"aa"` yields `"a"`, just like stdlib. UTF-8 input.
 
 - `Compile`, `MustCompile`, `QuoteMeta`
-- `CompileMaxMem` / `MaxMem` — *not* in stdlib; the RE2 memory budget for **one** pattern
+- `CompileMaxMem` / `GetMaxMem` — *not* in stdlib; the RE2 memory budget for **one** pattern
   (`Compile` uses RE2's 8 MB default); see [Scanning backwards](#scanning-backwards) for when it matters
 - `String`, `NumSubexp`, `SubexpNames`
 - `MatchString`
@@ -153,7 +153,7 @@ as `regexp.Compile` (RE2's default Perl mode), *not* leftmost-longest — e.g.
   `MatchBytes`, `MatchAnyBytes`) — *not* in stdlib; one DFA answering "which of these N patterns
   hit" in a single scan; `MatchAny` drops the indices and returns at the **first** hit position
   instead of scanning to the end; see [RegexpSet](#regexpset) below
-- `RegexpSet.MatchStats` / `MatchStatsBytes` (`ScanStats`) and `RegexpSet.MemInfo` (`SetMemInfo`)
+- `RegexpSet.MatchStats` / `MatchStatsBytes` (`ScanStats`) and `RegexpSet.GetMemInfo` (`SetMemInfo`)
   — *not* in stdlib; **per-scan** and **per-Set** DFA counters (flushes, states built, budget
   left); see [Measuring a Set](#measuring-a-set) below
 - `RegexpSet.Attrib` (`AttribInfo`, `PatternCost`) — *not* in stdlib; a diagnostic build answers
@@ -163,8 +163,8 @@ as `regexp.Compile` (RE2's default Perl mode), *not* leftmost-longest — e.g.
   one scan reporting **where** each pattern of the set can end, handed back in batches;
   see [FindAllIndex](#findallindex-the-raw-end-point-runs) below
 - `RegexpSet.NewMatchScanner` (`MatchScanner`, `SetMatch`, `Scan`, `SetModes`,
-  `MatchScanMode_t`, `Hit`,
-  `HitIDs`, `Stats`, `MatchScanStats_t`, `Close`) — *not* in stdlib; the finished form of the
+  `MatchScanMode_t`, `IsHit`,
+  `GetHitIDs`, `GetStats`, `MatchScanStats_t`, `Close`) — *not* in stdlib; the finished form of the
   above: one pass giving the hit table **and** de-duplicated match spans, replacing
   `Match` + one `FindAllStringIndex` per hit pattern;
   see [Where a set matched](#where-a-set-matched-matchscanner) below
@@ -177,9 +177,9 @@ as `regexp.Compile` (RE2's default Perl mode), *not* leftmost-longest — e.g.
   `RegexpSetReverse`, in the opposite direction) — *not* in stdlib; complete one end
   point into a whole span with a single anchored question whose cost does not depend on
   input length; see [ResolveSpan](#resolvespan-complete-one-end-point-into-a-span) below
-- `PatternLenRange` / `RegexpSet.PatternLenRange` / `PatLenUnbounded` — *not* in stdlib;
-  the byte-length range a pattern can match; see [PatternLenRange](#patternlenrange) below
-- `RegexpSet.ViableOneStats` — *not* in stdlib; how much the lazily built per-pattern
+- `GetPatternLenRange` / `RegexpSet.GetPatternLenRange` / `PatLenUnbounded` — *not* in stdlib;
+  the byte-length range a pattern can match; see [GetPatternLenRange](#getpatternlenrange) below
+- `RegexpSet.GetViableOneStats` — *not* in stdlib; how much the lazily built per-pattern
   reverse sets (used to recover left edges) cost in states and bytes
 - `CompileLongest` / `CompileLongestMaxMem` / `MustCompileLongest` — *not* in stdlib as
   constructors (the stdlib spelling is the `re.Longest()` mutator); compile one pattern
@@ -196,9 +196,9 @@ as `regexp.Compile` (RE2's default Perl mode), *not* leftmost-longest — e.g.
   `RegexpSetReverse.ResolveSpanWithin`: given a match end, the leftmost start, bounded.
   Implemented as the very call `RE2::Match` makes internally to find a match's left
   edge (reverse program + `kAnchored` + `kLongestMatch`)
-- `RegexpReverse.MemInfo` — *not* in stdlib; the DFA cache high-water mark of that
+- `RegexpReverse.GetMemInfo` — *not* in stdlib; the DFA cache high-water mark of that
   pattern's reverse program, `Built=false` if it has never been walked (querying never builds it)
-- `DFAStats` / `DFAStatsZero` (`DFAStats_t`) — *not* in stdlib; process-wide counters for DFA
+- `GetDFAStats` / `ResetDFAStats` (`DFAStats_t`) — *not* in stdlib; process-wide counters for DFA
   state-cache flushes; the per-Set counters above are usually what you want instead;
   see [DFA cache thrashing](#dfa-cache-thrashing) below
 - `FindStringIndex_ctx_t` (`NewFindStringIndex_ctx`, `FindStringIndex`, `FindIndex`) — *not* in stdlib;
@@ -214,7 +214,7 @@ as `regexp.Compile` (RE2's default Perl mode), *not* leftmost-longest — e.g.
   answer as a forward `Regexp`, with the DFA walking the **original buffer back to front**;
   see [Scanning backwards](#scanning-backwards) below
 - `RegexpSetReverse` (`NewRegexpSetReverseMaxMem`, `GetPatternLen`, `Match`, `MatchBytes`,
-  `MatchAny`, `MatchAnyBytes`, `MatchStats`, `MemInfo`, `Attrib`, plus the `FindAllIndex`
+  `MatchAny`, `MatchAnyBytes`, `MatchStats`, `GetMemInfo`, `GetAttrib`, plus the `FindAllIndex`
   and `ResolveSpan` families above) — *not* in stdlib; the reverse-compiled twin of
   `RegexpSet`, and a **separate type**: it used to be a `*RegexpSet` carrying a
   `Reverse() bool`, which made two opposite meanings share one method name;
@@ -279,7 +279,7 @@ so the single knob raises two different ceilings:
   *this* is not an error: the DFA flushes its cache and keeps going with the
   same result. It is, however, a **cliff and not a slope** — see
   [DFA cache thrashing](#dfa-cache-thrashing) — and it is invisible unless you
-  count the flushes (`set.MemInfo().FlushesTotal`, or `DFAStats` process-wide;
+  count the flushes (`set.GetMemInfo().FlushesTotal`, or `GetDFAStats` process-wide;
   see [Measuring a Set](#measuring-a-set)).
   See also [Why `Match` has no error return](#why-match-has-no-error-return).
 
@@ -326,15 +326,15 @@ Two properties make it worth counting rather than reasoning about:
   each new shape pushes the state set outward. Benchmark with a rotation of
   distinct bodies, and look at flush counts, not just at throughput.
 
-`DFAStats()` returns a snapshot of process-wide counters; `DFAStatsZero()`
+`GetDFAStats()` returns a snapshot of process-wide counters; `ResetDFAStats()`
 zeroes them for segmented measurement:
 
 ```go
-hgmLibre2.DFAStatsZero()
+hgmLibre2.ResetDFAStats()
 for _, body := range distinctBodies {   // single-threaded, one warm-up pass first
     set.Match(body, buf)
 }
-st := hgmLibre2.DFAStats()
+st := hgmLibre2.GetDFAStats()
 // st.Resets == 0  ⇒  this budget holds this pattern table on this corpus.
 // st.Resets  > 0  ⇒  double maxMem, rebuild the set, measure again.
 // st.LastStateBudget / st.LastCacheStates report the budget and the state count
@@ -377,7 +377,7 @@ text (a cheap literal pre-filter in front of the big set).
 
 #### Measuring a Set
 
-`DFAStats` is process-wide. Two finer counters attribute to one `RegexpSet` and
+`GetDFAStats` is process-wide. Two finer counters attribute to one `RegexpSet` and
 to one call, with no globals and no `thread_local` — so they work under
 concurrency and in a process holding many sets.
 
@@ -395,10 +395,10 @@ hits := set.MatchStats(text, buf, &st)
 // st.StatesEnd, st.StateBudget, st.MemLeft   water level at the end
 
 // Per set: cumulative, read-only, never builds a DFA just to answer.
-mi := set.MemInfo()
+mi := set.GetMemInfo()
 // mi.FlushesTotal  == 0 after a run over distinct bodies ⇒ this budget fits
 // mi.StatesBuiltTotal  the direct "how expensive is this table" number
-// mi.States, mi.Used(), mi.StateBudget, mi.ArenaCap
+// mi.States, mi.GetUsedBytes(), mi.StateBudget, mi.ArenaCap
 ```
 
 `mi.ArenaCap` is the memory actually obtained from the system, as opposed to
@@ -441,7 +441,7 @@ at a budget with zero flushes, so the only variable is the pattern source:
 
 #### Attribution: which patterns build the states
 
-Not compiled in by default. Rebuild with the macro and the `Attrib` accessor
+Not compiled in by default. Rebuild with the macro and the `GetAttrib` accessor
 starts returning data (without it, `Enabled` is false and everything is zero —
 there are no fields and no branches in the default build):
 
@@ -450,7 +450,7 @@ CGO_CXXFLAGS="-O2 -DRE2_DFA_ATTRIB=1" go build ./...
 ```
 
 ```go
-a := set.Attrib()
+a := set.GetAttrib()
 for _, p := range a.Pats[:20] {   // already sorted, most expensive first
     fmt.Println(p.Index, p.Excess)   // p.Index indexes your patterns slice
 }
@@ -551,9 +551,9 @@ err = ms.Scan(body, func(batch []hgmLibre2.SetMatch) {
         handle(m.Index, body[m.Lo:m.Hi])
     }
 })                                // err != nil ⟹ the whole pass is void; redo it with FindAll
-ids := ms.HitIDs()                // the same hit table Set.Match would have returned
-// ms.Hit(i) is the O(1) form of the same answer
-st := ms.Stats()                  // Walks / Cands / Tries / Emits for that pass
+ids := ms.GetHitIDs()                // the same hit table Set.Match would have returned
+// ms.IsHit(i) is the O(1) form of the same answer
+st := ms.GetStats()                  // Walks / Cands / Tries / Emits for that pass
 // st.Tries/st.Walks is the number to watch: 1.00 means the first candidate start was
 // always the answer. Measured 1.00 on every production table. The first three counters
 // cover variable-length patterns only (fixed-length ones never look back); Emits counts
@@ -667,7 +667,7 @@ How the endpoint is recovered, per pattern:
 | pattern shape | mode | how |
 |---|---|---|
 | `min == max` (fixed length) | any | `Lo = Hi - min`, one subtraction, the regex engine is never entered. Both paths agree here, so the mode does not apply. |
-| variable | `span` (default) | **two steps.** ① A reverse pass from the end `e` with **every live state seeded**, walking left until the machine dies, collecting *all* viable-prefix starts in `[cursor, e)` (`RegexpSetReverse.ViableStarts`, on a reverse set holding **just that one pattern**). ② Try those candidates **in ascending order** with an anchored longest forward search; the first one that verifies is the answer. Ascending ⟹ leftmost; longest-mode ⟹ longest end. Strictly leftmost-longest for any pattern shape, and **no `maxLen` is needed** — the look-back's lower bound is wherever the reverse machine died. Cost: the look-back windows are pairwise **disjoint** (bounded by one extra pass over the text) plus however many false candidates get verified — measured `1.00` tries per look-back on every production table. |
+| variable | `span` (default) | **two steps.** ① A reverse pass from the end `e` with **every live state seeded**, walking left until the machine dies, collecting *all* viable-prefix starts in `[cursor, e)` (`RegexpSetReverse.GetViableStarts`, on a reverse set holding **just that one pattern**). ② Try those candidates **in ascending order** with an anchored longest forward search; the first one that verifies is the answer. Ascending ⟹ leftmost; longest-mode ⟹ longest end. Strictly leftmost-longest for any pattern shape, and **no `maxLen` is needed** — the look-back's lower bound is wherever the reverse machine died. Cost: the look-back windows are pairwise **disjoint** (bounded by one extra pass over the text) plus however many false candidates get verified — measured `1.00` tries per look-back on every production table. |
 | — | — | if the single-pattern object will not compile, `maxMem` is too small and `Scan` fails the whole pass. |
 
 **One rule governs all of it (2026-08-27): the pass over the text uses the set; every
@@ -739,7 +739,7 @@ local Claude history) × 9 **production** gate tables = 99 cells. Raw reports in
 - **Memory.** D2 needs a per-pattern *reverse set* (`vp1`); path A needed a per-pattern
   *reverse object* (`rev1`). Same order of magnitude: on the largest table (158 patterns,
   89 of them actually asked for a position) 9.6 MB vs 7.6 MB. Against path B it is a **net
-  add**, since B built no reverse object at all. Measure it with `ViableOneStats()`.
+  add**, since B built no reverse object at all. Measure it with `GetViableOneStats()`.
 
 Removed along with the two paths: `MatchScanMode_spanFast`, the guard rejecting it in
 `MatchScannerReverse.SetModes`, the `MatchScanner2` type, `RegexpSet.reverseOne` /
@@ -759,7 +759,7 @@ state (it was removed on 2026-08-27). Only two:
 
 | where | what it says |
 |---|---|
-| `NewMatchScanner`'s `unsupported` | `[]int32` — pattern indices that cannot produce spans at all. Today there is exactly one reason: the pattern matches the empty string (`PatternLenRange`'s `min <= 0`), so every position is a zero-length hit the cursor cannot pin down. |
+| `NewMatchScanner`'s `unsupported` | `[]int32` — pattern indices that cannot produce spans at all. Today there is exactly one reason: the pattern matches the empty string (`GetPatternLenRange`'s `min <= 0`), so every position is a zero-length hit the cursor cannot pin down. |
 | `Scan`'s `err` | this pass is void — the batches you already received do not count either. Redo the whole input with `FindAll`. |
 
 `unsupported` **does not depend on the input**: it is decided when the workspace is
@@ -900,11 +900,11 @@ without limit (`(?s).*KEY`) constant-cost instead of O(input). Matching context 
 always the **whole** input, so `\b`, `^` and `$` still see the real neighbouring
 bytes — a bound can only make the answer shorter, never wrong.
 
-#### `PatternLenRange`
+#### `GetPatternLenRange`
 
 ```go
-min, max := hgmLibre2.PatternLenRange(`[A-Z]\d{3}`)   // 4, 4
-min, max = set.PatternLenRange(i)                     // same, from the table built with the set
+min, max := hgmLibre2.GetPatternLenRange(`[A-Z]\d{3}`)   // 4, 4
+min, max = set.GetPatternLenRange(i)                     // same, from the table built with the set
 // max == hgmLibre2.PatLenUnbounded (-1) means "no upper bound"
 ```
 
@@ -1024,7 +1024,7 @@ err := s.Scan(body, buf, func(rs []hgmLibre2.Re2SetFrel_result_t) bool {
     }
     return true                          // false = stop early
 })
-// afterwards s.Hit(i) / s.HitIDs(nil) is the hit table (the only output of ExistOnly rows)
+// afterwards s.IsHit(i) / s.GetHitIDs(nil) is the hit table (the only output of ExistOnly rows)
 ```
 
 The slice handed to the callback **is** `buf`; the next batch overwrites it in place.
@@ -1048,9 +1048,9 @@ to the start of the body. Three stages, each where it is cheapest:
 | collect + split | native side, no per-hit bridge crossing | match ends are kept as run-lengths in a per-pattern buffer, handed over one component at a time |
 | resolve starts | that one pattern's **single** `Regexp`, reverse-anchored | one call per non-overlapping match in the component |
 
-`Stats().NResolve / Stats().NSeg` is *how many reverse-anchored searches each component
+`GetStats().NResolve / GetStats().NSeg` is *how many reverse-anchored searches each component
 cost*; on the ten general-purpose patterns of the benchmark it is exactly 1.00 across
-all three corpora. `Stats().UsedPeak` — the native-side run buffer — stays in the tens
+all three corpora. `GetStats().UsedPeak` — the native-side run buffer — stays in the tens
 of bytes and does not grow with the body.
 
 **The de-overlap rule — rightmost *end*, longest.** Start with the bound at the end of
@@ -1081,7 +1081,7 @@ components does not change the answer.
 hits: no runs collected, no liveness watched, no component closed, no start resolved.
 That is the expensive part of this layer, not just a few results you would have thrown
 away — filtering inside the callback is throwing away work already paid for. Patterns
-that can match the empty string (`PatternLenRange` min `<= 0`) may *only* be `ExistOnly`;
+that can match the empty string (`GetPatternLenRange` min `<= 0`) may *only* be `ExistOnly`;
 otherwise `NewRe2SetFrel` fails immediately, independent of any body.
 
 **Measuring it.** These DFA loops are extraordinarily sensitive to code layout on the
@@ -1182,18 +1182,18 @@ the matching start. That second one is what a reverse set is really for.
 pattern backwards: state counts inside a set **multiply**, so a 155-pattern table that
 scans a 6.4 MB body in 18 ms with zero flushes forward takes **65 s** in reverse, with
 the arena pinned at its 254 MB ceiling and still flushing. Measure
-`MemInfo().FlushesTotal` before pointing a reverse set at whole documents; to recover
+`GetMemInfo().FlushesTotal` before pointing a reverse set at whole documents; to recover
 the left edge of a hit you already found, use `ResolveSpanWithin`, whose cost is
 independent of input length. `MatchScanner` does exactly this internally — a lazily
 built **one-pattern** reverse set per pattern that ever needs a left edge, never used
-to scan text (see `ViableOneStats` for what those cost: 32 patterns, 973 states,
+to scan text (see `GetViableOneStats` for what those cost: 32 patterns, 973 states,
 2.0 MB on that table).
 
 **Direction is a per-pattern decision, not a global switch.** The mirror shape
 loses by the same mechanism it wins by: on a corpus containing no `key`,
 `(?s).{20}key` costs 21 states forward and 1 reverse, while `key(?s).{20}` costs
 1 forward and 21 reverse. Measure both directions on real input — build a
-one-pattern set each way and compare `MemInfo().States` — then put each pattern
+one-pattern set each way and compare `GetMemInfo().States` — then put each pattern
 in whichever set matches its cheap direction. Two scans over the input still
 beat one scan that is thrashing.
 
@@ -1424,9 +1424,9 @@ both already vendored here). It answers three questions:
 
 ```go
 p, err := hgmLibre2.NewPrefilter(patterns, 0 /*minAtomLen: 0 = RE2 default*/, 0 /*maxMem*/)
-atoms := p.Atoms()              // lowercased, distinct literals that must appear
-live  := p.Potentials(found)    // given the atom indices found in the text: which patterns can still match
-hard  := p.Unfiltered()         // which patterns need NO literal at all -> they always have to run
+atoms := p.GetAtoms()              // lowercased, distinct literals that must appear
+live  := p.GetPotentials(found)    // given the atom indices found in the text: which patterns can still match
+hard  := p.GetUnfiltered()         // which patterns need NO literal at all -> they always have to run
 ```
 
 `Prefilter` does no matching of its own. It hands you the atom list; you find
@@ -1435,7 +1435,7 @@ those atoms with whatever string matcher you like (an Aho-Corasick automaton, or
 **guaranteed** not to match. Matching must be case-insensitive, or done on a
 lowercased copy of the text, because the atoms are lowercased.
 
-**`Unfiltered()` is the reason this is exposed.** "Screen the text with a cheap
+**`GetUnfiltered()` is the reason this is exposed.** "Screen the text with a cheap
 literal gate first, and only run the big table on what gets through" is the one
 direction that raises the throughput ceiling (see
 `doc/set性能优化经验.txt` §4 G) — but it has a hard cap: patterns with no required
@@ -1449,11 +1449,11 @@ contains the literal `foo`, yet the pattern as a whole is unfilterable, because
 the other alternative does not need `foo`. That reasoning lives in an AND-OR tree
 and is not something you can eyeball. `prefilter_test.go` pins this case, along
 with the soundness property the whole idea rests on: every pattern that really
-matches a text must appear in `Potentials()` for the atoms found in that text.
+matches a text must appear in `GetPotentials()` for the atoms found in that text.
 
 `minAtomLen` is a real trade-off knob, not a tuning detail. Raising it yields
 fewer, longer atoms — a faster matcher, but more patterns fall into
-`Unfiltered()`. Measured on a 112-pattern production table: RE2's default gives
+`GetUnfiltered()`. Measured on a 112-pattern production table: RE2's default gives
 1654 atoms and only 4 unfilterable patterns, but the atoms are so short that they
 occur in nearly every text, so nothing gets filtered out; `minAtomLen=6` gives 216
 atoms and 38 unfilterable patterns, which filters much harder but starts from a

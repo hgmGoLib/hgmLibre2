@@ -221,8 +221,8 @@ func TestMatchScanReverse_Modes(t *testing.T) {
 	if err := ms.Scan("ab 123 cd", func(b []SetMatch) { got = append(got, b...) }); err != nil {
 		t.Fatal(err)
 	}
-	if !ms.Hit(0) || !ms.Hit(1) || !ms.Hit(2) {
-		t.Fatalf("命中表不对: %v", ms.HitIDs())
+	if !ms.IsHit(0) || !ms.IsHit(1) || !ms.IsHit(2) {
+		t.Fatalf("命中表不对: %v", ms.GetHitIDs())
 	}
 	if fmt.Sprint(got) != "[{0 3 6}]" {
 		t.Fatalf("boolOnly 那两条不该出区间: %v", got)

@@ -25,9 +25,9 @@ import (
 // PatLenUnbounded 是 max 的"没有上限"取值。
 const PatLenUnbounded = -1
 
-// PatternLenRange 算一条 pattern 的匹配字节长度区间。max = PatLenUnbounded 表示没有上限。
+// GetPatternLenRange 算一条 pattern 的匹配字节长度区间。max = PatLenUnbounded 表示没有上限。
 // pattern 解析不了时返回 (0, PatLenUnbounded) —— 与"没上限"同一档, 调用方照兜底路走即可。
-func PatternLenRange(pattern string) (min, max int) {
+func GetPatternLenRange(pattern string) (min, max int) {
 	re, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
 		return 0, PatLenUnbounded
@@ -35,9 +35,9 @@ func PatternLenRange(pattern string) (min, max int) {
 	return lenRangeOf(re) // 不 Simplify: {1000} 那种会被展开成一千个节点, 而 OpRepeat 这里本来就直接算
 }
 
-// PatternLenRange 返回集合里第 i 条的长度区间, 越界返回 (0, PatLenUnbounded)。
+// GetPatternLenRange 返回集合里第 i 条的长度区间, 越界返回 (0, PatLenUnbounded)。
 // 结果在建集期算好存着, 这里只是查表。
-func (s *RegexpSet) PatternLenRange(i int) (min, max int) {
+func (s *RegexpSet) GetPatternLenRange(i int) (min, max int) {
 	if i < 0 || i >= len(s.lens) {
 		return 0, PatLenUnbounded
 	}
@@ -53,7 +53,7 @@ type patLen_t struct {
 func buildPatLens(patterns []string) []patLen_t {
 	out := make([]patLen_t, len(patterns))
 	for i, p := range patterns {
-		lo, hi := PatternLenRange(p)
+		lo, hi := GetPatternLenRange(p)
 		if hi > maxCInt || hi < 0 {
 			hi = PatLenUnbounded
 		}

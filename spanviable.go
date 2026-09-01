@@ -1,9 +1,9 @@
-// spanviable.go —— ViableStarts: 给一个匹配【右端】, 把它左边全部【候选起点】收下来。
+// spanviable.go —— GetViableStarts: 给一个匹配【右端】, 把它左边全部【候选起点】收下来。
 //
 // ── 它和 ResolveSpan 差在哪 (只有一处, 但是决定性的) ─────────────────────────
 // 反向 set 的 ResolveSpan  : 反向机器只种【accept】—— 回答的是"哪些 s 使 text[s,e) 【正好】
 //                            是一个匹配", 而且只给最靠左的那一个。
-// 反向 set 的 ViableStarts : 反向机器种【全部指令】—— 回答的是"哪些 s 起头的匹配【路过】了 e",
+// 反向 set 的 GetViableStarts : 反向机器种【全部指令】—— 回答的是"哪些 s 起头的匹配【路过】了 e",
 //                            即 text[s,e) 是个【可行前缀】(还能被某个后缀补成真匹配)。
 //                            后者是前者的超集, 而且【全部】给出来。
 //
@@ -41,7 +41,7 @@ import (
 	"unsafe"
 )
 
-// ViableStarts 把 [bound, from) 里全部候选起点写进 out, 返回【找到的总条数】n。
+// GetViableStarts 把 [bound, from) 里全部候选起点写进 out, 返回【找到的总条数】n。
 //
 //	from  匹配右端 (不含) —— 就是正向 set 的 FindAllIndex 吐出来的那种端点;
 //	bound 回看的左下界 (含), 负数 = 不限。判定用的上下文恒是【整篇正文】, 所以 \b / ^ / $
@@ -56,7 +56,7 @@ import (
 // 🔴 from 这个位置本身【不算】候选 (text[from:from) 是空的可行前缀, 对调用方没有意义)。
 //
 // 无状态、只读 (自己拿 DFA 的缓存读锁), 可以和别的 goroutine 的扫描并发调。
-func (r *RegexpSetReverse) ViableStarts(text string, from, bound, id int32, out []int32) (n int, err error) {
+func (r *RegexpSetReverse) GetViableStarts(text string, from, bound, id int32, out []int32) (n int, err error) {
 	s := r.s
 	if s.size == 0 {
 		return 0, errors.New("re2native: viable starts on empty set")

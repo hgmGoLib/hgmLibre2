@@ -2,11 +2,11 @@
 //
 // 回答三个问题:
 //
-//	Atoms()              这批 pattern 想命中, 正文里【必须】先出现哪些字面量?
+//	GetAtoms()              这批 pattern 想命中, 正文里【必须】先出现哪些字面量?
 //	                     (已小写化、去重 —— 拿它们去正文里找的时候要么大小写不敏感, 要么先折成小写)
-//	Potentials(found)    正文里找到了这几个原子, 那么还有哪几条 pattern 【可能】命中?
+//	GetPotentials(found)    正文里找到了这几个原子, 那么还有哪几条 pattern 【可能】命中?
 //	                     没进这个名单的 pattern 【保证】不命中, 可以整条跳过。
-//	Unfiltered()         哪几条 pattern 【没有】必需字面量, 因而任何前置粗筛都筛不掉?
+//	GetUnfiltered()         哪几条 pattern 【没有】必需字面量, 因而任何前置粗筛都筛不掉?
 //
 // ── 第三个问题才是接这套出来的动机 ────────────────────────────────────────────
 //
@@ -55,7 +55,7 @@ type Prefilter struct {
 // 掉进不可过滤集); 调小 ⇒ 筛得更细但原子表膨胀、短原子在任何正文里都到处是, 筛不掉东西。
 // maxMem 是每条 pattern 各自那个 RE2 的预算 (<=0 = RE2 默认 8MB)。
 //
-// 任一条解析失败即返回 error —— 与 NewRegexpSet 一致: 静默丢掉一条会让 Potentials 的下标
+// 任一条解析失败即返回 error —— 与 NewRegexpSet 一致: 静默丢掉一条会让 GetPotentials 的下标
 // 与调用方的 patterns 下标错位, 那是最难查的一类错。
 func NewPrefilter(patterns []string, minAtomLen int, maxMem int64) (*Prefilter, error) {
 	h := C.cre2_prefilter_new(C.int(minAtomLen), C.int64_t(maxMem))
@@ -91,18 +91,18 @@ func NewPrefilter(patterns []string, minAtomLen int, maxMem int64) (*Prefilter, 
 	return p, nil
 }
 
-// Atoms 返回原子表 (已小写化、去重)。下标就是 Potentials 要的那个 atom 下标。
+// GetAtoms 返回原子表 (已小写化、去重)。下标就是 GetPotentials 要的那个 atom 下标。
 // 返回的是内部切片, 【不要改写】。
-func (p *Prefilter) Atoms() []string { return p.atoms }
+func (p *Prefilter) GetAtoms() []string { return p.atoms }
 
 // GetPatternLen 返回 pattern 条数。
 func (p *Prefilter) GetPatternLen() int { return p.n }
 
-// Potentials 给定"正文里找到的原子下标"(升序不升序都行, 重复也无所谓), 返回还可能命中的
+// GetPotentials 给定"正文里找到的原子下标"(升序不升序都行, 重复也无所谓), 返回还可能命中的
 // pattern 下标 (升序)。没进名单的 pattern 保证不命中。
 //
-// 传 nil / 空切片 ⟹ 返回【不可过滤集】, 见 Unfiltered。
-func (p *Prefilter) Potentials(atomIdx []int32) []int32 {
+// 传 nil / 空切片 ⟹ 返回【不可过滤集】, 见 GetUnfiltered。
+func (p *Prefilter) GetPotentials(atomIdx []int32) []int32 {
 	out := make([]int32, p.n)
 	var ap *C.int
 	if len(atomIdx) > 0 {
@@ -121,11 +121,11 @@ func (p *Prefilter) Potentials(atomIdx []int32) []int32 {
 	return out[:n]
 }
 
-// Unfiltered 返回【一个原子都不需要】的那批 pattern 下标 —— 它们无论正文长什么样都得跑。
+// GetUnfiltered 返回【一个原子都不需要】的那批 pattern 下标 —— 它们无论正文长什么样都得跑。
 //
 // 这个数是任何"前置字面量粗筛"方案的天花板: 筛得掉的那部分再便宜, 也省不掉这批的钱。
 // 做粗筛之前先量它, 别先做完再发现天花板在 3%。
-func (p *Prefilter) Unfiltered() []int32 { return p.Potentials(nil) }
+func (p *Prefilter) GetUnfiltered() []int32 { return p.GetPotentials(nil) }
 
 // FreeC 显式释放 native 资源 (否则靠 finalizer)。释放后不得再调本对象任何方法。
 func (p *Prefilter) FreeC() {

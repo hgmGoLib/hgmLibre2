@@ -133,7 +133,7 @@ func (r *RegexpSetReverse) NewMatchScanner() (m *MatchScannerReverse, unsupporte
 	}
 	for i := 0; i < r.s.size; i++ {
 		p := &m.per[i]
-		minL, maxL := r.s.PatternLenRange(i)
+		minL, maxL := r.s.GetPatternLenRange(i)
 		if minL <= 0 {
 			unsupported = append(unsupported, int32(i))
 			continue
@@ -155,7 +155,7 @@ func (r *RegexpSetReverse) NewMatchScanner() (m *MatchScannerReverse, unsupporte
 //    那一档整个删了 (见 matchscan.go 头注), 于是这里也不再有那道闸 —— 两侧的档位从此
 //    是同一套两态, 不必再解释"为什么这边少一档"。
 //
-// 🔴 能匹配空串的 pattern (PatternLenRange 的 min <= 0) 只允许配 boolOnly, 否则这里当场报错
+// 🔴 能匹配空串的 pattern (GetPatternLenRange 的 min <= 0) 只允许配 boolOnly, 否则这里当场报错
 //    而不是运行时静默退回老路 —— 理由同正向: 每个位置都是一处零长命中, 游标压不住。
 func (m *MatchScannerReverse) SetModes(modes []MatchScanMode_t) error {
 	for i := 0; i < len(modes) && i < len(m.per); i++ {
@@ -190,7 +190,7 @@ func (m *MatchScannerReverse) Close() {
 
 // Scan 从末尾往前扫 text 一遍 —— 这是【唯一】一遍全文。命中区间攒够一批 (matchScanBatch 处)
 // 就调一次 batchFn; 扫完把不足一批的余数也交出去。全程没有任何命中就一次都不调。
-// 返回之后 HitIDs/Hit 可用。
+// 返回之后 GetHitIDs/IsHit 可用。
 //
 // 🔴 交给 batchFn 的切片是内部缓冲本身, 下一批原地覆写 —— 要留就 append 走。
 // 🔴 各条 pattern 的结果是【交错】着来的, 同一条 pattern 内部按 Lo 【降序】(不是升序)。
@@ -352,12 +352,12 @@ func (m *MatchScannerReverse) feed(i int, lo, hi int32) {
 	}
 }
 
-// HitIDs 返回上一次 Scan 命中过的 pattern 下标 (无序 · 不重复), 与 RegexpSetReverse.Match
+// GetHitIDs 返回上一次 Scan 命中过的 pattern 下标 (无序 · 不重复), 与 RegexpSetReverse.Match
 // 给的是同一张表。切片下次 Scan 会被覆写。
-func (m *MatchScannerReverse) HitIDs() []int32 { return m.hits }
+func (m *MatchScannerReverse) GetHitIDs() []int32 { return m.hits }
 
-// Hit 报第 i 条上一次 Scan 有没有命中 (O(1) 查表)。
-func (m *MatchScannerReverse) Hit(i int) bool {
+// IsHit 报第 i 条上一次 Scan 有没有命中 (O(1) 查表)。
+func (m *MatchScannerReverse) IsHit(i int) bool {
 	return i >= 0 && i < len(m.hit) && m.hit[i]
 }
 

@@ -19,10 +19,10 @@
 // 右端补成完整区间 —— 它整个就是【搭在 FindAllIndex 上面的一层】, 自己不碰 native。
 //
 //	SetModes(modes)            【每条要什么】两态: 只要 bool / 要区间 (默认)。全文见下一节。
-//	Scan(text, batchFn)        一遍全文。命中表 (HitIDs / Hit, 与 Set.Match 同解) 边扫边填,
+//	Scan(text, batchFn)        一遍全文。命中表 (GetHitIDs / IsHit, 与 Set.Match 同解) 边扫边填,
 //	                           命中区间【边扫边收口、攒够一批就交出去】。
 //	                           只返回 err: 要么全给, 要么整遍不算数 —— 见下面那一节。
-//	Stats()                    上一遍的账 (回看了几次 · 收到几个候选 · 验了几次 · 吐了几处)。
+//	GetStats()                    上一遍的账 (回看了几次 · 收到几个候选 · 验了几次 · 吐了几处)。
 //	                           变长条的钱全在"验了几个假候选"上, 没这几个数就看不见它。
 //
 // 🔴 一批一批交出去是【内存】上的要求, 不是风格。底下 FindAllIndex 本来就是 sqlite3_step
@@ -98,7 +98,7 @@
 //
 //	变长 (min < max)   【两步】:
 //	                   ① 反向 · 种全部状态 · 从右端 e 往左走到死 —— 把起点落在 [cur, e) 里的
-//	                      【全部可行前缀起点】一次收齐 (spanviable.go 的 ViableStarts,
+//	                      【全部可行前缀起点】一次收齐 (spanviable.go 的 GetViableStarts,
 //	                      走的是 RegexpSet.viableOne 那条"反向 · 只装这一条的 set")。
 //	                   ② 候选【从小到大】逐个拿正向单条 longest 锚定去验 (forwardOne →
 //	                      Regexp.FindStringIndexAtWithin), 第一个验过的就是答案。
@@ -116,7 +116,7 @@
 //
 // ① 候选集不漏。设真答案是 [s, E) 且 s ∈ [cur, e)。E 是一个匹配右端且 E > s >= cur,
 //    而 e 是【> cur 的最小右端】⟹ E >= e ⟹ text[s, e) 是 text[s, E) 的前缀 ⟹ 它是
-//    一个可行前缀 ⟹ s 一定在 ViableStarts 给的候选里。∎
+//    一个可行前缀 ⟹ s 一定在 GetViableStarts 给的候选里。∎
 //    升序试 ⟹ 第一个通过的必然是 leftmost; 而 fwd 是 longest 口径编的, 锚定在 s 上给的
 //    就是最长右端 ⟹ 严格 leftmost-longest。
 //
@@ -192,7 +192,7 @@
 //	内存   本路的常驻是"反向单条 set"(vp1), 路 A 是"反向单条"(rev1), 同一个量级:
 //	       最大的那张 158 条表上 89 条被真问到位置, vp1 9.6MB vs rev1 7.6MB (1.26×)。
 //	       相对路 B 是【净增】—— B 只要正向单条, 一条反向都不建。这一笔是这次换路的
-//	       全部代价, 量它用 (*RegexpSet).ViableOneStats()。
+//	       全部代价, 量它用 (*RegexpSet).GetViableOneStats()。
 //
 // 更早那一笔 (2026-08-27): 两条老路的第二趟原先都回整表 set.ResolveSpan, 换成单条对象之后
 // 答案一字不差而价钱降了 27~36% (TestMatchScanPathsSameAsSetRoute)。那次换的是"回不回 set",
@@ -288,7 +288,7 @@ type msPat_t struct {
 // NewMatchScanner 开一个工作区。热路径上建一次长期留着, 别每次扫描新建。
 //
 // unsupported 是【走不了区间这条路】的那几条 pattern 的下标 —— 当下只有一个原因: 这条能
-// 匹配空串 (PatternLenRange 的 min <= 0)。每个位置都是一处零长命中, 游标压不住, 吐出来的
+// 匹配空串 (GetPatternLenRange 的 min <= 0)。每个位置都是一处零长命中, 游标压不住, 吐出来的
 // text[Lo:Lo] 对下游也没有意义。
 //
 // 🔴 这张名单是【建工作区那一刻就定死】的: 它只看 pattern 本身, 与你之后喂什么正文无关,
@@ -314,7 +314,7 @@ func (s *RegexpSet) NewMatchScanner() (m *MatchScanner, unsupported []int32, err
 	}
 	for i := 0; i < s.size; i++ {
 		p := &m.per[i]
-		minL, maxL := s.PatternLenRange(i)
+		minL, maxL := s.GetPatternLenRange(i)
 		if minL <= 0 {
 			unsupported = append(unsupported, int32(i))
 			continue // spanable 留 false: 之后一律当 bool 用
@@ -335,7 +335,7 @@ type MatchScanMode_t string
 const MatchScanMode_span MatchScanMode_t = ""
 
 // MatchScanMode_boolOnly 只要"命中没命中", 一处区间都不收口、一次端点都不补。
-// 这几条照样进命中表 (Hit/HitIDs), 只是一处区间都不给。
+// 这几条照样进命中表 (IsHit/GetHitIDs), 只是一处区间都不给。
 //
 // 🔴 这是最值钱的一档: 真表上 57% 的游程来自两条只当 bool 用的宽 pattern, 这一挡挡掉的是
 //    它们的端点补全 (真花钱的那步), 不只是内存。
@@ -369,7 +369,7 @@ func (m *MatchScanner) modeOf(i int) MatchScanMode_t {
 }
 
 // Stats 返回上一次 Scan 的账 (见 MatchScanStats_t)。
-func (m *MatchScanner) Stats() MatchScanStats_t { return m.st }
+func (m *MatchScanner) GetStats() MatchScanStats_t { return m.st }
 
 // Close 释放底层的 FindAllIndex 工作区。可重复调。
 func (m *MatchScanner) Close() {
@@ -382,7 +382,7 @@ func (m *MatchScanner) Close() {
 
 // Scan 扫 text 一遍 —— 这是【唯一】一遍全文。命中区间攒够一批 (matchScanBatch 处) 就调一次
 // batchFn; 扫完把不足一批的余数也交出去。全程没有任何命中就一次都不调。
-// 返回之后 HitIDs/Hit 可用。
+// 返回之后 GetHitIDs/IsHit 可用。
 //
 // 🔴 交给 batchFn 的切片是内部缓冲本身, 下一批原地覆写 —— 要留就 append 走。
 // 🔴 各条 pattern 的结果是【交错】着来的 (同一条内部按 Lo 升序), 不按 pattern 分组。
@@ -538,7 +538,7 @@ func (m *MatchScanner) feed(i int, lo, hi int32) {
 		// ① 反向 · 种全部状态 · 回看不越过游标: 把 [cur, e) 里全部候选起点一次收齐。
 		//    🔴 bound = cur 是【正确性】不是省钱: 越过游标推出来的起点会与刚吐出去的
 		//       那一处相交, 那一处就得整个丢掉 = 无声漏报。
-		n, err := p.vp.ViableStarts(m.text, e, p.cur, 0, m.cands)
+		n, err := p.vp.GetViableStarts(m.text, e, p.cur, 0, m.cands)
 		if err != nil {
 			m.failResolve(i, err)
 			return
@@ -546,7 +546,7 @@ func (m *MatchScanner) feed(i int, lo, hi int32) {
 		if n > len(m.cands) {
 			// 缓冲不够 —— 里面写下的是最大的那几个 (恰好最没用的), 整批作废, 换大的重来。
 			m.cands = make([]int32, n*2) // 翻倍留余量: 下一个右端多半也是这个量级
-			n, err = p.vp.ViableStarts(m.text, e, p.cur, 0, m.cands)
+			n, err = p.vp.GetViableStarts(m.text, e, p.cur, 0, m.cands)
 			if err != nil {
 				m.failResolve(i, err)
 				return
@@ -584,12 +584,12 @@ func (m *MatchScanner) feed(i int, lo, hi int32) {
 	}
 }
 
-// HitIDs 返回上一次 Scan 命中过的 pattern 下标 (无序 · 不重复), 与 Set.Match 给的是同一张表。
+// GetHitIDs 返回上一次 Scan 命中过的 pattern 下标 (无序 · 不重复), 与 Set.Match 给的是同一张表。
 // 切片下次 Scan 会被覆写。
-func (m *MatchScanner) HitIDs() []int32 { return m.hits }
+func (m *MatchScanner) GetHitIDs() []int32 { return m.hits }
 
-// Hit 报第 i 条上一次 Scan 有没有命中 (O(1) 查表)。
-func (m *MatchScanner) Hit(i int) bool {
+// IsHit 报第 i 条上一次 Scan 有没有命中 (O(1) 查表)。
+func (m *MatchScanner) IsHit(i int) bool {
 	return i >= 0 && i < len(m.hit) && m.hit[i]
 }
 

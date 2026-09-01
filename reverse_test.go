@@ -173,7 +173,7 @@ func revBodiesFrom(n, size int, alphabet string) []string {
 	return out
 }
 
-// setStates 用一个【单条 pattern 的 Set】量状态数 —— 单条 Regexp 没有按对象的水位读数, Set 有 (MemInfo)。
+// setStates 用一个【单条 pattern 的 Set】量状态数 —— 单条 Regexp 没有按对象的水位读数, Set 有 (GetMemInfo)。
 // 方向由 reversed 决定, 其余一律相同。预算给足 64MB, 免得读到的是 flush 之后的残值。
 func setStates(t *testing.T, pat string, reversed bool, bodies []string) (states int64, usedMB float64, hits int) {
 	t.Helper()
@@ -185,20 +185,20 @@ func setStates(t *testing.T, pat string, reversed bool, bodies []string) (states
 		if err != nil {
 			t.Fatalf("建反向 set (pat=%q): %v", pat, err)
 		}
-		match, memInfo = s.Match, s.MemInfo
+		match, memInfo = s.Match, s.GetMemInfo
 	} else {
 		s, err := NewRegexpSetMaxMem([]string{pat}, 64<<20)
 		if err != nil {
 			t.Fatalf("建正向 set (pat=%q): %v", pat, err)
 		}
-		match, memInfo = s.Match, s.MemInfo
+		match, memInfo = s.Match, s.GetMemInfo
 	}
 	var buf []int32
 	for _, b := range bodies {
 		hits += len(match(b, buf))
 	}
 	mi := memInfo()
-	return mi.States, float64(mi.Used()) / (1 << 20), hits
+	return mi.States, float64(mi.GetUsedBytes()) / (1 << 20), hits
 }
 
 func TestReverseCollapsesStateExplosion(t *testing.T) {
@@ -402,7 +402,7 @@ func TestMatchReverse_ConcurrentLazyInit(t *testing.T) {
 //
 // String 的门是【反的是程序, 不是 pattern 文本】: 反向对象里没有任何"反转过的 pattern 串",
 // 所以 String() 必须逐字节等于编译时给的原文 —— 一旦哪天有人真去反转文本, 这道门会响。
-// MaxMem 的门是它与 CompileMaxMem 同一套约定: 显式预算原样读回, <=0 回落 DefaultMaxMem。
+// GetMaxMem 的门是它与 CompileMaxMem 同一套约定: 显式预算原样读回, <=0 回落 DefaultMaxMem。
 func TestRegexpReverse_StringAndMaxMem(t *testing.T) {
 	const pat = `[A-Za-z][A-Za-z0-9]{2,19}key`
 
@@ -414,7 +414,7 @@ func TestRegexpReverse_StringAndMaxMem(t *testing.T) {
 	if got := rr.String(); got != pat {
 		t.Fatalf("String()=%q, want 源 pattern %q", got, pat)
 	}
-	if got := rr.MaxMem(); got != DefaultMaxMem {
+	if got := rr.GetMaxMem(); got != DefaultMaxMem {
 		t.Fatalf("CompileReverse 出来的 MaxMem=%d, want DefaultMaxMem=%d", got, DefaultMaxMem)
 	}
 
@@ -433,8 +433,8 @@ func TestRegexpReverse_StringAndMaxMem(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CompileReverseMaxMem(%d): %v", mm, err)
 		}
-		if got := r.MaxMem(); got != mm {
-			t.Fatalf("CompileReverseMaxMem(%d).MaxMem()=%d", mm, got)
+		if got := r.GetMaxMem(); got != mm {
+			t.Fatalf("CompileReverseMaxMem(%d).GetMaxMem()=%d", mm, got)
 		}
 		if got := r.String(); got != pat {
 			t.Fatalf("CompileReverseMaxMem(%d).String()=%q", mm, got)
@@ -447,8 +447,8 @@ func TestRegexpReverse_StringAndMaxMem(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CompileReverseMaxMem(%d): %v", mm, err)
 		}
-		if got := r.MaxMem(); got != DefaultMaxMem {
-			t.Fatalf("CompileReverseMaxMem(%d).MaxMem()=%d, want 默认 %d", mm, got, DefaultMaxMem)
+		if got := r.GetMaxMem(); got != DefaultMaxMem {
+			t.Fatalf("CompileReverseMaxMem(%d).GetMaxMem()=%d, want 默认 %d", mm, got, DefaultMaxMem)
 		}
 		r.FreeC()
 	}
@@ -464,8 +464,8 @@ func TestRegexpReverse_StringAndMaxMem(t *testing.T) {
 		t.Fatalf("CompileReverseMaxMem: %v", err)
 	}
 	defer rev32.FreeC()
-	if fwd.MaxMem() != rev32.MaxMem() {
-		t.Fatalf("同预算下正反读回不一致: 正向 %d, 反向 %d", fwd.MaxMem(), rev32.MaxMem())
+	if fwd.GetMaxMem() != rev32.GetMaxMem() {
+		t.Fatalf("同预算下正反读回不一致: 正向 %d, 反向 %d", fwd.GetMaxMem(), rev32.GetMaxMem())
 	}
 }
 

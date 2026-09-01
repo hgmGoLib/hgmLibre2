@@ -70,7 +70,7 @@ import (
 
 // Re2SetFrelPattern_t 是初始化 Re2SetFrel 用的一条。
 //
-// ExistOnly = 这一条只要"有没有命中"(扫完看 Hit(i)), 不要 Start/End。挡掉的是这一层
+// ExistOnly = 这一条只要"有没有命中"(扫完看 IsHit(i)), 不要 Start/End。挡掉的是这一层
 // 真花钱的那步 —— 攒游程 + 盯存活位 + 收口 + 补起点, 不只是少交几处结果。门上很多位
 // 只当外层短路的 bool 用, 从来没人问它在哪, 真表上光两条这样的 pattern 就能占掉一多半
 // 的游程。回调里自己过滤顶替不了: 那是钱已经花完了才扔。
@@ -111,9 +111,9 @@ func NewRe2SetFrel(pats []Re2SetFrelPattern_t) (*Re2SetFrel, error) {
 
 // NewRe2SetFrelMaxMem 同上, 但显式给内存预算 maxMem (字节; <=0 = RE2 默认 8MB)。
 // 这个预算同时管【整表正向 set】和【惰性建出来的每条单条对象】。表大就得调大 ——
-// 判据是扫一批互不相同的真 body 之后 Stats() 里 DFA 有没有在 flush (见 readme.txt)。
+// 判据是扫一批互不相同的真 body 之后 GetStats() 里 DFA 有没有在 flush (见 readme.txt)。
 //
-// 🔴 能匹配空串的 pattern (PatternLenRange 的 min <= 0) 只允许配 ExistOnly, 否则这里
+// 🔴 能匹配空串的 pattern (GetPatternLenRange 的 min <= 0) 只允许配 ExistOnly, 否则这里
 //    当场报错: 每个偏移都是一处零长命中, 游程会长到与正文同量级, 分量也切不动。
 //    这与正文无关, 建工作区那一刻就定死 —— 所以它能直接写成回归测试。
 func NewRe2SetFrelMaxMem(pats []Re2SetFrelPattern_t, maxMem int64) (*Re2SetFrel, error) {
@@ -125,7 +125,7 @@ func NewRe2SetFrelMaxMem(pats []Re2SetFrelPattern_t, maxMem int64) (*Re2SetFrel,
 		if pats[i].ExistOnly {
 			continue
 		}
-		if minL, _ := PatternLenRange(pats[i].Pattern); minL <= 0 {
+		if minL, _ := GetPatternLenRange(pats[i].Pattern); minL <= 0 {
 			return nil, errors.New("re2native: Re2SetFrel 第 " + strconv.Itoa(i) +
 				" 条能匹配空串, 只能配 ExistOnly=true (或走老路 FindAll): " + pats[i].Pattern)
 		}
@@ -176,8 +176,8 @@ func (s *Re2SetFrel) Close() {
 	s.h = nil
 }
 
-// Size 是 pattern 条数 (= Index 的上界)。
-func (s *Re2SetFrel) Size() int { return s.size }
+// GetPatternLen 是 pattern 条数 (= Index 的上界)。与 RegexpSet.GetPatternLen 同解。
+func (s *Re2SetFrel) GetPatternLen() int { return s.size }
 
 // Scan 扫一遍 text, 一批一批把命中交给 fn。fn 返回 false = 提前收工, 剩下的正文不再扫
 // (这不算错, Scan 返回 nil)。
@@ -242,9 +242,9 @@ func (s *Re2SetFrel) lastErr(fallback string) error {
 	return errors.New("re2native: Re2SetFrel " + fallback)
 }
 
-// Hit 回答第 i 条这一遍命中过没有 —— ExistOnly 那几条唯一的产物, 要区间的那几条也照样有。
+// IsHit 回答第 i 条这一遍命中过没有 —— ExistOnly 那几条唯一的产物, 要区间的那几条也照样有。
 // 只在最近一次 Scan 之后有意义。
-func (s *Re2SetFrel) Hit(i int) bool {
+func (s *Re2SetFrel) IsHit(i int) bool {
 	if s == nil || s.h == nil || i < 0 || i >= s.size {
 		return false
 	}
@@ -255,8 +255,8 @@ func (s *Re2SetFrel) Hit(i int) bool {
 	return unsafe.Slice((*byte)(unsafe.Pointer(p)), s.size)[i] != 0
 }
 
-// HitIDs 把命中过的 pattern 下标升序追加进 dst (传 dst[:0] 复用 ⇒ 零分配)。
-func (s *Re2SetFrel) HitIDs(dst []int32) []int32 {
+// GetHitIDs 把命中过的 pattern 下标升序追加进 dst (传 dst[:0] 复用 ⇒ 零分配)。
+func (s *Re2SetFrel) GetHitIDs(dst []int32) []int32 {
 	if s == nil || s.h == nil {
 		return dst
 	}
@@ -284,7 +284,7 @@ type Re2SetFrelStats_t struct {
 
 // Stats 见 Re2SetFrelStats_t。NResolve/NSeg 是"平均每个分量里有几处不重叠的匹配";
 // UsedPeak 是这一层的内存峰值 (与正文长度无关, 只与"同时开着的分量有多大"有关)。
-func (s *Re2SetFrel) Stats() Re2SetFrelStats_t {
+func (s *Re2SetFrel) GetStats() Re2SetFrelStats_t {
 	var st Re2SetFrelStats_t
 	if s == nil || s.h == nil {
 		return st

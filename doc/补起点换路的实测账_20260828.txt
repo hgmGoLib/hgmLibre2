@@ -11,7 +11,7 @@
                                                给的是"第三种口径"(既不是 leftmost-first 也不是 leftmost-longest)。
   B  = MatchScanner 默认档                    : 从 max(游标, e-maxL) 起做一次正向【非锚定】longest 搜索。
                                                一趟, 口径严, 贵在【没有上界的条要走完空隙】。
-  D2 = MatchScanner2                          : 反向机【种全部状态】(RegexpSetReverse.ViableStarts) 收下
+  D2 = MatchScanner2                          : 反向机【种全部状态】(RegexpSetReverse.GetViableStarts) 收下
                                                [游标, e) 里全部可行前缀起点(降序), 再【升序】逐个正向锚定验,
                                                第一个成的就是答案。口径严, 回看窗口两两【不交】。
 
@@ -44,7 +44,7 @@
   就是答案。人造反例 a|[ab]+c 那种 2.00 的退化 (见 TestMatchScanPerfHard) 在真表上不发生。
   常驻: D2 要"反向单条 set"(vp1), A 要"反向单条"(rev1), 同一量级 —— 最大那张 158 条表上
   89 条被真问到位置, vp1 9.6MB vs rev1 7.6MB (1.26x)。相对 B 是【净增】(B 一条反向都不建),
-  这一笔是换路的全部代价, 量它用 (*RegexpSet).ViableOneStats()。
+  这一笔是换路的全部代价, 量它用 (*RegexpSet).GetViableOneStats()。
 
 量具
 ----
