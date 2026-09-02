@@ -319,4 +319,4 @@ leftmost-first,`a*|b` 撞 `"b"` 时引擎在位置 0 先试 `a*`、匹配到空�
   §3.2 的内存结论不适用 —— 那种要单独量 `Resets` / `GetMemInfo()`,并考虑反着扫。
 * 本文只比了**单条 `Regexp`**。N 条正则要一起扫的话,正确的比较对象根本不是"N 条标准库正则",
   而是一个 `RegexpSet`(一遍 DFA 回答"哪几条命中"),那是另一个数量级的话题 ——
-  见 [README#regexpset](../README.md#regexpset) 与 [set性能优化经验.txt](set性能优化经验.txt)。
+  见 [README#regexpset](../README.md#regexpset) 与 [set性能优化经验.md](set性能优化经验.md)。

@@ -22,13 +22,14 @@ the short version is in [Why](#why).
 
 | you want to | read |
 |---|---|
+| a Chinese quick-reference of the whole library (what it does, how to use it, when not to) | [`doc/中文速记.md`](doc/%E4%B8%AD%E6%96%87%E9%80%9F%E8%AE%B0.md) |
 | one pattern, stdlib-shaped API | [Supported API](#supported-api) · [Byte-slice methods](#byte-slice-methods) |
 | pick between this library and stdlib `regexp` | [Why](#why) · [`doc/与标准库regexp怎么选.md`](doc/%E4%B8%8E%E6%A0%87%E5%87%86%E5%BA%93regexp%E6%80%8E%E4%B9%88%E9%80%89.md) |
 | N patterns, "which of them hit" in one scan | [`RegexpSet`](#regexpset) |
 | N patterns, **"which hit *and where*"** in one scan | [One scan, whole spans: the three de-overlap modes](#one-scan-whole-spans-the-three-de-overlap-modes) · [`doc/三种去重叠模式.md`](doc/%E4%B8%89%E7%A7%8D%E5%8E%BB%E9%87%8D%E5%8F%A0%E6%A8%A1%E5%BC%8F.md) |
 | why the span rule is leftmost-longest and how it is proven | [`doc/fll的leftmost-longest保证.md`](doc/fll%E7%9A%84leftmost-longest%E4%BF%9D%E8%AF%81.md) |
 | the raw end points, my own overlap policy | [`FindAllIndex`](#findallindex-the-raw-end-point-runs) · [`ResolveSpan`](#resolvespan-complete-one-end-point-into-a-span) |
-| make a big table fast / stop it thrashing | [Tuning for the DFA state cache](#tuning-for-the-dfa-state-cache) · [`doc/set性能优化经验.txt`](doc/set%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96%E7%BB%8F%E9%AA%8C.txt) · [`doc/状态数为什么会相乘.txt`](doc/%E7%8A%B6%E6%80%81%E6%95%B0%E4%B8%BA%E4%BB%80%E4%B9%88%E4%BC%9A%E7%9B%B8%E4%B9%98.txt) |
+| make a big table fast / stop it thrashing | [Tuning for the DFA state cache](#tuning-for-the-dfa-state-cache) · [`doc/set性能优化经验.md`](doc/set%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96%E7%BB%8F%E9%AA%8C.md) · [`doc/状态数为什么会相乘.md`](doc/%E7%8A%B6%E6%80%81%E6%95%B0%E4%B8%BA%E4%BB%80%E4%B9%88%E4%BC%9A%E7%9B%B8%E4%B9%98.md) |
 | scan a table backwards | [Scanning backwards](#scanning-backwards) |
 | know where this differs from stdlib | [Differences](#differences-from-stdlib-regexp) · [`doc/已有库的坑.md`](doc/%E5%B7%B2%E6%9C%89%E5%BA%93%E7%9A%84%E5%9D%91.md) |
 | know what was changed in the vendored RE2 | [Vendored RE2](#vendored-re2) · `VENDOR.txt` |
@@ -39,7 +40,7 @@ repository, named at the point where it is quoted.
 ## Why
 
 **Use this library by default. Reach for the standard library `regexp` only in the
-three cases listed below** — they are all recognizable by inspection, so no
+four cases listed below** — they are all recognizable by inspection, so no
 experiment is needed to tell them apart.
 
 Go's `regexp` is RE2-*derived* in syntax and in its linear-time guarantee, but its
@@ -77,6 +78,16 @@ re-run it after changing the library or moving to another machine.
   few bytes of input and a pattern simple enough for onepass. Note that "short input"
   alone is **not** the criterion: on a 161-byte string with six backtracking-shaped
   patterns this library is 24× faster and allocation-free.
+- **The pattern can match the empty string** — e.g. `a*`, `x{0,3}`, `(a|)`,
+  `(?m)^[ \t]*$`, `\b`. This library **rejects such patterns at every compile entry point**
+  (see [Empty-capable patterns are rejected](#empty-capable-patterns-are-rejected)), so this
+  is not a judgement call: you either rewrite the pattern or you use the standard library.
+  Rewrite first — an empty-matchable pattern succeeds everywhere, so `FindAll` is forced to
+  emit one match per line and pay the advance-and-restart path for each; on 115 KiB of
+  line-shaped text that is **0.23x** (10.4 ms vs 2.4 ms), while making the same intent
+  non-empty-matchable (`*` → `+`) flips it to **8.45x** in this library's favour and is
+  faster under the standard library too. Only keep stdlib when the zero-length match really
+  is the semantics you want. Numbers: `go test -run TestEmptyWidthMultiline -v .`
 - **You are compiling somebody else's pattern** — user- or config-supplied — and the
   accepted syntax must match stdlib byte for byte. The two engines disagree at the
   edges (`\C`, nesting-depth limit, a few escapes; see
@@ -88,14 +99,6 @@ does not scale linearly here (every search takes a read lock on the DFA state ca
 so on **tiny inputs under heavy concurrency** the two engines come out even. On
 body-sized input the lock is irrelevant and this library is still ~100× ahead at 1000
 goroutines. See [Concurrency](#concurrency-sharing-one-regexp-is-fine-it-just-doesnt-scale-linearly).
-- **the pattern can match the empty string and you `FindAll` over a whole document** — e.g.
-  `(?m)^[ \t]*$` or `(?m)^\s*(?://.*)?$`. An empty-matchable pattern succeeds on every line,
-  so `FindAll` is forced to emit one match per line and pay the advance-and-restart path for
-  each; on 115 KiB of line-shaped text that is **0.23x** (10.4 ms vs 2.4 ms). This is a *pattern
-  shape* problem, not an engine problem: making the same intent non-empty-matchable (`*` → `+`)
-  flips it to **8.45x** in this library's favour, and is faster under the standard library too.
-  Try rewriting the pattern before you settle for the standard library here.
-  Numbers: `go test -run TestEmptyWidthMultiline -v .`
 
 
 Beyond speed, this library also avoids the costs of the usual ways to get native RE2
@@ -666,7 +669,7 @@ two cgo crossings per hit have nothing to amortise against.
 🔴 Both sets of numbers predate the 2026-08-28 path change; they answer a different
 question — *how much better is this layer than not having it* (versus the old "gate `Match`
 plus one `FindAll` per hit pattern") — and that ratio only improved. Post-change numbers are
-in `doc/补起点换路的实测账_20260828.txt`.
+in `doc/补起点换路的实测账_20260828.md`.
 
 Rules that matter, all pinned by tests (`re2set_fll_test.go`, `spanscan_*_test.go`):
 
@@ -797,7 +800,7 @@ candidate, which is exactly what step ① above does.
 **The evidence for collapsing them** — 11 corpora at the 100 MB scale (web build output ·
 eight credential-dense generators · source code + manuals + a native executable · a real
 long chat log) × 9 **production** pattern tables = 99 cells. Raw reports in
-`doc/补起点换路的实测账_20260828.txt`.
+`doc/补起点换路的实测账_20260828.md`.
 
 - **Semantics.** Compared span by span, after sorting into a canonical `(pattern, Lo, Hi)`
   order: D2 vs path B — **zero** differences across **161.9 million** spans. D2 vs path A —
@@ -1534,7 +1537,7 @@ lowercased copy of the text, because the atoms are lowercased.
 **`GetUnfiltered()` is the reason this is exposed.** "Screen the text with a cheap
 literal gate first, and only run the big table on what gets through" is the one
 direction that raises the throughput ceiling (see
-`doc/set性能优化经验.txt` §4 G) — but it has a hard cap: patterns with no required
+`doc/set性能优化经验.md` §4 G) — but it has a hard cap: patterns with no required
 literal (`[A-Za-z0-9+/=_-]{20,}`, `(?-i:\([A-Z]{2,5}\))`) have to run no matter
 what the text looks like. Measure that set **before** building a prefilter stage,
 not after.
@@ -1557,7 +1560,7 @@ atoms and 38 unfilterable patterns, which filters much harder but starts from a
 
 ## Tuning for the DFA state cache
 
-[`doc/set性能优化经验.txt`](doc/set%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96%E7%BB%8F%E9%AA%8C.txt) is the long-form version of the
+[`doc/set性能优化经验.md`](doc/set%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96%E7%BB%8F%E9%AA%8C.md) is the long-form version of the
 performance material above, for a single `Regexp` as well as for a `RegexpSet`:
 the mental model, what to measure and in what order, what actually drives state
 explosion, the three knobs in benefit order (direction > pattern shape > memory
