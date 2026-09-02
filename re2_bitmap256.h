@@ -11,7 +11,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#include "util/logging.h"
+#include "util_logging.h"
 
 namespace re2 {
 

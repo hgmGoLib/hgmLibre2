@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-#include "re2/prefilter_tree.h"
+#include "re2_prefilter_tree.h"
 
 #include <stddef.h>
 #include <algorithm>
@@ -13,11 +13,11 @@
 #include <utility>
 #include <vector>
 
-#include "util/util.h"
-#include "util/logging.h"
-#include "util/strutil.h"
-#include "re2/prefilter.h"
-#include "re2/re2.h"
+#include "util_util.h"
+#include "util_logging.h"
+#include "util_strutil.h"
+#include "re2_prefilter.h"
+#include "re2_re2.h"
 
 namespace re2 {
 

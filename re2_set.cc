@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-#include "re2/set.h"
+#include "re2_set.h"
 
 #include <stddef.h>
 #include <string.h>
@@ -10,14 +10,14 @@
 #include <memory>
 #include <utility>
 
-#include "util/util.h"
-#include "util/logging.h"
-#include "re2/pod_array.h"
-#include "re2/prog.h"
-#include "re2/re2.h"
-#include "re2/regexp.h"
-#include "re2/span_scan.h"
-#include "re2/stringpiece.h"
+#include "util_util.h"
+#include "util_logging.h"
+#include "re2_pod_array.h"
+#include "re2_prog.h"
+#include "re2_re2.h"
+#include "re2_regexp.h"
+#include "re2_span_scan.h"
+#include "re2_stringpiece.h"
 
 namespace re2 {
 
@@ -165,7 +165,7 @@ int RE2::Set::ResolveSpan(const char* text, int textlen, int from, int bound,
   return prog_->SpanResolve(size_, text, textlen, from, bound, id, out);
 }
 
-// ── hgmLibre2 追加 ── 见 set.h / re2_dfa_spanscan.inc。id 与 Match 返回的下标同一套。
+// ── hgmLibre2 追加 ── 见 re2_set.h / re2_dfa_spanscan_inl.h。id 与 Match 返回的下标同一套。
 int RE2::Set::ViableStarts(const char* text, int textlen, int from, int bound,
                            int id, int32_t* out, int outcap) const {
   if (!compiled_ || prog_ == NULL)

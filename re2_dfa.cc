@@ -37,16 +37,16 @@
 #include <utility>
 #include <vector>
 
-#include "util/logging.h"
-#include "util/mix.h"
-#include "util/mutex.h"
-#include "util/strutil.h"
-#include "re2/pod_array.h"
-#include "re2/prog.h"
-#include "re2/span_scan.h"   // ── hgmLibre2 追加 ── 流式游程扫描 (实现见文件末尾的 .inc)
-#include "re2/re2.h"
-#include "re2/sparse_set.h"
-#include "re2/stringpiece.h"
+#include "util_logging.h"
+#include "util_mix.h"
+#include "util_mutex.h"
+#include "util_strutil.h"
+#include "re2_pod_array.h"
+#include "re2_prog.h"
+#include "re2_span_scan.h"   // ── hgmLibre2 追加 ── 流式游程扫描 (实现见文件末尾 include 的 _inl.h)
+#include "re2_re2.h"
+#include "re2_sparse_set.h"
+#include "re2_stringpiece.h"
 
 // Silence "zero-sized array in struct/union" warning for DFA::State::next_.
 #ifdef _MSC_VER
@@ -202,7 +202,7 @@ static const bool ExtraDebug = false;
 
 class DFA {
  public:
-  // ── hgmLibre2 追加 ── 流式游程扫描的工作区 (re2_dfa_spanscan.inc)。它要用 State /
+  // ── hgmLibre2 追加 ── 流式游程扫描的工作区 (re2_dfa_spanscan_inl.h)。它要用 State /
   // RWLocker / StateSaver / RunStateOnByteUnlocked 这些只在本编译单元里可见的东西。
   friend class DFASpanScan;
   // 上面那个和"锚定解析"共用的几行 (推一个字节 / 查状态里有没有某条 pattern)。
@@ -268,11 +268,30 @@ class DFA {
       (RE2_DFA_NEXT_BITS == 16) ? 65536u : 0xFFFFFFFFu;
 #endif
 
+  // ── per-pattern 存活位: 用几个 64 位字 (Re2SetFrel 的分量切分靠它) ──
+  // 每条 pattern 占一位, 上限 64*GLIVE_WORDS 条; 超过才按 % kGBits 折叠
+  // (折叠只会把"死"误判成"活" —— 方向安全, 分量变长而已, 结果不变)。
+  // 默认 4 (= 256 条不折叠)。代价只有 State 大 8*(GW-1) 字节;
+  // 热循环【不】按 GW 收费: 见 spanscan 里的 gpendw_ —— 只碰"有挂着 pattern"的那个字,
+  // 一条没命中就一个字都不碰。所以 GW 调大对没用满的 set 是零成本。
+  // 用 CGO_CXXFLAGS=-DGLIVE_WORDS=1 编一份折叠版来对比。
+#ifndef GLIVE_WORDS
+#define GLIVE_WORDS 4
+#endif
+  static const int kGW = GLIVE_WORDS;
+  static const int kGBits = 64 * GLIVE_WORDS;
+
   // A single DFA state.  The DFA is represented as a graph of these
   // States, linked by the next_ pointers.  If in state s and reading
   // byte c, the next state should be s->next_[c].
   struct State {
     inline bool IsMatch() const { return (flag_ & kFlagMatch) != 0; }
+
+    // ── per-pattern 存活位 (本库自加, 非上游) ──
+    // live_ 的第 (p % kGBits) 位 = 1: 这个状态里还有【不是本位置新起的】指令能走到
+    // pattern p 的 Match。npat > kGBits 时折叠 (折叠只会把"死"误判成"活", 方向安全)。
+    // 是 inst_[] 的纯函数 ⇒ 建状态时算一次, 跟着状态缓存走, 热循环里只读不算。
+    uint64_t live_[GLIVE_WORDS];
 
     int* inst_;         // Instruction pointers in the state.
     int ninst_;         // # of inst_ pointers.
@@ -361,7 +380,7 @@ class DFA {
     kStartAfterNonWordChar = 6,   // text follows non-word character
 
     // ── hgmLibre2 追加 ── 种【全部指令】的那个起始状态 (可行前缀回推用, 见
-    // re2_dfa_spanscan.inc 的 SpanDFA::ViableStarts)。与上面四个 base 或起来用
+    // re2_dfa_spanscan_inl.h 的 SpanDFA::ViableStarts)。与上面四个 base 或起来用
     // (8/10/12/14)。它与 kStartAnchored 不是一回事, 也不冲突: 那个选的是"从 start
     // 还是 start_unanchored 进", 这个是"锚定入口可达的每一条指令都是起点"。
     // 摆进 start_[] 里是为了白拿三样东西 —— arena 搬家时的重定位 · ResetCache 的清空 ·
@@ -607,6 +626,15 @@ class DFA {
   void BuildInstOwner();                          // 构造时跑一次
   void AttribNewState(const int* inst, int ninst);  // CachedState 里每建一个状态调一次
 #endif
+  // ── per-pattern 存活位 ──
+  std::vector<uint64_t> g_reach_;   // 指令 -> 能到达哪几条 pattern; 每条指令 kGW 个字
+  std::vector<uint8_t> g_fresh_;    // 指令在 start_unanchored 的 eps 闭包里 (每个位置都在)
+  uint64_t g_always_[GLIVE_WORDS];  // 起始指令自环的 pattern: 只能一律判活
+  int g_npat_ = 0;
+  int g_ninst_ = 0;
+  void BuildGLive();
+  void GLiveOf(const int* inst, int ninst, uint64_t* out) const;
+
   int64_t mem_budget_;     // Total memory budget for all States.
   int64_t state_budget_;   // Amount of memory remaining for new States.
   StateSet state_cache_;   // All States computed so far.
@@ -788,6 +816,7 @@ DFA::DFA(Prog* prog, Prog::MatchKind kind, int64_t max_mem)
   q0_ = new Workq(prog_->size(), nmark);
   q1_ = new Workq(prog_->size(), nmark);
   stack_ = PODArray<int>(nstack);
+  BuildGLive();   // per-pattern 存活位: O(prog) 一次性
 #if RE2_DFA_ATTRIB
   BuildInstOwner();
   if (const char* f = getenv("RE2_DFA_BIRTH_FILE"))
@@ -1074,6 +1103,221 @@ size_t DFA::NextArrayBytes(int nnext) {
   size_t pad = (alignof(int) - (sizeof(State) + n) % alignof(int)) % alignof(int);
   return n + pad;
 #endif
+}
+
+// ── per-pattern 存活位 ──────────────────────────────────────────────────────
+// 目的: 给 Re2SetFrel 一个【分量边界】—— 某条 pattern 在某个位置上没有活线程,
+// 就没有匹配能跨过这个位置, 于是它左右两侧的命中互不影响, 可以分段独立结算。
+//
+// 🔴 状态里【没有历史】(内容寻址缓存的代价), 所以这里能算的只有一件事:
+//    "这个状态里有没有【不是本位置新起的】、能走到 pattern p 的指令"。
+//    .*? 前缀每个字节都把 start() 的 eps 闭包重新灌一遍, 那批指令 (g_fresh_) 因此
+//    每个位置都在, 带不出任何信息, 要排除。
+// 🔴 排除之后还有一个漏洞: 起始指令自环的 pattern (a+ / [a-z0-9._%+-]+@… 那种),
+//    "新起的线程" 和 "老线程" 落在同一条指令上, 状态分不出来。这些 pattern 记进
+//    g_always_, 一律判活 (= 退回"整篇一个分量", 正确但不省)。
+void DFA::BuildGLive() {
+  const int n = prog_->size();
+  g_reach_.assign(static_cast<size_t>(n > 0 ? n : 1) * kGW, 0);
+  g_fresh_.assign(n > 0 ? n : 1, 0);
+  for (int w = 0; w < kGW; w++)
+    g_always_[w] = 0;
+  g_npat_ = 0;
+  g_ninst_ = n;
+  if (n <= 0)
+    return;
+
+  int npat = 0;
+  for (int id = 0; id < n; id++) {
+    Prog::Inst* ip = prog_->inst(id);
+    if (ip->opcode() == kInstMatch && ip->match_id() + 1 > npat)
+      npat = ip->match_id() + 1;
+  }
+  g_npat_ = npat;
+  if (npat <= 0)
+    return;
+
+  // (1) reach: 每条指令能到达哪几条 pattern 的 Match (按 %64 折叠)。反向定点。
+  //     边的口径与 AddToQueue / RunWorkqOnByte 一致: out()/out1() + 同 list 的 id+1。
+  std::vector<std::vector<int>> preds(n);
+  std::vector<std::vector<int>> succs(n);
+  auto add_edge = [&](int from, int to) {
+    if (to > 0 && to < n) {
+      preds[to].push_back(from);
+      succs[from].push_back(to);
+    }
+  };
+  for (int id = 0; id < n; id++) {
+    Prog::Inst* ip = prog_->inst(id);
+    switch (ip->opcode()) {
+      case kInstMatch:
+        {
+          int b = ip->match_id() % kGBits;
+          g_reach_[static_cast<size_t>(id) * kGW + (b >> 6)] |= uint64_t{1} << (b & 63);
+        }
+        break;
+      case kInstAlt:
+      case kInstAltMatch:
+        add_edge(id, ip->out());
+        add_edge(id, ip->out1());
+        break;
+      case kInstByteRange:
+      case kInstCapture:
+      case kInstNop:
+      case kInstEmptyWidth:
+        add_edge(id, ip->out());
+        break;
+      default:
+        break;
+    }
+    if (ip->opcode() != kInstFail && !ip->last())
+      add_edge(id, id + 1);
+  }
+  {
+    std::vector<int> work;
+    std::vector<char> inq(n, 0);
+    for (int id = 0; id < n; id++) {
+      if (prog_->inst(id)->opcode() == kInstMatch) {
+        work.push_back(id);
+        inq[id] = 1;
+      }
+    }
+    while (!work.empty()) {
+      int id = work.back();
+      work.pop_back();
+      inq[id] = 0;
+      const uint64_t* v = &g_reach_[static_cast<size_t>(id) * kGW];
+      for (size_t k = 0; k < preds[id].size(); k++) {
+        int q = preds[id][k];
+        uint64_t* qv = &g_reach_[static_cast<size_t>(q) * kGW];
+        bool changed = false;
+        for (int w = 0; w < kGW; w++) {
+          uint64_t nv = qv[w] | v[w];
+          if (nv != qv[w]) {
+            qv[w] = nv;
+            changed = true;
+          }
+        }
+        if (changed && !inq[q]) {
+          inq[q] = 1;
+          work.push_back(q);
+        }
+      }
+    }
+  }
+
+  // (2) fresh: start_unanchored 的 eps 闭包 (不跨 ByteRange 的 out —— 那要吃一个字节)。
+  std::vector<int> st;
+  {
+    std::vector<char> seen(n, 0);
+    auto push = [&](int id) {
+      if (id > 0 && id < n && !seen[id]) {
+        seen[id] = 1;
+        st.push_back(id);
+      }
+    };
+    push(prog_->start_unanchored());
+    while (!st.empty()) {
+      int id = st.back();
+      st.pop_back();
+      Prog::Inst* ip = prog_->inst(id);
+      g_fresh_[id] = 1;
+      switch (ip->opcode()) {
+        case kInstAlt:
+        case kInstAltMatch:
+          push(ip->out());
+          push(ip->out1());
+          break;
+        case kInstCapture:
+        case kInstNop:
+        case kInstEmptyWidth:
+          push(ip->out());
+          break;
+        default:
+          break;   // ByteRange / Match: 到此为止
+      }
+      if (ip->opcode() != kInstFail && !ip->last())
+        push(id + 1);
+    }
+  }
+
+  // (3) 前缀链 = 从 start_unanchored 够得着、从 start() 够不着的那截 .*?。
+  std::vector<char> anch(n, 0);
+  {
+    st.clear();
+    int r = prog_->start();
+    if (r > 0 && r < n) {
+      anch[r] = 1;
+      st.push_back(r);
+    }
+    while (!st.empty()) {
+      int id = st.back();
+      st.pop_back();
+      for (size_t k = 0; k < succs[id].size(); k++) {
+        int q = succs[id][k];
+        if (!anch[q]) {
+          anch[q] = 1;
+          st.push_back(q);
+        }
+      }
+    }
+  }
+
+  // (4) "新起的线程" 和 "老线程" 落在同一条指令上的 pattern ⇒ 一律判活。
+  //     判据: 某条 fresh 指令 j 能被"从 start() 出发、至少吃掉一个字节"之后再走到 ——
+  //     那 j 出现在状态里就分不清是本位置新起的还是老线程走到的。
+  {
+    std::vector<char> after1(n, 0);
+    st.clear();
+    for (int id = 0; id < n; id++) {
+      if (!anch[id])
+        continue;
+      Prog::Inst* ip = prog_->inst(id);
+      if (ip->opcode() != kInstByteRange)
+        continue;
+      int q = ip->out();
+      if (q > 0 && q < n && !after1[q]) {
+        after1[q] = 1;
+        st.push_back(q);
+      }
+    }
+    while (!st.empty()) {
+      int id = st.back();
+      st.pop_back();
+      for (size_t k = 0; k < succs[id].size(); k++) {
+        int q = succs[id][k];
+        if (!after1[q]) {
+          after1[q] = 1;
+          st.push_back(q);
+        }
+      }
+    }
+    for (int id = 0; id < n; id++) {
+      if (g_fresh_[id] && anch[id] && after1[id])
+        for (int w = 0; w < kGW; w++)
+          g_always_[w] |= g_reach_[static_cast<size_t>(id) * kGW + w];
+    }
+  }
+}
+
+// GLiveOf: 状态的存活位。inst 的布局是 [inst ids...] MatchSep [match ids...]。
+void DFA::GLiveOf(const int* inst, int ninst, uint64_t* out) const {
+  for (int w = 0; w < kGW; w++)
+    out[w] = g_always_[w];
+  if (g_npat_ <= 0)
+    return;
+  for (int i = 0; i < ninst; i++) {
+    int id = inst[i];
+    if (id == MatchSep)
+      break;
+    if (id < 0 || id >= g_ninst_)
+      continue;
+    if (g_fresh_[id])
+      continue;
+    const uint64_t* v = &g_reach_[static_cast<size_t>(id) * kGW];
+    for (int w = 0; w < kGW; w++)
+      out[w] |= v[w];
+  }
 }
 
 int DFA::StateMemSize(int nnext, int ninst) {
@@ -1426,6 +1670,7 @@ DFA::State* DFA::CachedState(int* inst, int ninst, uint32_t flag) {
   memmove(s->inst_, inst, ninst*sizeof s->inst_[0]);
   s->ninst_ = ninst;
   s->flag_ = flag;
+  GLiveOf(inst, ninst, s->live_);   // per-pattern 存活位
 #if RE2_DFA_HOTSTATS
   s->visits_ = 0;
   {
@@ -3329,4 +3574,7 @@ bool Prog::PossibleMatchRange(std::string* min, std::string* max, int maxlen) {
 
 // ── hgmLibre2 追加 ── 流式游程扫描 (自带 namespace re2)。放文件末尾是因为它要用到
 // 上面所有 DFA 内部件, 而 class DFA 整个定义就在本文件里, 外面的编译单元看不见。
-#include "re2_dfa_spanscan.inc"
+// (原来这里叫 .inc, go build 的缓存【不看 .inc 文件】, 改了不触发重编, 只能靠手动
+//  +1 一个 cachebust 宏。改名成 _inl.h 之后 go build 把它算进 HFiles 一起哈希,
+//  那个宏就没用了, 一并删掉。)
+#include "re2_dfa_spanscan_inl.h"

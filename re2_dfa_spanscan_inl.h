@@ -1,12 +1,17 @@
-// re2_dfa_spanscan.inc — ── hgmLibre2 追加 (非上游 re2) ──
+// re2_dfa_spanscan_inl.h — ── hgmLibre2 追加 (非上游 re2) ──
 // RE2::Set "命中在哪"的实现, 两件事:
 //   · DFASpanScan  : 流式游程扫描 —— 一遍扫正文, 吐每条 pattern 的命中【端点】;
 //   · SpanDFA::Resolve : 锚定解析 —— 给定一个端点, 求同一条 pattern 的【另一端】。
-// 两者的语义/为什么这么设计见 re2/span_scan.h。
+// 两者的语义/为什么这么设计见 re2_span_scan.h。
 //
-// 这份文件被 re2_dfa.cc 在文件末尾 #include 进来 (不是独立编译单元): class DFA 整个定义
-// 就在 re2_dfa.cc 里, 外面看不见 State / RWLocker / StateSaver / RunStateOnByteUnlocked,
-// 所以只能同编译单元。拆成单独文件是为了不让 re2_dfa.cc 再长 400 行。
+// 🔴 这不是普通头文件, 是"只给 re2_dfa.cc 末尾 #include 一次"的实现片段 (没有 include
+// guard, 里面全是函数体, 被第二个编译单元 include 就是重复定义)。名字用 -inl.h 是跟着上游
+// 的 re2_walker-inl.h 走的。为什么只能这么摆: class DFA 整个定义就在 re2_dfa.cc 里, 外面
+// 看不见 State / RWLocker / StateSaver / RunStateOnByteUnlocked, 所以只能同编译单元;
+// 拆成单独文件是为了不让 re2_dfa.cc 再长 400 行。
+// 🔴 扩展名【必须是 .h】, 不能用 .inc: go build 的缓存只哈希包目录里它认得的扩展名
+// (.go/.c/.cc/.cpp/.h/.s...), .inc 对 go 完全不存在 —— 只改这个文件的话 go build 会直接
+// 复用旧目标文件, 编出来的是旧二进制, 而且一声不吭。也不能叫 .cc (那会被当成第二个编译单元)。
 //
 // 🔴 热循环是【另写的一份】, 不往 InlinedSearchLoop 里塞 if。两者要回答的问题不同:
 //    老的一路只管把 id 塞进 SparseSet (每个 id 塞一次就够, 位置无所谓, 塞完还能 early-out);
@@ -82,7 +87,7 @@ struct SpanDFA {
   static int Resolve(DFA* dfa, bool run_forward, const char* text, int textlen,
                      int from, int bound, int id, int32_t* out);
 
-  // ── 可行前缀回推 (MatchScanner2 / 路 D2 用) ────────────────────────────────
+  // ── 可行前缀回推 (fll 那条路补起点用) ─────────────────────────────────────
   // ViableStart  : 拿"种全部指令"的那个起始状态 (按 flags 缓存在 start_[base|kStartViable])。
   // ViableStarts : 从 from 往左走一趟, 沿途把每一个【候选起点】收下来。
   static DFA::State* ViableStart(DFA* dfa, int base, uint32_t flags);
@@ -92,6 +97,16 @@ struct SpanDFA {
 
 class DFASpanScan {
  public:
+  typedef DFASpanScanG2Rec G2Rec;   // g2: 交给调用方的分量记录 (定义在 span_scan.h)
+
+  // 逐条状态打在一起: 一次命中只碰一条 cache line (拆成几个 vector 会碰几条)。
+  struct G2St {
+    int32_t* p;    // 当前分量的结束位置【游程数组】(NULL = 没开段); p[2k],p[2k+1] = 第 k 条的 lo,hi
+    int32_t cap;   // p 的容量, 单位 int32 (8 起 = 4 条游程, 二倍扩)
+    int32_t n;     // 已用游程条数
+    int32_t lo;    // 本分量左界 (上一次断气的位置)
+  };
+
   DFASpanScan(DFA* dfa, int nid, bool run_forward)
       : dfa_(dfa),
         nid_(nid),
@@ -107,17 +122,79 @@ class DFASpanScan {
         limit_(0),
         lock_(NULL) {
     int n = nid > 0 ? nid : 1;
-    runlo_.resize(n);
-    runhi_.resize(n);
+    // 🔴 runlo_/runhi_ 【不在这里开】—— 它们只有 g1 档 (Note/Flush) 用, 而 g 档要到
+    //    Begin 才定得下来。工作区现在是一遍扫描一开一关的 (cre2_re2set.cpp 那两层),
+    //    每少开一张按 n 的表就是每篇正文少一次 malloc + 4n 字节。见 Begin 里那句补开。
     pend_.assign(n, 0);
     pendlist_.reserve(n);
+    gbool_.assign(n, 0);
+    ghit_.assign(n, 0);
+    G2St z;
+    z.p = NULL;
+    z.cap = 0;
+    z.n = 0;
+    z.lo = 0;
+    g2_.assign(n, z);
+    g2bucket_.resize(31);
+    g2want_.assign(n, 8);
   }
 
-  ~DFASpanScan() { delete saved_; }
+  ~DFASpanScan() {
+#ifdef G2_PEAKDUMP
+    G2PeakDump();
+#endif
+    delete saved_;
+    G2FreeAll();
+  }
 
-  bool Begin(int textlen) {
+  // g 档: 开了之后每个字节读一次 state->live_, 某条 pattern 由活转死就把它当前挂着的
+  // 那一段游程整块收口成一个【分量】, 挂进待取列表 (语义见 span_scan.h)。
+  bool Begin(int textlen) { return Begin(textlen, false); }
+  bool Begin(int textlen, bool gspan) {
     if (textlen < 0)
       return false;
+#ifdef G2_PEAKDUMP
+    G2PeakDump();
+#endif
+    // g 档 (存活位切分量 + 游程留 native) 只在正向 set 上有意义 —— 反向 set 一律关掉。
+    g_span_ = run_forward_ && gspan;
+    // g1 档那两张游程表在这里才开 (见构造函数)。开过就留着 —— 同一个工作区反复 Begin
+    // 的用法 (cre2_spanscan) 一样只付一次。
+    if (!g_span_ && runlo_.empty()) {
+      int n = nid_ > 0 ? nid_ : 1;
+      runlo_.resize(n);
+      runhi_.resize(n);
+    }
+    for (int i = 0; i < nid_; i++)
+      ghit_[i] = 0;
+    for (int w = 0; w < DFA::kGW; w++) {
+      glive_[w] = 0;
+      gpend_[w] = 0;
+    }
+    gpendw_ = 0;
+    G2Recycle();
+    for (int i = 0; i < nid_; i++) {
+      if (g2_[i].p != NULL) {
+        g2live_ -= g2_[i].cap * 4;
+        g2open_ -= g2_[i].cap * 4;
+        G2Heap(-static_cast<long long>(g2_[i].cap) * 4);
+        free(g2_[i].p);
+        g2_[i].p = NULL;
+        g2_[i].cap = 0;
+        g2_[i].n = 0;
+      }
+      g2_[i].lo = 0;
+    }
+    g2peak_ = 0;
+    g2openpeak_ = 0;
+    g2used_ = 0;
+    g2usedpeak_ = 0;
+    g2nopen_ = 0;
+    g2nopenpeak_ = 0;
+    g2heappeak_ = g2heap_;   // 水位不清零, 只把高水位拉回当前值
+    g2ngrow_ = 0;
+    g2alloc_ = 0;
+    g2nseg_ = 0;
     // 上一次扫描要是没扫完就被丢下 (调用方提前 return false), 挂着的状态副本要清掉。
     delete saved_;
     saved_ = NULL;
@@ -165,8 +242,12 @@ class DFASpanScan {
   //    反过来说: 千万别写成"每个命中字节扫一遍挂着的表, 找这次没出现的 id 收口",
   //    那是 O(nid)/字节 (150 条 pattern 就是 150 次/字节), 比想省的那部分还贵。
   //    这里的收口是【惰性】的 —— 等这条 pattern 下次出现、或者整篇扫完才发现它掉出去了。
-  template <bool run_forward>
+  template <bool run_forward, bool gspan>
   inline void Note(int32_t id, int32_t pos) {
+    if (gspan) {
+      G2Note(id, pos);
+      return;
+    }
     if (!pend_[id]) {
       pend_[id] = 1;
       pendlist_.push_back(id);
@@ -183,19 +264,334 @@ class DFASpanScan {
     runhi_[id] = pos;
   }
 
+  // GDeaths: died 里每一位对应一条(折叠后可能是几条) pattern 由活转死。
+  // 把它当前挂着的游程收口, 再吐一条 (id, -1, pos) 告诉调用方"这一分量到此为止"。
+  // 🔴 noinline: 断气是罕见事件, 让它被 inline 进热循环只会把循环体撑大、赶跑 I-cache。
+  //    (实测: 不加这一条, 零命中的第一趟从 0.41ms 掉到 0.65ms —— 纯粹是代码膨胀的钱。)
+  //    dmask 的第 w 位 = died[w] 非零 (热循环只填了这些字, 其余是脏的, 不许读)。
+  __attribute__((noinline)) void GDeaths(const uint64_t* died, uint32_t dmask, int32_t pos) {
+    while (dmask != 0) {
+      int w = __builtin_ctz(dmask);
+      dmask &= dmask - 1;
+      uint64_t d = died[w];
+      while (d != 0) {
+        int b = __builtin_ctzll(d);
+        d &= d - 1;
+        // 折叠时 (kGW=1 且 npat>64) 一位对应好几条 pattern, 所以要按 kGBits 跨步遍历。
+        for (int id = w * 64 + b; id < nid_; id += DFA::kGBits)
+          G2Close(id, pos);
+        gpend_[w] &= ~(uint64_t{1} << b);
+      }
+      if (gpend_[w] == 0)
+        gpendw_ &= ~(uint32_t{1} << w);
+    }
+  }
+
+  // ── g2 (游程档) ───────────────────────────────────────────────────────────
+  // 与 g1 的差别 (语义完全一样, 都是 rightmost-longest 的分量切分):
+  //   ① 一条 pattern 没命中过就【完全不管】存活位 (gpend_ == 0 时热循环里只判一次零);
+  //   ② 结束位置的游程留在 native 侧, 每条 pattern 一块, 从 8 个 int32 (= 4 条) 起二倍扩;
+  //   ③ 分量收口时把整块游程数组交给调用方 —— 命中【不逐条过桥】, 一个分量交一次。
+  // (位图版试过了: 内存和 CPU 都更差, 因为结束位置天生连号, 游程本来就是它的最优压缩。
+  //  换算与实测在原型阶段量过, 结论就是这一句。)
+  inline void GMark(int32_t id) {
+    int b = id % DFA::kGBits;
+    int w = b >> 6;
+    uint64_t bit = uint64_t{1} << (b & 63);
+    gpend_[w] |= bit;
+    gpendw_ |= uint32_t{1} << w;
+    // 新挂上的位先当它"上一个字节还活着": 这个字没挂东西的期间 glive_[w] 是不维护的,
+    // 不补这一下, 紧跟着的那个字节就判不出"这条已经死了", 分量会白白拖长。
+    // (按字懒维护也靠这一行 —— gpendw_ 的第 w 位是 0 时 glive_[w] 一律是脏的。)
+    glive_[w] |= bit;
+  }
+
+  // 内存账口径 (字节): g2open_ = 逐条【还开着】的分量占用 (与 g1 的 Go 侧峰值同口径);
+  //                    g2live_ = 再加上"已收口但调用方还没取走"的那批; 都不含回收池。
+  inline void G2Acct(int32_t ncap) {
+    g2live_ += ncap * 4;
+    g2open_ += ncap * 4;
+    if (g2live_ > g2peak_)
+      g2peak_ = g2live_;
+    if (g2open_ > g2openpeak_)
+      g2openpeak_ = g2open_;
+  }
+
+  // G2Take: 给 id 这条 pattern 的新分量要一块游程数组。
+  //
+  // 🔴 回收池必须【按大小分档】, 不能是一个全局 LIFO。三版都试过, 数字在 readme:
+  //   ① 全局 LIFO: pop 出来的袋子是"历史最大分量"那个级别, 原样发给
+  //      只装一条游程的分量 ⇒ 开着的容量收敛到 (同时开着的分量数 × 全局最大袋)。
+  //      body 表实测: 真正装着 325.8KB, 真实堆 2128.2KB。
+  //   ② 逐条 pattern 一个槽: 内存降到 588KB, 但一个 pattern 在同一批里能开关好几次分量,
+  //      槽空了就得 malloc ⇒ 14.5 万次 malloc/free, 第一趟从 4.4ms 拖到 8.4ms。不要。
+  //   ③ 按 cap 分档的空闲链 (本版): 拿的时候按【这条 pattern 的容量高水位】取对应档,
+  //      所以小分量拿小袋子、大分量拿大袋子; 档内是 LIFO, 零 malloc。两头都拿到。
+  __attribute__((noinline)) int32_t* G2Take(int32_t id, int32_t* cap) {
+    int32_t want = g2want_[id];
+    if (want < 8)
+      want = 8;
+    std::vector<G2Buf>& bk = g2bucket_[G2Bucket(want)];
+    if (!bk.empty()) {
+      G2Buf b = bk.back();
+      bk.pop_back();
+      *cap = b.cap;
+      G2Acct(b.cap);
+      return b.p;
+    }
+    // 档里空着 —— 按这条 pattern 的容量高水位一次开够, 不从 8 起二倍扩。
+    int32_t want2 = g2want_[id];
+    if (want2 < 8)
+      want2 = 8;
+    int32_t* p = static_cast<int32_t*>(malloc(static_cast<size_t>(want2) * sizeof(int32_t)));
+    *cap = want2;
+    g2alloc_ += want2 * 4;
+    G2Heap(static_cast<long long>(want2) * 4);
+    G2Acct(want2);
+    return p;
+  }
+
+  // G2Bucket: cap 恒为 8*2^k, 直接拿最低位的位置当档号。
+  static inline int G2Bucket(int32_t cap) {
+    int b = 0;
+    while ((1 << b) < cap && b < 30)
+      b++;
+    return b;
+  }
+
+  // G2Note 与 g1 的 Note 同一套收敛规则: 与上一条游程连号就接长, 否则开一条新的。
+  inline void G2Note(int32_t id, int32_t pos) {
+    ghit_[id] = 1;
+    if (gbool_[id])   // 这条只要"有没有命中" ⇒ 不攒游程, 也不去盯它的存活位
+      return;
+    G2St& g = g2_[id];
+    GMark(id);
+    if (g.p == NULL) {                       // 开新分量
+      g.p = G2Take(id, &g.cap);
+      if (g.p == NULL)
+        return;
+      g.p[0] = pos;
+      g.p[1] = pos;
+      g.n = 1;
+      G2Used(8);
+      g2nopen_++;
+      if (g2nopen_ > g2nopenpeak_)
+        g2nopenpeak_ = g2nopen_;
+      if (!pend_[id]) {
+        pend_[id] = 1;
+        pendlist_.push_back(id);
+      }
+      return;
+    }
+    int32_t* last = g.p + 2 * g.n - 1;
+    if (pos == *last + 1) {                  // 连号, 接长
+      *last = pos;
+      return;
+    }
+    if (2 * (g.n + 1) > g.cap)               // 二倍扩
+      G2Grow(g);
+    g.p[2 * g.n] = pos;
+    g.p[2 * g.n + 1] = pos;
+    g.n++;
+    G2Used(8);
+  }
+
+  // G2Used: 只算【真正装着结束位置】的字节 (n 条游程 = 8n)。
+  // 与 g2open_ 的差别就是"多申请没用上的那部分" —— 二倍扩的尾巴 + 回收池发下来的大袋子。
+  // G2Heap: 这个 scanner 手上真实持有的堆字节 (malloc 加、free 减)。
+  // 跨 scan 不清零 —— 回收池里的袋子是跨 scan 活着的, 清零就成了自欺欺人。
+  inline void G2Heap(long long d) {
+    g2heap_ += d;
+    if (g2heap_ > g2heappeak_)
+      g2heappeak_ = g2heap_;
+  }
+
+  inline void G2Used(int32_t d) {
+    g2used_ += d;
+    if (g2used_ > g2usedpeak_)
+      g2usedpeak_ = g2used_;
+#ifdef G2_PEAKDUMP
+    // 峰值现场取样: 只在【历史最高水位】又被顶上去 4KB 时才扫一遍开着的分量,
+    // 所以最后留下的快照离真峰值不超过 4KB。默认档不编这段。
+    if (g2used_ > g2snapused_ + 4096) {
+      g2snapused_ = g2used_;
+      g2snap_.clear();
+      for (int i = 0; i < nid_; i++) {
+        G2St& g = g2_[i];
+        if (g.p == NULL)
+          continue;
+        g2snap_.push_back(i);
+        g2snap_.push_back(g.n);
+        for (int k = 0; k < 2 * g.n; k++)
+          g2snap_.push_back(g.p[k]);
+      }
+    }
+#endif
+  }
+
+#ifdef G2_PEAKDUMP
+  // 把峰值现场原样打到 stderr, 一行一个分量: id 游程数 首lo 末hi 然后是每条游程的
+  // "长度:到下一条的空档"。给上层拿去统计到底能不能压。
+  void G2PeakDump() {
+    if (g2snap_.empty())
+      return;
+    fprintf(stderr, "#PEAKDUMP used=%lld\n", g2snapused_);
+    size_t i = 0;
+    while (i < g2snap_.size()) {
+      int32_t id = g2snap_[i++];
+      int32_t n = g2snap_[i++];
+      fprintf(stderr, "C %d %d", id, n);
+      for (int k = 0; k < n; k++) {
+        int32_t lo = g2snap_[i + 2 * k];
+        int32_t hi = g2snap_[i + 2 * k + 1];
+        int32_t gap = (k + 1 < n) ? (g2snap_[i + 2 * k + 2] - hi - 1) : -1;
+        fprintf(stderr, " %d:%d", hi - lo + 1, gap);
+      }
+      fprintf(stderr, "\n");
+      i += 2 * n;
+    }
+    g2snap_.clear();   // 水位 g2snapused_ 【不】清 —— 只有更高的峰值才会再取样、再打一次
+  }
+#endif
+
+  __attribute__((noinline)) void G2Grow(G2St& g) {
+    int32_t nc = g.cap * 2;
+    int32_t* np = static_cast<int32_t*>(realloc(g.p, static_cast<size_t>(nc) * sizeof(int32_t)));
+    if (np == NULL)
+      return;
+    g2alloc_ += (nc - g.cap) * 4;
+    G2Heap((nc - g.cap) * 4);
+    G2Acct(nc - g.cap);
+    g2ngrow_++;
+    g.p = np;
+    g.cap = nc;
+  }
+
+  // G2Close: 把这条 pattern 当前分量的游程数组整块交出去 (所有权转给 g2closed_),
+  // 并把这次断气的位置记成【下一个分量的左界】。
+  void G2Close(int32_t id, int32_t death) {
+    G2St& g = g2_[id];
+    if (g.p != NULL) {
+      G2Rec r;
+      r.id = id;
+      r.lo = g.lo;
+      r.nrun = g.n;
+      r.runs = g.p;
+      g2closed_.push_back(r);
+      g2closedcap_.push_back(g.cap);   // 所有权转给 closed 列表, g2live_ 不变
+      g2used_ -= static_cast<long long>(g.n) * 8;
+      g2nopen_--;
+      if (g.cap > g2want_[id])
+        g2want_[id] = g.cap;   // 这条 pattern 的分量能有多大, 下次一次开够
+      g2nseg_++;
+      g2open_ -= g.cap * 4;
+      g.p = NULL;
+      g.cap = 0;
+      g.n = 0;
+    }
+    if (death >= 0) {
+      // 界就是 death 本身, 不能再 +1: 偏移 death 处没有存活线程, 说明【起点 < death】的
+      // 匹配全断了 —— 但起点【等于】death 的匹配是这个字节新种下的 (fresh, 不算进存活位),
+      // 它完全可以活下去。+1 会把这种匹配漏掉。用 -DGLO_PLUS1 编一份可以看到对拍变红。
+#ifdef GLO_PLUS1
+      g.lo = death + 1;
+#else
+      g.lo = death;
+#endif
+    }
+  }
+
+  // G2Recycle: 上一批交出去的游程数组, 调用方已经读完了, 收回回收池。
+  // (位图版这里还得 memset 清零; 游程是按下标覆写的, 不用清 —— 白省一笔。)
+  void G2Recycle() {
+    for (size_t i = 0; i < g2closed_.size(); i++) {
+      int32_t* p = const_cast<int32_t*>(g2closed_[i].runs);
+      if (p == NULL)
+        continue;
+      G2Buf b;
+      b.p = p;
+      b.cap = g2closedcap_[i];
+      g2live_ -= b.cap * 4;
+      g2bucket_[G2Bucket(b.cap)].push_back(b);
+    }
+    g2closed_.clear();
+    g2closedcap_.clear();
+  }
+
+  void G2FreeAll() {
+    G2Recycle();
+    for (size_t b = 0; b < g2bucket_.size(); b++) {
+      for (size_t i = 0; i < g2bucket_[b].size(); i++) {
+        G2Heap(-static_cast<long long>(g2bucket_[b][i].cap) * 4);
+        free(g2bucket_[b][i].p);
+      }
+      g2bucket_[b].clear();
+    }
+    for (size_t i = 0; i < g2_.size(); i++) {
+      if (g2_[i].p != NULL) {
+        G2Heap(-static_cast<long long>(g2_[i].cap) * 4);
+        free(g2_[i].p);
+      }
+      g2_[i].p = NULL;
+    }
+  }
+
   // NoteState 把一个 match 状态里的所有 pattern id 都记一遍 (布局见 SpanDFA::HasId)。
-  template <bool run_forward>
+  template <bool run_forward, bool gspan>
   inline void NoteState(DFA::State* s, int32_t pos) {
     for (int i = s->ninst_ - 1; i >= 0; i--) {
       int id = s->inst_[i];
       if (id == MatchSep)
         break;
-      Note<run_forward>(static_cast<int32_t>(id), pos);
+      Note<run_forward, gspan>(static_cast<int32_t>(id), pos);
     }
   }
 
-  template <bool run_forward>
+  // gspan  = 开 g 档 (存活位切分量); gwatch = 当下【真的有 pattern 挂着】, 要逐字节读存活位。
+  // 两个循环轮流跑: 空闲档 (gspan && !gwatch) 一个字节都不读存活位, 第一次命中时 return 2
+  // 换到盯着档; 挂着的都断气之后再 return 2 换回来。Step 里那个 for(;;) 就是干这个的。
+  template <bool run_forward, bool gspan, bool gwatch>
   int RunLoop(const uint8_t* bp, int32_t* dummy_unused);
+
+  // GLiveStep: 读一个字节的存活位, 把由活转死的那几条 (可能是几条, 折叠时一位对好几条)
+  // 收口。前提: gpendw_ != 0。返回 0=接着走 · 1=收口攒够了要挂起 · 2=没有挂着的了。
+  inline int GLiveStep(DFA::State* s, int32_t pos) {
+    // 状态的 inst_ 描述的是【吃完这个字节之后】的活线程, 也就是偏移 pos 处的存活位;
+    // 而 IsMatch 说的是 pos-1 处结束的匹配 —— 所以死亡事件排在命中之后。
+    // 🔴 不按 GW 收费: 只过"有挂着 pattern"的那几个字。挂着一两条 (常态) 就只读一个字
+    //    —— 所以 GLIVE_WORDS 调到 4 (256 条不折叠) 与折叠版同价。
+    uint64_t died[DFA::kGW];
+    uint32_t dmask = 0;
+    uint32_t wm = gpendw_;
+    do {
+      int w = __builtin_ctz(wm);
+      wm &= wm - 1;
+      uint64_t nl = s->live_[w];
+      uint64_t d = glive_[w] & ~nl & gpend_[w];
+      glive_[w] = nl;
+      if (d != 0) {
+        died[w] = d;
+        dmask |= uint32_t{1} << w;
+      }
+    } while (wm != 0);
+    if (dmask == 0)
+      return 0;
+    s_ = s;
+    GDeaths(died, dmask, pos);
+    if (static_cast<int>(g2closed_.size()) >= g2batch_)
+      return 1;
+    return gpendw_ == 0 ? 2 : 0;
+  }
+
+  // 起点/正文结束那两个"匹配晚一个字节"的特例, 三档共用的分派。
+  inline void NoteStateDyn(DFA::State* s, int32_t pos) {
+    if (!run_forward_)
+      NoteState<false, false>(s, pos);
+    else if (g_span_)
+      NoteState<true, true>(s, pos);
+    else
+      NoteState<true, false>(s, pos);
+  }
 
   bool Analyze(const char* text, int textlen);
   bool AdvanceState(int c);   // s_ = NextOf(s_, c), 必要时造状态/扩 arena/flush 缓存
@@ -214,10 +610,64 @@ class DFASpanScan {
   size_t flushi_;            // kPhaseFlush 收口到 pendlist_ 的第几个了
 
   // 每条 pattern 当前挂着的游程 (原文坐标)。pend_[id]!=0 才有效。
+  // 🔴 只有 g1 档用 (g2 档的游程装在 g2_[id].p 里), 所以【惰性开在 Begin 里】。
   std::vector<int32_t> runlo_;
   std::vector<int32_t> runhi_;
   std::vector<uint8_t> pend_;
   std::vector<int32_t> pendlist_;   // 挂着的 id 列表 (无重复), 扫完时按它收口
+
+  // ── g 档 (存活位切分量) ──
+  bool g_span_ = false;             // 开着 = 存活位切分量 + 游程留 native, 分量整块交付
+  uint64_t glive_[DFA::kGW];        // 上一个字节的存活位 (只有 gpendw_ 置位的那些字有效)
+  uint64_t gpend_[DFA::kGW];        // 当前"有未收口命中"的 pattern (npat>kGBits 才折叠)
+  uint32_t gpendw_ = 0;             // gpend_ 里哪几个字非零 —— 热循环只碰这几个字
+  static_assert(DFA::kGW <= 32, "gpendw_ 是 uint32, GLIVE_WORDS 不能超过 32 (= 2048 条)");
+  std::vector<uint8_t> gbool_;      // 逐条: 1 = 只要"有没有命中", 不攒游程 (调用方声明的)
+  std::vector<uint8_t> ghit_;       // 逐条: 1 = 这一遍命中过 (boolOnly 那几条唯一的产物)
+
+  // ── g2 游程档 ──
+  struct G2Buf { int32_t* p; int32_t cap; };   // cap 单位 int32
+  std::vector<G2St> g2_;
+  std::vector<G2Rec> g2closed_;     // 本批已经收口、等调用方取走的分量
+  std::vector<int32_t> g2closedcap_;
+  std::vector<std::vector<G2Buf> > g2bucket_;  // 按 cap 分档的空闲链 (默认走这个, 见 G2Take)
+  std::vector<int32_t> g2want_;     // 逐条 pattern 的容量高水位: 槽空时按它一次开够
+  int g2batch_ = 1024;               // 攒够这么多条收口就挂起, 让调用方消化
+ public:
+  int G2Closed(const G2Rec** recs) {
+    *recs = g2closed_.empty() ? NULL : &g2closed_[0];
+    return static_cast<int>(g2closed_.size());
+  }
+
+  // SetBoolOnly: 这条 pattern 只要"有没有命中"。Begin 之前调 (跨 scan 保留, 所以
+  // 【要能关】—— 调用方每遍传的名单不一样, 只能开不能关就会把上一遍的名单粘到这一遍)。
+  // 挡掉的是这一层真花钱的那步 —— 攒游程 + 盯存活位 + 收口 + 补起点, 不只是少交几处结果。
+  // 门上只当短路 bool 用的位一律配这个。
+  void SetBoolOnly(int id, bool on) {
+    if (id >= 0 && id < nid_)
+      gbool_[id] = on ? 1 : 0;
+  }
+  // Hits: nid 个字节, 第 i 个非零 = 第 i 条这一遍命中过。Begin 时清零。
+  const uint8_t* Hits() const { return ghit_.empty() ? NULL : &ghit_[0]; }
+
+  long long g2alloc_ = 0;           // 统计: 二倍扩容累计申请的字节
+  long long g2ngrow_ = 0;           // 统计: 二倍扩容次数
+  long long g2live_ = 0;            // 统计: 当前正在用的游程数组字节
+  long long g2peak_ = 0;            // 统计: 峰值 (这就是 g2 相对 g1 要比的那个数)
+  long long g2used_ = 0;            // 统计: 开着的分量里【真正装着数据】的字节 (8 * 游程条数)
+  long long g2usedpeak_ = 0;        // 统计: 上面那个的峰值 —— 和 g1 的 maxPend*8 才是同一把尺
+  long long g2nopen_ = 0;           // 统计: 当前同时开着几个分量 (最多 nid 个)
+  long long g2nopenpeak_ = 0;       // 统计: 上面那个的峰值
+  long long g2heap_ = 0;            // 统计: 真实持有的堆字节 (含回收池, 跨 scan 累计)
+  long long g2heappeak_ = 0;        // 统计: 本遍的真实堆高水位
+  long long g2nseg_ = 0;            // 统计: 收口的分量条数
+  long long g2open_ = 0;            // 统计: 还开着的分量游程字节 (与 g1 的 Go 侧峰值同口径)
+  long long g2openpeak_ = 0;
+#ifdef G2_PEAKDUMP
+  long long g2snapused_ = -1;       // 已取样快照对应的 used 水位 (跨 scan 不清零 = 全局最高那次)
+  std::vector<int32_t> g2snap_;     // 峰值现场: [id, n, lo0,hi0, lo1,hi1, ...] 逐个分量接在一起
+#endif
+ private:
 
   // 本批输出 (只在一次 Step 里有效)
   int32_t* out_;
@@ -288,7 +738,7 @@ bool DFASpanScan::Resume() {
 }
 
 // RunLoop 是新的热循环。返回 0 = 本批攒满了要挂起, 1 = 正文走完了 (进入 etx), -1 = 出错。
-template <bool run_forward>
+template <bool run_forward, bool gspan, bool gwatch>
 int DFASpanScan::RunLoop(const uint8_t* bp, int32_t* /*unused*/) {
   // 当前状态和 dfa_ 都走【本地变量】, 与上游 InlinedSearchLoop 写法一致 (它的 s 也是局部的)。
   // ⚠ 实测这一条在这份循环上【量不出差别】(零命中 1MiB 上 ±1%, 落在噪声里) —— 留着只是
@@ -298,7 +748,6 @@ int DFASpanScan::RunLoop(const uint8_t* bp, int32_t* /*unused*/) {
   const uint8_t* p = bp + off_;
   const uint8_t* ep = run_forward ? (bp + textlen_) : bp;
   DFA::State* s = s_;
-
   while (p != ep) {
     int c;
     if (run_forward)
@@ -332,12 +781,44 @@ int DFASpanScan::RunLoop(const uint8_t* bp, int32_t* /*unused*/) {
       // 正向 p-1 = 匹配右端 (不含); 反向 p+1 = 匹配左端 (含)。
       const uint8_t* m = run_forward ? p - 1 : p + 1;
       s_ = s;                      // 挂起要把它按内容存下来, 所以先写回
-      NoteState<run_forward>(s, static_cast<int32_t>(m - bp));
-      if (n_ > limit_) {
+      NoteState<run_forward, gspan>(s, static_cast<int32_t>(m - bp));
+      if (gspan && !gwatch && gpendw_ != 0) {
+        // 【第一条 pattern 挂上来了】。本字节的存活位要在这儿读掉 (语义与盯着那一档逐字
+        // 相同 —— GMark 刚把这一位当成"上个字节还活着", 死亡就发生在本字节上), 读完换档。
+        int gr = GLiveStep(s, static_cast<int32_t>(p - bp));
         off_ = static_cast<int>(p - bp);
-        Suspend();
-        return 0;
+        s_ = s;
+        if (gr == 1) {
+          Suspend();
+          return 0;
+        }
+        return 2;   // 换循环: Step 会按 gpendw_ 重新选一次档
       }
+    }
+    if (gwatch) {
+      // 盯着档: 每个字节读一次存活位。注意【空闲档一个字节都不读】—— 一条 pattern 都还
+      // 没挂上的时候走的是另一份循环 (见上面那个 return 2), 那份与不开 g 档的循环逐条
+      // 指令相同。这是"零命中的正文上等于没开 g 档"的真正做法: 换的是整个循环,
+      // 不是每个字节判一次 gpendw_。
+      // 🔴 为什么值得这么做: 每字节多一次 this->gpendw_ 的 load + 一个分支, 实测在这台机
+      //    上能让零命中 64KiB 从 97us 变成 198us (整整两倍, 而且换个代码布局又会变回
+      //    101us —— 这条循环对布局极其敏感, 详见 doc)。索性让它一个字节都不读。
+      int gr = GLiveStep(s, static_cast<int32_t>(p - bp));
+      if (gr != 0) {
+        off_ = static_cast<int>(p - bp);
+        s_ = s;
+        if (gr == 1) {   // 收口攒够了, 交给调用方消化
+          Suspend();
+          return 0;
+        }
+        return 2;        // 挂着的 pattern 全断气了, 换回空闲档
+      }
+    }
+    if (!gspan && n_ > limit_) {
+      off_ = static_cast<int>(p - bp);
+      s_ = s;
+      Suspend();
+      return 0;
     }
   }
   off_ = static_cast<int>(p - bp);
@@ -352,8 +833,12 @@ int DFASpanScan::Step(const char* text, int textlen, int32_t* out, int outcap, i
     return 0;
   if (textlen != textlen_ || (textlen > 0 && text == NULL))
     return -1;
-  if (outcap < 3 * nid_)
+  // g 档一个字节都不往 out 写 (游程留 native, 分量整块交), 所以只有非 g 档才要这个下界。
+  if (!g_span_ && outcap < 3 * nid_)
     return -1;
+
+  if (g_span_)
+    G2Recycle();   // 上一批交出去的游程数组, 调用方已经读完了
 
   out_ = out;
   n_ = 0;
@@ -378,12 +863,10 @@ int DFASpanScan::Step(const char* text, int textlen, int32_t* out, int outcap, i
     }
     // 起点本身就可能是 match 状态 (空匹配 / 能匹配空串的 pattern)。
     off_ = run_forward_ ? 0 : textlen_;
-    if (s_->IsMatch()) {
-      if (run_forward_)
-        NoteState<true>(s_, static_cast<int32_t>(off_));
-      else
-        NoteState<false>(s_, static_cast<int32_t>(off_));
-    }
+    if (s_->IsMatch())
+      NoteStateDyn(s_, static_cast<int32_t>(off_));
+    // (起点这里不用给 glive_ 播种: gpendw_ 还是 0, 没有任何字在被盯着;
+    //  第一次命中时 GMark 会把那一位连同 glive_ 一起补上。)
     phase_ = kPhaseLoop;
   } else if (!Resume()) {
     phase_ = kPhaseDone;
@@ -392,13 +875,25 @@ int DFASpanScan::Step(const char* text, int textlen, int32_t* out, int outcap, i
   }
 
   if (phase_ == kPhaseLoop) {
-    int r = run_forward_ ? RunLoop<true>(bp, NULL) : RunLoop<false>(bp, NULL);
+    int r;
+    for (;;) {   // r == 2 = 空闲档/盯着档互换, 换完接着跑同一遍正文
+      if (!run_forward_)
+        r = RunLoop<false, false, false>(bp, NULL);
+      else if (!g_span_)
+        r = RunLoop<true, false, false>(bp, NULL);
+      else if (gpendw_ != 0)
+        r = RunLoop<true, true, true>(bp, NULL);
+      else
+        r = RunLoop<true, true, false>(bp, NULL);
+      if (r != 2)
+        break;
+    }
     if (r < 0) {
       phase_ = kPhaseDone;
       lock_ = NULL;
       return -1;
     }
-    if (r == 0) {   // 本批满了, 挂起
+    if (r == 0) {   // 本批满了 (g2: 收口攒够了), 挂起
       *more = 1;
       lock_ = NULL;
       return n_ / 3;
@@ -414,11 +909,7 @@ int DFASpanScan::Step(const char* text, int textlen, int32_t* out, int outcap, i
       return -1;
     }
     if (s_ > SpanSpecialMax() && s_->IsMatch()) {
-      int32_t pos = static_cast<int32_t>(off_);
-      if (run_forward_)
-        NoteState<true>(s_, pos);
-      else
-        NoteState<false>(s_, pos);
+      NoteStateDyn(s_, static_cast<int32_t>(off_));
     }
     s_ = NULL;
     phase_ = kPhaseFlush;
@@ -427,6 +918,26 @@ int DFASpanScan::Step(const char* text, int textlen, int32_t* out, int outcap, i
   // 收口: 把还挂着的游程吐出去。一条 pattern 最多挂一段, 所以最多 nid 条,
   // 但本批不一定装得下 (前面已经写了东西), 装不下就挂起 —— 这一段不需要 DFA 状态,
   // 挂起时也就没什么要存的。
+  if (g_span_) {
+    // g 档收口: 正文扫完还开着的分量, 整块交出去 (death = -1 ⇒ 不动左界)。
+    while (flushi_ < pendlist_.size()) {
+      int32_t id = pendlist_[flushi_++];
+      G2Close(id, -1);
+      pend_[id] = 0;
+      if (static_cast<int>(g2closed_.size()) >= g2batch_ && flushi_ < pendlist_.size()) {
+        s_ = NULL;
+        *more = 1;
+        lock_ = NULL;
+        return 0;
+      }
+    }
+    pendlist_.clear();
+    flushi_ = 0;
+    phase_ = kPhaseDone;
+    lock_ = NULL;
+    return 0;
+  }
+
   while (flushi_ < pendlist_.size()) {
     if (n_ > limit_) {
       s_ = NULL;   // 见 Resume: 挂起期间不持锁, 留着的 State* 随时可能失效
@@ -775,6 +1286,38 @@ bool DFASpanScanBegin(DFASpanScan* ss, int textlen) {
   if (ss == NULL)
     return false;
   return ss->Begin(textlen);
+}
+
+int DFASpanScanG2Closed(DFASpanScan* ss, const DFASpanScanG2Rec** recs) {
+  if (ss == NULL || recs == NULL)
+    return 0;
+  return ss->G2Closed(recs);
+}
+
+// heappeak = 这一遍为游程数组真实 malloc 出来的高水位 (扫描期间只申请不释放, 收口的
+// 袋子进回收池等着被再发出去); usedpeak = 其中【真正装着结束位置】的那部分 (8 * 游程条数)。
+void DFASpanScanG2Stats(DFASpanScan* ss, long long* usedpeak, long long* heappeak,
+                        long long* nseg) {
+  if (ss == NULL)
+    return;
+  if (usedpeak != NULL) *usedpeak = ss->g2usedpeak_;
+  if (heappeak != NULL) *heappeak = ss->g2heappeak_;
+  if (nseg != NULL) *nseg = ss->g2nseg_;
+}
+
+bool DFASpanScanBeginG2(DFASpanScan* ss, int textlen) {
+  if (ss == NULL)
+    return false;
+  return ss->Begin(textlen, true);
+}
+
+void DFASpanScanG2BoolOnly(DFASpanScan* ss, int id, int on) {
+  if (ss != NULL)
+    ss->SetBoolOnly(id, on != 0);
+}
+
+const uint8_t* DFASpanScanG2Hits(DFASpanScan* ss) {
+  return ss == NULL ? NULL : ss->Hits();
 }
 
 int DFASpanScanStep(DFASpanScan* ss, const char* text, int textlen,

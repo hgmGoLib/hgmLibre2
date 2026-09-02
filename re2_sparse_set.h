@@ -61,7 +61,7 @@
 #include <memory>
 #include <utility>
 
-#include "re2/pod_array.h"
+#include "re2_pod_array.h"
 
 namespace re2 {
 

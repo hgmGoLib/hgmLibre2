@@ -2,11 +2,11 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-#include "re2/stringpiece.h"
+#include "re2_stringpiece.h"
 
 #include <ostream>
 
-#include "util/util.h"
+#include "util_util.h"
 
 namespace re2 {
 

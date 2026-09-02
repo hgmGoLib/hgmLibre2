@@ -2,16 +2,16 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-#include "re2/filtered_re2.h"
+#include "re2_filtered_re2.h"
 
 #include <stddef.h>
 #include <string>
 #include <utility>
 
-#include "util/util.h"
-#include "util/logging.h"
-#include "re2/prefilter.h"
-#include "re2/prefilter_tree.h"
+#include "util_util.h"
+#include "util_logging.h"
+#include "re2_prefilter.h"
+#include "re2_prefilter_tree.h"
 
 namespace re2 {
 

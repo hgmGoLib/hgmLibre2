@@ -4,16 +4,38 @@ hgmLibre2 — vendored RE2 source
 许可 : BSD-3-Clause, 见 RE2_LICENSE.txt
 取法 : git archive 2023-03-01 (一次性 vendor, 编译期不再下载远程源)
 
-布局
-----
+布局 —— 🔴 全部 C/C++ 源码与头文件【一律拍平在本目录, 不开任何子目录】
+------------------------------------------------------------------------
+🔴 这条是硬规矩, 原因是 go build 的缓存 (2026-08-31 起; 之前头文件在 internal_include/ 下,
+   踩过一次: 只改头文件 / 只改 .inc, go build 直接复用旧目标文件, 编出来是旧二进制, 一声不吭)。
+   机制: go build 【完全不做 #include 依赖分析】(不用 -MD)。它的 action ID 只把 go/build 在
+   【包目录本身、不递归】扫到的、扩展名被识别的文件挨个内容哈希 (GoFiles/CgoFiles/CFiles/
+   CXXFiles/HFiles/SFiles/EmbedFiles...)。于是:
+     · 子目录里的 .h        → 扫不到 → 不在哈希里 → 改了不重编
+     · .inc 之类的扩展名    → 不认识 → 连 IgnoredOtherFiles 都进不去 → 改了不重编
+     · 包目录里的 .h        → 在 HFiles 里 → 改了全量重编 (哪怕没人 include 它)
+   所以只要"全在包目录 + 扩展名只用 .h/.c/.cc/.cpp", 这一类 bug 整个不存在。
+   验证方法: go list -f '{{len .HFiles}} {{len .CXXFiles}}' . 应该等于目录里的实际数量;
+   往任意一个 .h 里加一行注释再 go build -x, 应该看到 46 个 TU 重编。
+🔴 附带好处: CXXFLAGS 里不需要 -I, 也就没有 ${SRCDIR} —— 那玩意展开后不做引号/转义,
+   路径带空格 (Windows 的 "C:\Users\Zhang San\go\pkg\mod\...") 会炸。
+
 re2_*.cc / util_*.cc   : RE2 的 .cc (re2/*.cc + util/{rune,strutil}.cc), 拍平到本目录
                          (cgo 只编 package 目录下的 .cc, 不递归子目录, 故拍平).
                          已剔除: testing/ fuzzing/ util/pcre.* util/benchmark.* util/fuzz.cc util/test.*
-internal_include/re2/  : re2/*.h
-internal_include/util/ : util/*.h (logging/mutex/strutil/utf/util/flags/mix/malloc_counter)
+re2_*.h / util_*.h     : RE2 的 .h (re2/*.h + util/*.h), 同样拍平, 同样加 re2_ / util_ 前缀。
+                         配套地, 全库的 #include 从 "re2/prog.h" 改写成 "re2_prog.h"
+                         ("util/logging.h" → "util_logging.h"), 共 166 行 / 43 个文件。
+                         🔴 这是【纯机械改写, 两条规则全覆盖, 无例外】, 升级时照跑一遍即可,
+                         见下面"升级 RE2 版本"里的 sed。两个目录里没有重名文件 (核对过),
+                         前缀只为保留出处, 不是为了消歧义。
 cre2.h / cre2.cpp      : 我们自己写的极小 C 包装 (不算改 RE2)
 cre2_internal.h        : cre2 各 .cpp 之间共用的句柄定义 (struct cre2_set), 不对外
 cre2_dfastats.cpp      : 进程级 DFA 计数的 hook 安装 (挂 re2::hooks)
+cre2_emptymatch.cpp    : "这条 pattern 能不能匹配空串" 的判定 (cre2_pattern_can_match_empty)。
+                         🔴 直接用 re2 的内部件: Regexp::Parse + Regexp::Walker。必须如此 ——
+                         这道门的全部价值就在于和真正编译时【同一个解析器同一份 ParseFlags】;
+                         在 Go 侧拿 regexp/syntax 另算一遍就会漏 (\C 那一族), 试过, 是个 bug。
 cre2_spanscan.cpp      : "命中在哪"的 C 门面 —— 流式游程扫描 (sqlite3_step 式轮询)
                          + 锚定解析 (cre2_set_resolve_span 及其按值返回孪生 _r)
                          + 可行前缀回推 (cre2_set_viable_starts)。
@@ -21,12 +43,15 @@ cre2_spanscan.cpp      : "命中在哪"的 C 门面 —— 流式游程扫描 (s
                          据此每次调用把它搬上堆 —— 一次解析一笔 4 字节, 在"每个端点解析一次"
                          的用法上按端点数放大 (实测 6.5 万个端点 = 6.5 万笔)。同一招见
                          cre2_match_all_r; 有 TestSpanPerf_NoAlloc 钉着不许退回去。
-internal_include/re2/dfa_stats.h : 本库追加的观测结构体 (ScanStats / MemInfo / AttribInfo)
-internal_include/re2/span_scan.h : 流式游程扫描 + 锚定解析的对内声明 + 全部语义说明
-re2_dfa_spanscan.inc   : 流式游程扫描 · 锚定解析 · 可行前缀回推的实现。【不是独立编译单元】—— 由 re2_dfa.cc 末尾
+re2_dfa_stats.h        : 本库追加的观测结构体 (ScanStats / MemInfo / AttribInfo)
+re2_span_scan.h        : 流式游程扫描 + 锚定解析的对内声明 + 全部语义说明
+re2_dfa_spanscan_inl.h : 流式游程扫描 · 锚定解析 · 可行前缀回推的实现。【不是独立编译单元】—— 由 re2_dfa.cc 末尾
                          #include 进去, 因为 class DFA 整个定义就在 re2_dfa.cc 里,
                          别的编译单元看不见 State / RWLocker / StateSaver / RunStateOnByteUnlocked。
-                         cgo 不编 .inc, 所以扩展名必须留着 (改成 .cc 会被当成第二份实现编两遍)。
+                         它没有 include guard, 里面全是函数体, 被第二个编译单元 include 就是重复定义。
+                         🔴 扩展名必须是 .h: 叫 .cc 会被当成第二份实现编两遍; 叫 .inc 则掉出
+                         go build 的哈希 (见本节开头那段红字, 2026-08-31 之前就是 .inc, 踩过)。
+                         -inl.h 这个命名跟着上游的 re2_walker-inl.h 走。
 *.go                   : cgo Go API (Compile/MustCompile + Find/Replace 系列 + RegexpSet 及其观测)
 
 🔴 已改动的上游文件 (升级 RE2 时【不能直接覆盖】, 必须重新打这些改动)
@@ -36,25 +61,25 @@ re2_dfa.cc             : ①转移表槽位 8 字节 State* → 4 字节 arena �
                          ②per-Set / per-scan 计数 (flush 次数 / 新建状态数 / 额度水位)
                          ③编译期开关后面的排障采集 (RE2_DFA_ATTRIB / TRACE / HOTSTATS, 默认全关)
                          ④流式游程扫描 + 锚定解析: class DFA 里加两行 friend (DFASpanScan /
-                           SpanDFA), 文件末尾 #include "re2_dfa_spanscan.inc"。除这两处外
+                           SpanDFA), 文件末尾 #include "re2_dfa_spanscan_inl.h"。除这两处外
                            【一个字没动】—— 热循环是另写的一份, 不往 InlinedSearchLoop 里塞
                            分支 (它是全库最热的)。
-                         ⑤可行前缀回推 (MatchScanner 补起点用; 2026-08-28 之前只有那个已删的
-                           MatchScanner2 / 路 D2 用它): 私有 enum 里加一个
+                         ⑤可行前缀回推 (Re2Set_fll_t 补起点用; 2026-08-28 之前只有那个已删的
+                           Re2Set_fll_t2 / 路 D2 用它): 私有 enum 里加一个
                            kStartViable = 8 并把 kMaxStart 从 8 抬到 16 —— 就这一处。
                            start_[base|kStartViable] 存的是"种【全部指令】"的那个起始状态,
-                           实现全在 re2_dfa_spanscan.inc (SpanDFA::ViableStart/ViableStarts)。
+                           实现全在 re2_dfa_spanscan_inl.h (SpanDFA::ViableStart/ViableStarts)。
                            🔴 摆进 start_[] 是为了白拿三样东西: arena 搬家时的重定位 ·
                            ResetCache 的清空 · 内存归因那趟 BFS 的起点 —— 三处都是
                            for (i < kMaxStart) 的循环, 抬上限就自动覆盖, 一行都不用改。
                            🔴 这【不是】给 Prog 加第三个入口 (那必须同时改 Flatten, 见下面
                            re2_compile.cc 那条的红字)。它是在【Flatten 之后】从现有的
                            prog_->start() 做一趟可达性遍历把活指令收齐, 用的全是新编号。
-internal_include/re2/prog.h : 追加 SearchDFA 的可选出参 + GetDFAMemInfo / GetDFAAttribInfo 声明
+re2_prog.h             : 追加 SearchDFA 的可选出参 + GetDFAMemInfo / GetDFAAttribInfo 声明
                          + Prog::CompileSet 追加 reversed 参数 (默认 false, 上游调用点不受影响)
-                         + Prog::NewSpanScan / Prog::SpanResolve (见 re2/span_scan.h)
-                         + Prog::SpanViableStarts (可行前缀回推, 见 re2_dfa_spanscan.inc)
-internal_include/re2/set.h  : 追加 Match 的可选出参 + MemInfo / AttribInfo 声明
+                         + Prog::NewSpanScan / Prog::SpanResolve (见 re2_span_scan.h)
+                         + Prog::SpanViableStarts (可行前缀回推, 见 re2_dfa_spanscan_inl.h)
+re2_set.h              : 追加 Match 的可选出参 + MemInfo / AttribInfo 声明
                          + RE2::Set 三参构造 (reversed) 与 reversed() 访问器
                          + RE2::Set::NewSpanScan / RE2::Set::ResolveSpan / RE2::Set::ViableStarts
 re2_set.cc             : 上面那两个声明的实现 (转发给 Prog); 反向模式下 Add() 把 HaveMatch
@@ -200,11 +225,27 @@ C++ 侧做过 4000 条随机 pattern × 24 份随机输入的 pre/post 全量对
 
 升级 RE2 版本
 -------------
-重新 git archive 新 tag, 覆盖 re2_*.cc / util_*.cc / internal_include/**. 注意 2023-03 起 RE2 依赖
-abseil, 那之后不能再这样直接 cgo (会缺 absl/*), 要回到 cmake 方案. 故本方案钉死在 2023-03-01.
+重新 git archive 新 tag, 拍平后覆盖 re2_*.cc / util_*.cc / re2_*.h / util_*.h. 注意 2023-03 起
+RE2 依赖 abseil, 那之后不能再这样直接 cgo (会缺 absl/*), 要回到 cmake 方案. 故本方案钉死在 2023-03-01.
+
+🔴 "拍平"就是下面这三步, 【纯机械, 无例外】(2026-08-31 起; 在此之前头文件保留 re2/ util/ 子目录,
+   靠 -I${SRCDIR}/internal_include 找, 换掉的原因见开头"布局"那段红字):
+     # 1. 文件拍平, 加 re2_ / util_ 前缀 (两个目录里没有重名文件, 前缀只为保留出处)
+     for f in re2/*.cc  re2/*.h;  do mv "$f" "re2_$(basename "$f")";  done
+     for f in util/*.cc util/*.h; do mv "$f" "util_$(basename "$f")"; done
+     # 2. include 路径跟着改写 (上一版是 166 行 / 43 个文件, 全靠这两条规则)
+     sed -i -E 's|#include "re2/([A-Za-z0-9_.-]+)\.h"|#include "re2_\1.h"|g;
+                s|#include "util/([A-Za-z0-9_.-]+)\.h"|#include "util_\1.h"|g' *.cc *.cpp *.h
+     # 3. 核对: 应该输出 0
+     grep -rn '#include "\(re2\|util\)/' *.cc *.cpp *.h | wc -l
+🔴 因为第 2 步动了每个文件, 想跟上游逐字节比对时【不能直接 diff】, 要先把上游那份也跑一遍
+   同样的 sed, 再比:
+     diff <(sed -E '<上面那两条规则>' upstream/re2/dfa.cc) re2_dfa.cc
+   下面"已改动的上游文件"清单要重打的还是原来那五个, 数量没变。
+
 🔴 覆盖前先把上面"已改动的上游文件"那五个的 diff 存下来, 覆盖后重新打上去
    (`[backport re2 ...]` 标着的那批【不要】重打, 新版里本来就有)。
-   漏掉头文件 (prog.h/set.h/dfa_stats.h) 会编译报错, 看得见; 但只漏掉 re2_dfa.cc 的话
+   漏掉头文件 (re2_prog.h/re2_set.h/re2_dfa_stats.h) 会编译报错, 看得见; 但只漏掉 re2_dfa.cc 的话
    【一样编得过】—— 槽位悄悄退回 8 字节指针, 同预算装下的状态数掉回 1/1.74, 原本 0 flush
    的档可能开始 thrash, 除了变慢没有任何症状。所以升级后务必按 README 的方法重新量一遍
    0-flush 门槛。

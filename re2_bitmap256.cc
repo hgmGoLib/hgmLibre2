@@ -2,12 +2,12 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-#include "re2/bitmap256.h"
+#include "re2_bitmap256.h"
 
 #include <stdint.h>
 
-#include "util/util.h"
-#include "util/logging.h"
+#include "util_util.h"
+#include "util_logging.h"
 
 namespace re2 {
 
