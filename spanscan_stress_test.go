@@ -20,7 +20,7 @@ import (
 
 // stressPatterns 里第一条是库文档里那个著名的状态爆炸形状 (起始类窄于重复类的计数重复):
 // 非锚定搜索下它的活跃起点集会退化成任意子集, 状态数对计数上界指数增长 —— 正是最容易
-// 把状态缓存撑爆、逼出 flush 的形状。见 doc/状态数为什么会相乘.txt。
+// 把状态缓存撑爆、逼出 flush 的形状。见 doc/状态数为什么会相乘.md。
 var stressPatterns = []string{
 	`[A-Za-z][A-Za-z0-9]{2,19}key`,
 	`[a-z]{4,}`,
@@ -81,7 +81,7 @@ func TestSpanScan_FlushDuringSuspend(t *testing.T) {
 	if len(want) == 0 {
 		t.Fatalf("语料一条都没命中, 这个压力测试白跑了")
 	}
-	if f := ref.MemInfo().FlushesTotal; f != 0 {
+	if f := ref.GetMemInfo().FlushesTotal; f != 0 {
 		t.Logf("参照 set 也 flush 了 %d 次 (不影响判据, 只是说明预算还是紧)", f)
 	}
 
@@ -96,7 +96,7 @@ func TestSpanScan_FlushDuringSuspend(t *testing.T) {
 	spansEqual(t, "紧预算+最小批", got, want)
 
 	// 这个测试的价值全在"真的 flush 了"上 —— 没 flush 就只是又跑了一遍普通扫描。
-	if f := tight.MemInfo().FlushesTotal; f == 0 {
+	if f := tight.GetMemInfo().FlushesTotal; f == 0 {
 		t.Fatalf("紧预算 set 一次都没 flush, 没压到 StateSaver 那条路 (该把 maxMem 再调小或语料再调复杂)")
 	} else {
 		t.Logf("紧预算 set flush 了 %d 次", f)
@@ -172,7 +172,7 @@ func TestSpanScan_ConcurrentScanners(t *testing.T) {
 	for msg := range errCh {
 		t.Fatalf("%s", msg)
 	}
-	t.Logf("共享 set flush 了 %d 次", shared.MemInfo().FlushesTotal)
+	t.Logf("共享 set flush 了 %d 次", shared.GetMemInfo().FlushesTotal)
 }
 
 // TestSpanResolve_FlushDuringResolve: 锚定解析撞上缓存整表清空。
@@ -248,7 +248,7 @@ func TestSpanResolve_FlushDuringResolve(t *testing.T) {
 		}
 	}
 
-	if f := tight.MemInfo().FlushesTotal; f == 0 {
+	if f := tight.GetMemInfo().FlushesTotal; f == 0 {
 		t.Fatalf("紧预算 set 一次都没 flush, 没压到解析撞 flush 那条路")
 	} else {
 		t.Logf("紧预算 set flush 了 %d 次", f)

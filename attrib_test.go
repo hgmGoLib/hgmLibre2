@@ -36,7 +36,7 @@ func TestAttrib_DisabledIsHonest(t *testing.T) {
 	buf := make([]int32, set.GetPatternLen())
 	set.Match(attribBody(pats), buf)
 
-	a := set.Attrib()
+	a := set.GetAttrib()
 	if !a.Enabled {
 		if len(a.Pats) != 0 || a.StatesTotal != 0 {
 			t.Fatalf("没开 RE2_DFA_ATTRIB 时不该有数据: %+v", a)
@@ -59,7 +59,7 @@ func TestAttrib_RanksTheExpensivePattern(t *testing.T) {
 	buf := make([]int32, set.GetPatternLen())
 	set.Match(body, buf)
 
-	a := set.Attrib()
+	a := set.GetAttrib()
 	if !a.Enabled {
 		t.Skip("未开 RE2_DFA_ATTRIB 编译")
 	}

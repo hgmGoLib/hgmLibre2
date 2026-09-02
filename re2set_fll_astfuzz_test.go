@@ -1,11 +1,11 @@
 package hgmLibre2
 
-// matchscan_astfuzz_test.go —— MatchScanner × 【从 pattern 自己的 AST 生成的语料】×
+// re2set_fll_astfuzz_test.go —— Re2Set_fll_t × 【从 pattern 自己的 AST 生成的语料】×
 // stdlib 的 re.Longest().FindAllStringIndex, 300 轮逐字节对拍。
 //
 // 🔴 语料必须从 AST 生成再拌噪声, 不能纯随机撒字节: 纯随机正文上这批 pattern 一处都撞不上,
-//    那就是【空转绿】(同 TestMatchScanReverse_VsBrute 的红字)。生成器 msrGen 在
-//    matchscan_reverse_test.go。测试末尾那道 "nSpan < 1000 就 Fatal" 是这件事的哨兵。
+//    那就是【空转绿】(同 TestRe2SetRrl_VsBrute 的红字)。生成器 astGen 在
+//    re2set_rrl_test.go。测试末尾那道 "nSpan < 1000 就 Fatal" 是这件事的哨兵。
 //
 // 🔴 oracle 必须是 Longest() 那个。stdlib 默认的 FindAll 是 leftmost-first (贪心),
 //    两者在"同一起点上贪心先撞到的比最长的短"时给不同的右端, 拿默认那个对是【假红】。
@@ -43,7 +43,7 @@ var msAstPats = []string{
 	`x{1,3}[a-c]?(?:ab|cd)?`,
 }
 
-func TestMatchScanAstFuzzVsLongest(t *testing.T) {
+func TestRe2SetFllAstFuzzVsLongest(t *testing.T) {
 	set, err := NewRegexpSet(msAstPats)
 	if err != nil {
 		t.Fatal(err)
@@ -61,16 +61,14 @@ func TestMatchScanAstFuzzVsLongest(t *testing.T) {
 	}
 	noiseR := []rune(" ,;:-_/@.\n\tabcdefkqwxyz019ABFKZ张三李")
 
-	ms, unsup, err := set.NewMatchScanner()
+	ms, err := set.NewRe2Set_fll()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ms.Close()
-	if len(unsup) != 0 {
-		t.Fatalf("这批 pattern 不该有走不了区间的: %v", unsup)
-	}
 	rng := rand.New(rand.NewSource(20260827))
 	nSpan := 0
+	var st Re2Set_stats_t
 	for round := 0; round < 300; round++ {
 		var sb strings.Builder
 		target := 60 + rng.Intn(400)
@@ -79,11 +77,12 @@ func TestMatchScanAstFuzzVsLongest(t *testing.T) {
 				sb.WriteRune(noiseR[rng.Intn(len(noiseR))])
 				continue
 			}
-			msrGen(asts[rng.Intn(len(asts))], rng, &sb, 0)
+			astGen(asts[rng.Intn(len(asts))], rng, &sb, 0)
 			sb.WriteRune(noiseR[rng.Intn(len(noiseR))])
 		}
 		text := sb.String()
-		got := scanByPat(t, ms, text)
+		var got map[int32][]int32
+		got, _, st = scanFlat(t, ms.Scan, text)
 		for id := range msAstPats {
 			var flat []int32
 			for _, loc := range std[id].FindAllStringIndex(text, -1) {
@@ -99,7 +98,6 @@ func TestMatchScanAstFuzzVsLongest(t *testing.T) {
 	if nSpan < 1000 {
 		t.Fatalf("只对账了 %d 处区间 —— 语料没造对, 这是空转绿", nSpan)
 	}
-	st := ms.Stats()
 	t.Logf("300 轮 · 对账 %d 处区间, 与 Longest() 逐字节相同 (末轮账: walks=%d cands=%d tries=%d)",
 		nSpan, st.Walks, st.Cands, st.Tries)
 }

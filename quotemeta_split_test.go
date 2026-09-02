@@ -27,7 +27,8 @@ func TestQuoteMeta_EquivStdlib(t *testing.T) {
 }
 
 func TestSplit_EquivStdlib(t *testing.T) {
-	patterns := []string{`[\s.\-_]+`, `,`, `\d+`, `a*`, `\s*`, `(?i)x`}
+	// 🔴 原来这里还有 `a*` 与 `\s*` 两条 (能匹配空串)。全库拒空串之后它们编不出来了。
+	patterns := []string{`[\s.\-_]+`, `,`, `\d+`, `(?i)x`}
 	inputs := []string{
 		"", "f-a-l-c-o-n", "f.a.l.c.o.n", "f a l c o n", "a,b,,c,", "x1y22z333",
 		"aXbXc", "no separators here", "  lead and trail  ",

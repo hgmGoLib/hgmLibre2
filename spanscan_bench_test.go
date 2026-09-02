@@ -249,7 +249,7 @@ func newBenchNewOn(tb testing.TB, forward bool, fwd *RegexpSet, rev *RegexpSetRe
 			return fwd.FindAllIndex(text, alloc, fn)
 		}
 		n.resolve = rev.ResolveSpanWithin
-		n.scanMem, n.resMem = fwd.MemInfo, rev.MemInfo
+		n.scanMem, n.resMem = fwd.GetMemInfo, rev.GetMemInfo
 	} else {
 		alloc, err := newFindAllIndexAlloc(rev.s, 256)
 		if err != nil {
@@ -259,7 +259,7 @@ func newBenchNewOn(tb testing.TB, forward bool, fwd *RegexpSet, rev *RegexpSetRe
 			return rev.FindAllIndex(text, alloc, fn)
 		}
 		n.resolve = fwd.ResolveSpanWithin
-		n.scanMem, n.resMem = rev.MemInfo, fwd.MemInfo
+		n.scanMem, n.resMem = rev.GetMemInfo, fwd.GetMemInfo
 	}
 	return n
 }
@@ -655,7 +655,7 @@ func TestSpanPerf_PeakChild(t *testing.T) {
 		for _, tx := range texts {
 			o.run(tx)
 		}
-		m := o.set.MemInfo()
+		m := o.set.GetMemInfo()
 		fmt.Printf("PEAK %-3s 增量=%dKB 门set: arena=%dKB 状态=%d 生涯建过=%d flush=%d | 另有 %d 个独立 Regexp DFA 缓存 (各自 %dMB 额度)\n",
 			path, (vmHWM(t)-base)>>10, m.ArenaCap>>10, m.States, m.StatesBuiltTotal, m.FlushesTotal,
 			len(o.res), m.StateBudget>>20)

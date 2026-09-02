@@ -88,7 +88,6 @@ func TestFindWithinBounds(t *testing.T) {
 	if m := re.FindStringSubmatchIndexWithin(s, 1, 1); m != nil {
 		t.Errorf("空段该无匹配, 得到 %v", m)
 	}
-	if m := MustCompile(`x*`).FindStringSubmatchIndexWithin(s, 1, 1); !reflect.DeepEqual(m[:2], []int{1, 1}) {
-		t.Errorf("空段上能匹配空串的 pattern 该给 [1,1), 得到 %v", m)
-	}
+	// 🔴 原来这里还有一句: `x*` 在空段 [1,1) 上该给 [1,1)。全库拒空串之后 `x*` 编不出来了
+	//    (见 emptymatch.go) —— 空段上一律无匹配, 就是上面那一句。
 }

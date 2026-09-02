@@ -1,5 +1,5 @@
 // prefilter_test.go — Prefilter 的三条:
-//   1. 【健全性】(唯一要害) 真命中的 pattern 必须一条不少地出现在 Potentials 里。
+//   1. 【健全性】(唯一要害) 真命中的 pattern 必须一条不少地出现在 GetPotentials 里。
 //      筛子多放几条只是白跑, 少放一条就是漏检 —— 整个"前置粗筛"方向的正确性全压在这一条上。
 //   2. 不可过滤集认得准 —— 特别是 `(?:foo|[A-Z]{5})` 这种含字面量但整条筛不掉的。
 //   3. 原子表的形状 (小写化、最短长度旋钮生效)。
@@ -36,7 +36,7 @@ func newTestPrefilter(t *testing.T) *Prefilter {
 	return p
 }
 
-// TestPrefilterSoundness — 健全性对拍: 对每份正文, 拿"正文里真的出现了的原子"去问 Potentials,
+// TestPrefilterSoundness — 健全性对拍: 对每份正文, 拿"正文里真的出现了的原子"去问 GetPotentials,
 // 结果必须【覆盖】所有真命中的 pattern。这一条挂了, 前置粗筛就是在漏检。
 func TestPrefilterSoundness(t *testing.T) {
 	p := newTestPrefilter(t)
@@ -73,13 +73,13 @@ func TestPrefilterSoundness(t *testing.T) {
 	for _, text := range texts {
 		lower := strings.ToLower(text)
 		var found []int32
-		for i, a := range p.Atoms() {
+		for i, a := range p.GetAtoms() {
 			if strings.Contains(lower, a) {
 				found = append(found, int32(i))
 			}
 		}
 		pot := map[int32]bool{}
-		for _, id := range p.Potentials(found) {
+		for _, id := range p.GetPotentials(found) {
 			pot[id] = true
 		}
 		for i, re := range res {
@@ -87,8 +87,8 @@ func TestPrefilterSoundness(t *testing.T) {
 				continue
 			}
 			if !pot[int32(i)] {
-				t.Errorf("🔴 漏筛: 正文 %q 上 pattern[%d]=%q 真的命中, 但 Potentials 没放它进来\n"+
-					"  找到的原子 %v · 全部原子 %v", text, i, prefilterPats[i], found, p.Atoms())
+				t.Errorf("🔴 漏筛: 正文 %q 上 pattern[%d]=%q 真的命中, 但 GetPotentials 没放它进来\n"+
+					"  找到的原子 %v · 全部原子 %v", text, i, prefilterPats[i], found, p.GetAtoms())
 			}
 		}
 	}
@@ -100,14 +100,14 @@ func TestPrefilterUnfiltered(t *testing.T) {
 	defer p.FreeC()
 
 	un := map[int32]bool{}
-	for _, id := range p.Unfiltered() {
+	for _, id := range p.GetUnfiltered() {
 		un[id] = true
 	}
 	// 4 = [A-Za-z0-9+/=_-]{20,} · 5 = (?-i:\([A-Z]{2,5}\)) · 6 = (?:foo|[A-Z]{5})
 	for _, i := range []int32{4, 5, 6} {
 		if !un[i] {
 			t.Errorf("pattern[%d]=%q 没有必需字面量, 应该在不可过滤集里, 实际不在(不可过滤集 %v)",
-				i, prefilterPats[i], p.Unfiltered())
+				i, prefilterPats[i], p.GetUnfiltered())
 		}
 	}
 	// 0 = api_key · 8 = -----BEGIN … 这两条有硬字面量, 必须筛得掉。
@@ -127,10 +127,10 @@ func TestPrefilterUnfiltered(t *testing.T) {
 func TestPrefilterAtoms(t *testing.T) {
 	p := newTestPrefilter(t)
 	defer p.FreeC()
-	if len(p.Atoms()) == 0 {
+	if len(p.GetAtoms()) == 0 {
 		t.Fatal("原子表空 —— 这批 pattern 里有硬字面量, 不该一个原子都推不出来")
 	}
-	for _, a := range p.Atoms() {
+	for _, a := range p.GetAtoms() {
 		if a != strings.ToLower(a) {
 			t.Errorf("原子 %q 没小写化 —— 文档承诺是小写的, 调用方会照着直接在小写正文里找", a)
 		}
@@ -141,11 +141,11 @@ func TestPrefilterAtoms(t *testing.T) {
 		t.Fatalf("NewPrefilter(minAtomLen=8): %v", err)
 	}
 	defer big.FreeC()
-	if len(big.Atoms()) > len(p.Atoms()) {
-		t.Errorf("minAtomLen 调大之后原子反而变多了: %d → %d", len(p.Atoms()), len(big.Atoms()))
+	if len(big.GetAtoms()) > len(p.GetAtoms()) {
+		t.Errorf("minAtomLen 调大之后原子反而变多了: %d → %d", len(p.GetAtoms()), len(big.GetAtoms()))
 	}
-	if len(big.Unfiltered()) < len(p.Unfiltered()) {
+	if len(big.GetUnfiltered()) < len(p.GetUnfiltered()) {
 		t.Errorf("minAtomLen 调大之后不可过滤集反而变小了: %d → %d —— 原子更长只会让更多 pattern 筛不掉",
-			len(p.Unfiltered()), len(big.Unfiltered()))
+			len(p.GetUnfiltered()), len(big.GetUnfiltered()))
 	}
 }

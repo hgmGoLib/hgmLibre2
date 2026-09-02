@@ -506,7 +506,7 @@ func TestStdlibCompare_PeakChild(t *testing.T) {
 	}
 	extra := ""
 	if engine == "re2" {
-		extra = fmt.Sprintf(" DFA整表清空(flush)=%d", DFAStats().Resets)
+		extra = fmt.Sprintf(" DFA整表清空(flush)=%d", GetDFAStats().Resets)
 	}
 	fmt.Printf("PEAK %-9s 正则=%3d 正文=%2d×%dKiB VmHWM增量=%6.2fMB 命中=%d%s\n",
 		mode, len(pats), len(bodies), stdcmpBodySize>>10,

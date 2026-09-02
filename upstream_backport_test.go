@@ -94,14 +94,15 @@ func TestBackport_LookAroundErrorArg(t *testing.T) {
 // upstream e664633: 空宽算子的计数重复 (\b{1000} / (?:^|$){500}) 原来会老老实实展开成上千条指令,
 // 而它们语义上就等于一份。改后指令数塌回个位数, 匹配结果不变 —— 拿 stdlib 对拍这一点。
 func TestBackport_EmptyWidthRepeatNoBlowup(t *testing.T) {
+	// 🔴 原来这张表里还有 `(?:^|$){500}` · `(?:$){28,}` · `\b(?:\b|\B){999}\B` 三条 ——
+	//    它们【整条都是零宽】, 匹配的就是空串。2026-09-01 起全库编译入口一律拒能匹配空串的
+	//    pattern (见 emptymatch.go), 这三条编不出来了。剩下四条各带至少一个占字节的部分,
+	//    照样把"空宽算子的计数重复不该展开成上千条指令"这件事钉住。
 	pats := []string{
 		`\b{1000}foo`,
 		`(?:^){1000}foo`,
 		`(?:\b\B){500}x`,
-		`(?:^|$){500}`,
 		`a(?:\b){0,900}b`,
-		`(?:$){28,}`,
-		`\b(?:\b|\B){999}\B`,
 	}
 	inputs := []string{"", "foo", " foo ", "xfoo", "ab", "a b", "x", "aXb"}
 	for _, p := range pats {

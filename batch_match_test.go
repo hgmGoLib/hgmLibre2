@@ -88,14 +88,14 @@ func BenchmarkFindAll_PerCall(b *testing.B) {
 	}
 }
 
-// TestBatchVsPerCallVsStdlib: 大正文上三方对拍 (批量 == 逐处 == stdlib), 覆盖 index/submatch/string
-// 与含空匹配的正则, 确保下沉到 C 的循环逐字等价.
+// TestBatchVsPerCallVsStdlib: 大正文上三方对拍 (批量 == 逐处 == stdlib), 覆盖 index/submatch/string,
+// 确保下沉到 C 的循环逐字等价.
 func TestBatchVsPerCallVsStdlib(t *testing.T) {
 	body := benchBody()
 	pats := []string{
 		`[A-Za-z0-9_]{3,}`,        // 多命中, 无空匹配
 		`(?i)def_(\d+)`,           // 带子组
-		`x*`,                      // 会产空匹配 (推进/去重路径)
+		// 🔴 原来这里有一条 `x*` (会产空匹配, 走推进/去重路径)。全库拒空串之后它编不出来了。
 		`(token)(\d)`,             // 多子组
 		`\d{2}[-\x{2011}]\w+`,     // 多字节 rune 邻接
 	}

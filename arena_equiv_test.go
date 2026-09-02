@@ -197,5 +197,5 @@ func TestSetHitsMatchTruthConcurrent(t *testing.T) {
 			t.Fatalf("并发下命中集与逐条对拍不符: %s (flush 或 arena 搬家把别人手里的状态弄丢了)", f)
 		}
 	}
-	t.Logf("并发 %d 协程 × 3 轮 × %d 份正文全部对上; %+v", nw, len(bodies), set.MemInfo())
+	t.Logf("并发 %d 协程 × 3 轮 × %d 份正文全部对上; %+v", nw, len(bodies), set.GetMemInfo())
 }

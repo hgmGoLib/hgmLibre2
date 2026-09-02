@@ -1,4 +1,4 @@
-// scanstats_test.go — 按对象归因的 DFA 计数 (MatchStats / MemInfo) 的门。
+// scanstats_test.go — 按对象归因的 DFA 计数 (MatchStats / GetMemInfo) 的门。
 //
 // 跟 dfastats_test.go 的区别就是这套东西存在的理由: 那份计数是【进程级】的, 只能回答
 // "这个进程里有人在 thrash"; 这份要能回答"是哪个 Set"和"是哪一次调用"。所以下面的门里
@@ -25,7 +25,7 @@ func TestScanStats_AttributesFlushToTheCall(t *testing.T) {
 	}
 	buf := make([]int32, set.GetPatternLen())
 
-	DFAStatsZero()
+	ResetDFAStats()
 	var st ScanStats
 	var sumFlush, sumBuilt, withFlush int64
 	for i, b := range bodies {
@@ -42,7 +42,7 @@ func TestScanStats_AttributesFlushToTheCall(t *testing.T) {
 		sumFlush += st.Flushes
 		sumBuilt += st.StatesBuilt
 	}
-	global := DFAStats().Resets
+	global := GetDFAStats().Resets
 	t.Logf("预算 %d bytes: %d/%d 次调用踩到 flush, 合计 flush %d 次 (进程级 Resets %d), 共建状态 %d 个",
 		mem, withFlush, len(bodies), sumFlush, global, sumBuilt)
 
@@ -82,7 +82,7 @@ func TestScanStats_QuietWhenBudgetFits(t *testing.T) {
 
 // TestScanStats_PerSetAttribution — 这道门是整套东西的存在理由。
 // 同一个进程里两个 Set: A 饿着(必 thrash), B 喂饱(必安静)。进程级计数这时候是涨的,
-// 但 B 自己的每次调用和 B 的 MemInfo.FlushesTotal 必须一次都不涨。
+// 但 B 自己的每次调用和 B 的 GetMemInfo.FlushesTotal 必须一次都不涨。
 func TestScanStats_PerSetAttribution(t *testing.T) {
 	pats := dfaStatsPatterns(60, 8)
 	bodies := dfaStatsBodies(12, 64<<10, len(pats))
@@ -102,7 +102,7 @@ func TestScanStats_PerSetAttribution(t *testing.T) {
 		fat.Match(b, bufB)
 	}
 
-	DFAStatsZero()
+	ResetDFAStats()
 	var sa, sb ScanStats
 	var flushA, flushB int64
 	for _, b := range bodies {
@@ -111,7 +111,7 @@ func TestScanStats_PerSetAttribution(t *testing.T) {
 		flushA += sa.Flushes
 		flushB += sb.Flushes
 	}
-	global := DFAStats().Resets
+	global := GetDFAStats().Resets
 	t.Logf("饿集 flush %d 次, 宽集 flush %d 次, 进程级 Resets %d", flushA, flushB, global)
 
 	if flushA == 0 {
@@ -120,18 +120,18 @@ func TestScanStats_PerSetAttribution(t *testing.T) {
 	if flushB != 0 {
 		t.Fatalf("宽集被算进了 %d 次 flush —— 归因串台了", flushB)
 	}
-	if mi := fat.MemInfo(); mi.FlushesTotal != 0 {
-		t.Fatalf("宽集 MemInfo.FlushesTotal=%d, 应为 0: %+v", mi.FlushesTotal, mi)
+	if mi := fat.GetMemInfo(); mi.FlushesTotal != 0 {
+		t.Fatalf("宽集 GetMemInfo.FlushesTotal=%d, 应为 0: %+v", mi.FlushesTotal, mi)
 	}
-	if mi := starved.MemInfo(); mi.FlushesTotal != flushA {
-		t.Fatalf("饿集 MemInfo.FlushesTotal=%d 与 per-scan 合计 %d 对不上", mi.FlushesTotal, flushA)
+	if mi := starved.GetMemInfo(); mi.FlushesTotal != flushA {
+		t.Fatalf("饿集 GetMemInfo.FlushesTotal=%d 与 per-scan 合计 %d 对不上", mi.FlushesTotal, flushA)
 	}
 	if int64(global) != flushA+flushB {
 		t.Fatalf("进程级 %d != 两个 Set 之和 %d", global, flushA+flushB)
 	}
 }
 
-// TestSetMemInfo_TracksUsage — MemInfo 的三条: 没扫过时不建 DFA; 扫过之后水位有意义;
+// TestSetMemInfo_TracksUsage — GetMemInfo 的三条: 没扫过时不建 DFA; 扫过之后水位有意义;
 // 生涯计数与 per-scan 合计一致。
 func TestSetMemInfo_TracksUsage(t *testing.T) {
 	pats := dfaStatsPatterns(60, 8)
@@ -142,11 +142,11 @@ func TestSetMemInfo_TracksUsage(t *testing.T) {
 	}
 	// RE2::Set::Compile 自己会跑一次冒烟搜索, 所以编译完 DFA 就已经存在了 (States=1)。
 	// 这里钉住的是"查询本身不制造状态": 查两次, 水位不动。
-	before := set.MemInfo()
+	before := set.GetMemInfo()
 	if !before.Built || before.States > 4 {
 		t.Fatalf("刚编完的水位不像话 (期望 Built 且只有个位数状态): %+v", before)
 	}
-	if again := set.MemInfo(); again.States != before.States || again.StatesBuiltTotal != before.StatesBuiltTotal {
+	if again := set.GetMemInfo(); again.States != before.States || again.StatesBuiltTotal != before.StatesBuiltTotal {
 		t.Fatalf("连查两次水位就变了 —— 查询在制造状态: %+v -> %+v", before, again)
 	}
 	buf := make([]int32, set.GetPatternLen())
@@ -156,13 +156,13 @@ func TestSetMemInfo_TracksUsage(t *testing.T) {
 		set.MatchStats(b, buf, &st)
 		built += st.StatesBuilt
 	}
-	mi := set.MemInfo()
-	t.Logf("%+v used=%d", mi, mi.Used())
+	mi := set.GetMemInfo()
+	t.Logf("%+v used=%d", mi, mi.GetUsedBytes())
 	if !mi.Built {
 		t.Fatalf("扫过之后仍报 Built=false: %+v", mi)
 	}
-	if mi.States <= 0 || mi.Used() <= 0 || mi.StateBudget <= 0 {
-		t.Fatalf("水位不像话: %+v used=%d", mi, mi.Used())
+	if mi.States <= 0 || mi.GetUsedBytes() <= 0 || mi.StateBudget <= 0 {
+		t.Fatalf("水位不像话: %+v used=%d", mi, mi.GetUsedBytes())
 	}
 	if mi.MemLeft > mi.StateBudget {
 		t.Fatalf("剩余额度比总额度还大: %+v", mi)
@@ -236,7 +236,7 @@ func TestScanStats_ConcurrentDoesNotCrash(t *testing.T) {
 	for _, f := range flush {
 		sum += f
 	}
-	mi := set.MemInfo()
+	mi := set.GetMemInfo()
 	t.Logf("并发 %d 线程合计 flush %d 次, Set 生涯 %d 次: %+v", nw, sum, mi.FlushesTotal, mi)
 	if sum != mi.FlushesTotal {
 		t.Fatalf("并发下 per-scan 合计 %d != 生涯 %d", sum, mi.FlushesTotal)

@@ -22,7 +22,7 @@ var spanResolvePatterns = []string{
 	"abcd",
 	"[a-z]{3,}",
 	"[a-z]{2,4}",
-	"a*",
+	// 🔴 原来这里有一条 "a*" (端点集合几乎覆盖全文)。全库拒空串之后它编不出来了, 删掉。
 	"[0-9]+",
 	`\bkey[0-9]+`,
 	"^the",
@@ -311,17 +311,10 @@ func TestSpanResolve_BadArgs(t *testing.T) {
 	if _, _, err := set.ResolveSpan(text, -1, 0); err == nil {
 		t.Fatalf("from 为负应该报错")
 	}
-	// 空正文 + 空匹配 pattern: 合法, 且应该答"匹配, 右端 0"。
-	e, err := NewRegexpSet([]string{"a*"})
-	if err != nil {
-		t.Fatalf("建 set: %v", err)
-	}
-	pos, ok, err := e.ResolveSpan("", 0, 0)
-	if err != nil || !ok || pos != 0 {
-		t.Fatalf("空正文空匹配: pos=%d ok=%v err=%v", pos, ok, err)
-	}
+	// 🔴 原来这里还有一格: 空正文 + 能匹配空串的 pattern ("a*") 该答"匹配, 右端 0"。
+	//    全库拒空串之后 "a*" 编不出来了 (见 emptymatch.go), 这一格随之作废。
 	// ResolveSpanBytes 与 ResolveSpan 同解。
-	pos, ok, err = set.ResolveSpanBytes([]byte(text), 0, 0)
+	pos, ok, err := set.ResolveSpanBytes([]byte(text), 0, 0)
 	if err != nil || !ok || pos != 3 {
 		t.Fatalf("ResolveSpanBytes: pos=%d ok=%v err=%v", pos, ok, err)
 	}

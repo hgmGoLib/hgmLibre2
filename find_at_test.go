@@ -7,7 +7,7 @@ import (
 )
 
 // TestCompileLongestVsGreedy 钉住"longest 与贪心选同一个起点, 只在终点上分歧"这句话 ——
-// 上层 (MatchScanner 的路 B) 把两趟压成一趟, 靠的就是它。
+// 上层 (Re2Set_fll_t 在 2026-08-28 之前的"路 B") 把两趟压成一趟, 靠的就是它。
 func TestCompileLongestVsGreedy(t *testing.T) {
 	cases := []struct {
 		pat  string
