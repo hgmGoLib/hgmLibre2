@@ -19,9 +19,9 @@
 // cre2.cpp 已经装了 Regexp + Set + 反向扫三套东西。prefilter 与它们没有共享状态
 // (FilteredRE2 自己持有一批独立的 RE2 对象), 塞进去只会让那个文件更难读。
 #include "cre2.h"
-#include "re2/filtered_re2.h"
-#include "re2/re2.h"
-#include "re2/stringpiece.h"
+#include "re2_filtered_re2.h"
+#include "re2_re2.h"
+#include "re2_stringpiece.h"
 #include <new>
 #include <string>
 #include <vector>

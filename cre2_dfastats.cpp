@@ -12,7 +12,7 @@
 // 进程级计数, 让"正在 thrash"变成可测的量: maxMem 到底够不够, 不必再靠猜。
 // 用法与口径见 cre2.h 的声明与 Go 侧 dfastats.go。
 #include "cre2.h"
-#include "re2/re2.h"
+#include "re2_re2.h"
 
 #include <atomic>
 

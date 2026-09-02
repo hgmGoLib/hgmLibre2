@@ -1,14 +1,14 @@
 // cre2.cpp — cre2.h 的实现, 直接调 vendored RE2 (2023-03-01, 无 abseil).
 #include "cre2.h"
 #include "cre2_internal.h"
-#include "re2/re2.h"
-#include "re2/set.h"
+#include "re2_re2.h"
+#include "re2_set.h"
 // 反着扫要直接用 re2 的内部件: Regexp::Parse + Regexp::CompileToReverseProg + Prog::SearchDFA。
 // 走 RE2 对象本身不行 —— 它的 rprog_ 是从【剥掉必需前缀之后】的 suffix_regexp_ 编的,
 // 只在"已经知道匹配右端在哪"的场景下用, 拿来当整篇非锚定搜索会漏。
-#include "re2/prog.h"
-#include "re2/regexp.h"
-#include "re2/stringpiece.h"
+#include "re2_prog.h"
+#include "re2_regexp.h"
+#include "re2_stringpiece.h"
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -95,7 +95,7 @@ static int cre2_match_at_common(const cre2_re *h, const char *text, int textlen,
 	const char *base = text ? text : "";
 	re2::StringPiece full(base, textlen);
 	// 🔴 小 nmatch 走栈上那块, 不要每次调用 new 一个 vector. 这条路是【按处命中调用】的
-	//    (MatchScanner 补端点每处一次), 一次 malloc/free 在那个量级上是能量出来的常数 ——
+	//    (fll/frel/rrl 补端点每处一次), 一次 malloc/free 在那个量级上是能量出来的常数 ——
 	//    实测把它去掉之前, 路 A 在低命中密度语料上比走 set 的老路子慢 2%.
 	//    8 是随手够用的界: group0 + 7 个子组, 超了才落回 vector.
 	re2::StringPiece stackbuf[8];
@@ -736,6 +736,7 @@ cre2_set *cre2_set_new_ex(int64_t max_mem, int reversed) {
 		delete h;
 		return nullptr;
 	}
+	h->max_mem = max_mem;
 	return h;
 }
 
@@ -745,7 +746,12 @@ int cre2_set_reversed(const cre2_set *h) { return h->set->reversed() ? 1 : 0; }
 
 int cre2_set_add(cre2_set *h, const char *pat, int patlen) {
 	re2::StringPiece sp(pat, patlen);
-	return h->set->Add(sp, NULL); // 返回 index 或 -1(解析失败)
+	int id = h->set->Add(sp, NULL); // 返回 index 或 -1(解析失败)
+	if (id >= 0) {
+		// 源串留一份: 补端点的单条对象是惰性建的, 建的时候正文早没了, 只能靠这份。
+		h->pats.push_back(std::string(pat, (size_t)(patlen > 0 ? patlen : 0)));
+	}
+	return id;
 }
 
 int cre2_set_compile(cre2_set *h) { return h->set->Compile() ? 1 : 0; }
@@ -831,9 +837,21 @@ void cre2_set_attrib_info(const cre2_set *h, cre2_set_attrib *agg,
 	memcpy(agg->BirthHist, ai.birth_hist, sizeof agg->BirthHist);
 }
 
+// cre2_set_ref: 再要一份引用 (给 cre2_re2set 这种要把表活过自己调用方的持有者)。
+void cre2_set_ref(cre2_set *h) {
+	if (h == nullptr) {
+		return;
+	}
+	h->ref.fetch_add(1, std::memory_order_relaxed);
+}
+
+// cre2_set_free: 引用【减一】, 减到 0 才真拆。可以对同一个句柄调多次 —— 每次配一份引用。
 void cre2_set_free(cre2_set *h) {
 	if (h == nullptr) {
 		return;
+	}
+	if (h->ref.fetch_sub(1, std::memory_order_acq_rel) != 1) {
+		return; // 还有别人攥着
 	}
 	delete h->set;
 	delete h;
