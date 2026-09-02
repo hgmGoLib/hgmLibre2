@@ -9,7 +9,7 @@ import (
 // re2set_fll_viable_test.go —— fll 补起点那条路 (反向种全部状态收候选 + 升序逐个
 // 正向锚定验) 的回归。GetViableStarts 本身的单元测试也在这里。
 //
-// 🔴 2026-08-28 之前这条路叫"路 D2", 挂在一个独立类型 MatchScanner2 上, 与老的路 A
+// 🔴 2026-08-28 之前这条路叫"路 D2", 挂在一个独立类型 Re2Set_fll_t2 上, 与老的路 A
 //    (spanFast) / 路 B (默认档) 并存比价。比完了, A/B 和那个类型一起删了, 这几个用例
 //    跟着落到 Re2Set_fll_t 上 —— 现在它们钉的就是【唯一那条路】。
 
@@ -128,7 +128,7 @@ func TestRe2SetFllVsLongestFuzz(t *testing.T) {
 	t.Logf("对账 %d 条 pattern-正文 · 共 %d 处命中, 岔开 0", cmp, total)
 }
 
-// TestRe2SetFllBenchTableVsLongest —— 换成【整张真表 benchPats × 三档语料】再对一遍
+// TestRe2SetFllBenchTableVsLongest —— 换成【整张真实规则表 benchPats × 三档语料】再对一遍
 // re.Longest().FindAllStringIndex。上面那个 fuzz 是"小表 × 随机短正文"(形状刁钻但正文小),
 // 这个是"大表 × 长正文"(形状普通但游标要真的走很多步) —— 两头都要。
 //

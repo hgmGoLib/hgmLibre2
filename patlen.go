@@ -1,6 +1,6 @@
 // patlen.go —— 每条 pattern 的【匹配字节长度区间】(min, max), 建集期算一次。
 //
-// 用来干什么: NewMatchScanner 拿到"这条 pattern 的匹配在第几字节结束"之后, 还得知道它从哪开始。
+// 用来干什么: NewRe2Set_fll 拿到"这条 pattern 的匹配在第几字节结束"之后, 还得知道它从哪开始。
 // 怎么找开始, 完全由这个区间决定, 三档差着数量级:
 //
 //	min == max        定长 (NRIC 9 字节 · 身份证 18 字节 · 邮编…): start = end - min, 一句减法,

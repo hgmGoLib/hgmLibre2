@@ -59,7 +59,7 @@ func frelScanOn(t *testing.T, s *Re2Set_frel_t, text string, batch int) []Re2Set
 // 上界从正文末尾起, 反复取"终点最靠右且 <= 上界"的匹配, 同终点取最长 (= 起点最靠左),
 // 收下之后把上界压到它的起点。返回升序。
 //
-// 🔴 这不是 msrBrute (反向 MatchScanner 那个)。那个先挑【起点】最靠右的, 这个先挑
+// 🔴 这不是 rrlBrute (Re2Set_rrl_t 那个判据)。那个先挑【起点】最靠右的, 这个先挑
 //    【终点】最靠右的 —— aa|a 撞 "aaa" 两者给出完全不同的答案, 见 TestRe2SetFrel_Shape。
 func frelBrute(pat, text string) []Re2Set_startEnd_t {
 	re := regexp.MustCompile(`\A(?:` + pat + `)\z`)
@@ -95,7 +95,7 @@ func TestRe2SetFrel_Shape(t *testing.T) {
 	if fmt.Sprint(got) != "[{0 0 1} {0 1 3}]" {
 		t.Fatalf("最右终点最长不对: 要 [{0 0 1} {0 1 3}] 得到 %v", got)
 	}
-	if s := fmt.Sprint(msrBrute(`aa|a`, "aaa")); s != "[{0 2 3} {0 1 2} {0 0 1}]" {
+	if s := fmt.Sprint(rrlBrute(`aa|a`, "aaa")); s != "[{0 2 3} {0 1 2} {0 0 1}]" {
 		t.Fatalf("判据自身失效: 最右【起点】最长该是 [{0 2 3} {0 1 2} {0 0 1}], 得到 %v", s)
 	}
 	ll := regexp.MustCompile(`aa|a`)
@@ -118,8 +118,8 @@ func TestRe2SetFrel_Shape(t *testing.T) {
 	}
 }
 
-// frelPats 是下面几个对拍共用的名单。前五条是 matchscan.go 头注里那几个"会把猜起点的路
-// 搞岔"的反例; 第六条是正向状态数爆炸那一族; 剩下几条是真门表里的形状。
+// frelPats 是下面几个对拍共用的名单。前五条是 re2set_fll.go 那条路上"会把猜起点的路
+// 搞岔"的反例; 第六条是正向状态数爆炸那一族; 剩下几条是真实规则表里的形状。
 // 🔴 一条 \b / ^ / $ 都不许有: 判据是拿 text[s:e] 切片跑 stdlib 的, 上下文断言在切片上
 //    看到的邻居是假的 —— 那会变成判据的伪影, 不是被测对象的。
 var frelPats = []string{
@@ -135,16 +135,16 @@ var frelPats = []string{
 }
 
 // frelCorpus 按 pattern 自己的 AST 造一篇【真的撞得上】的语料 (随机字节撞不出真匹配 = 空转绿)。
-// msrGen 在 re2set_rrl_test.go 里, 两边共用。
+// astGen 在 re2set_rrl_test.go 里, 两边共用。
 func frelCorpus(ast *syntax.Regexp, rng *rand.Rand) string {
-	const noise = " ,;:\"'\n\tabcXYZ019-_/@." // 全 ASCII, 理由同 msrGen 那段红字
+	const noise = " ,;:\"'\n\tabcXYZ019-_/@." // 全 ASCII, 理由同 astGen 那段红字
 	var sb strings.Builder
 	for sb.Len() < 60+rng.Intn(80) {
 		if rng.Intn(3) == 0 {
 			sb.WriteByte(noise[rng.Intn(len(noise))])
 			continue
 		}
-		msrGen(ast, rng, &sb, 0)
+		astGen(ast, rng, &sb, 0)
 		sb.WriteByte(noise[rng.Intn(len(noise))])
 	}
 	return sb.String()

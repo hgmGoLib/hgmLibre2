@@ -2,8 +2,8 @@
 //
 // 为什么: "任何字符串里都有空串", 所以一条能匹配空串的 pattern 在任何正文上都必然命中,
 // 拿它当正则没有信息量 —— 这是 pattern 写错了, 不是引擎该伺候的用法。
-// 本库过去为这种写法养着一整套逃生通道 (MatchScanner 的 unsupported 名单 · SetModes 的
-// boolOnly 降级 · Re2SetFrel 的逐条校验 · asc 那边的 bodyGateSpanShapeOK 静态排除),
+// 本库过去为这种写法养着一整套逃生通道 (Re2Set_fll_t 的 unsupported 名单 · SetModes 的
+// boolOnly 降级 · Re2Set_frel_t 的逐条校验 · 调用方那边再来一道静态排除),
 // 通道本身就是一批几乎跑不到、因而基本没测过的分支。2026-09-01 决定整条拆掉:
 // 编译入口一道门, 后面所有代码都可以【无条件】假设"每个匹配至少 1 字节"。
 //

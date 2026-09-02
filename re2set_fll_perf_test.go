@@ -8,15 +8,15 @@ import (
 
 // re2set_fll_perf_test.go —— fll 补起点那条路的价钱与它的账 (GetStats / 常驻内存)。
 //
-// 🔴 2026-08-28 之前这里是【三条路的对照台】(A=spanFast · B=默认档 · D2=MatchScanner2),
+// 🔴 2026-08-28 之前这里是【三条路的对照台】(A=spanFast · B=默认档 · D2=Re2Set_fll_t2),
 //    整个文件的骨架就是"同一个 set 上开三个工作区各跑一遍比倍数"。三条路合成一条之后
 //    对照没有了对手, 于是这里只剩【一条路的绝对值 + 它自己的账】。
-//    真正的换路凭据在调用方产品的扫描基准 (11 份 100MB 真语料 × 9 张生产真门表), 不在这儿 ——
+//    真正的换路凭据在调用方产品的扫描基准 (11 份 100MB 真语料 × 9 张生产规则表), 不在这儿 ——
 //    这个文件量的是 64KiB 量级的形状, 只够看"有没有突然塌一个数量级"。
 //
 // 🔴 msPerfHardPats 那张表是【故意留着】的: 它是这条路最坏形状的哨兵 (起点定了之后正向
 //    取最长右端要一路走到机器死, 而机器死不掉), 也是"试/看 > 1"唯一真的会发生的地方 ——
-//    真门表上 99 格全是 1.00。哪天有人动了候选那一步, 先看这张表塌没塌。
+//    真实规则表上 99 格全是 1.00。哪天有人动了候选那一步, 先看这张表塌没塌。
 
 // msPerfRun 跑一遍并返回交出去的区间数 (拿它当 sink, 免得被优化掉)。
 func msPerfRun(tb testing.TB, ms *msPerfWork, text string) int {
@@ -88,7 +88,7 @@ func BenchmarkRe2SetFll(b *testing.B) {
 // TestRe2SetFllPerfTable —— 把价钱和账打成一张表。
 //
 // 🔴 "试/看" = Tries/Walks = 每次回看正向锚定验了几次。1.00 = 升序第一个候选就是答案,
-//    一次假候选都没验。这是这条路便不便宜的【唯一】那个数 —— 生产真门表上 99 格全是 1.00。
+//    一次假候选都没验。这是这条路便不便宜的【唯一】那个数 —— 生产规则表上 99 格全是 1.00。
 //    Emits 不进这个分母: 它把定长条 (走 e-minL 减法, 一次回看都不做) 也数进去了。
 func TestRe2SetFllPerfTable(t *testing.T) {
 	set, _, _ := benchObjects(t)
@@ -113,7 +113,7 @@ func TestRe2SetFllPerfTable(t *testing.T) {
 		nVp, sVp, float64(aVp)/(1<<20))
 }
 
-// msPerfHardPats 是这条路会露怯的那几个形状 (doc/plan12 里那条"正向锚定收口无上界"的账):
+// msPerfHardPats 是这条路会露怯的那几个形状 ("正向锚定收口无上界"那笔账):
 // 起点定了之后正向取最长右端要一路走到机器死, 而机器【死不掉】。
 // 拿它们量的不是"快不快", 是"最坏形状上塌得有多厉害"。
 var msPerfHardPats = []struct{ name, pat, fill string }{

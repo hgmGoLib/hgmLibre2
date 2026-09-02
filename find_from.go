@@ -10,8 +10,9 @@
 // 🔴 所以这组入口的存在理由只有一条: 让"只在某一段里找"这件事不必切片。参数都是【原串上的
 //    偏移】, 整串照样喂给 RE2。
 //
-// 谁在用: ① MatchScanner 的 B 路 (matchscan.go 的 MatchScanMode_t) —— 它要"起点 >= 游标的
-// 最左匹配", 正是这个形状 (拿的是 longest 口径的对象, 所以一趟就是整段区间)。
+// 谁在用: ① "一遍扫一张表, 再把命中补成整段区间"那条路 (Re2Set_fll_t, re2set_fll.go) 在
+// 2026-08-28 换路之前走的就是这个形状 —— 它要"起点 >= 游标的最左匹配"
+// (拿的是 longest 口径的对象, 所以一趟就是整段区间)。
 // ② 拿到整段区间之后回头补捕获组偏移的调用方 (下面那个 Within 版)。
 // 🔴 锚定版 (起点必须【就是】pos) 在 find_at.go: FindStringIndexAtWithin。
 package hgmLibre2
@@ -30,7 +31,7 @@ import "runtime"
 // leftmost-longest。
 // 🔴 两者【选同一个起点】, 只在终点上分歧 —— 所以要 leftmost-longest 的整段区间, 用一个
 //    longest 对象调这一句就够了 (一趟)。拿贪心对象定起点、再另跑一趟锚定解析重取最长终点
-//    也对, 但那是两趟; MatchScanner 的默认档 2026-08-27 就是这么从两趟压成一趟的。
+//    也对, 但那是两趟; Re2Set_fll_t 的默认档 2026-08-27 就是这么从两趟压成一趟的。
 func (re *Regexp) FindStringIndexFrom(s string, pos int) []int {
 	if pos < 0 || pos > len(s) {
 		return nil
@@ -72,7 +73,7 @@ func (ctx *FindStringIndex_ctx_t) FindStringIndexFrom(re *Regexp, s string, pos 
 // 偏移都是【原串 s 上的】。越界 (from<0 / bound>len(s) / from>bound) 当无匹配。
 //
 // 🔴 它存在的理由与本文件头那段一字不差, 只是换个消费点: 调用方已经从别处 (比如
-//    MatchScanner) 拿到了某一处匹配的【整段区间】 [from,bound), 现在还想要这一段里某个捕获组
+//    Re2Set_fll_t) 拿到了某一处匹配的【整段区间】 [from,bound), 现在还想要这一段里某个捕获组
 //    的位置。没有这个入口的话只能 re.FindStringSubmatchIndex(s[from:bound]) —— 那两刀切完,
 //    ^ / $ / \b 在两端看到的是假邻居, 捕获组偏移会偏; 而捕获组偏移的下游往往是脱敏切片。
 //

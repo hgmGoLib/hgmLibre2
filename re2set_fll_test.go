@@ -93,8 +93,10 @@ func TestRe2SetFllUnboundedTail(t *testing.T) {
 //	定长 (min == max)  【逐字节等于 FindAll】。这一档是可以论证的 (右端定了起点就唯一),
 //	                   也是唯一能拿去切片过校验位 (身份证 / IBAN mod-97 / Luhn) 的一档。
 //	变长 (min < max)   只钉三条: ① 每段都是真匹配 ② 互不相交且升序 ③ FindAll 命中的每一处
-//	                   都被盖到 (不整段静默)。边界【允许】和 FindAll 不同 —— 这一档给的既不是
-//	                   贪心也不是最长, 见 matchscan.go 文件头"变长档"。
+//	                   都被盖到 (不整段静默)。边界【允许】和 FindAll 不同 —— FindAll 是
+//	                   leftmost-first (贪心), 这一档给的是 leftmost-longest, 同一起点上
+//	                   终点可以不同。要逐字节对上就拿 re.Longest() 那个当 oracle,
+//	                   见 re2set_fll_astfuzz_test.go。
 //
 // 2026-08-25 之前这里是"变长条要么逐字节相同、要么自认 ok=false", 靠 PatternLeftmostLongestSafe
 // 那道静态闸兜。闸删掉了 (它兑现不了这个承诺: ? * + {m,n} 同样是长度不齐的交替, 堵严就退化成

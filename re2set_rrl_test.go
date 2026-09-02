@@ -9,10 +9,10 @@ import (
 	"testing"
 )
 
-// msrScan 是"开一个 Re2Set_rrl_t, 扫一遍, 把区间收成一个数组"的测试用简写。
+// rrlScan 是"开一个 Re2Set_rrl_t, 扫一遍, 把区间收成一个数组"的测试用简写。
 // 🔴 生产路径别这么写 (那块数组是 ∝ 命中数的 ratchet 缓冲, 正是分批接口要躲开的东西),
 // 这里是判据代码, 语料才一百多字节。
-func msrScan(t *testing.T, pat, text string) []Re2Set_startEnd_t {
+func rrlScan(t *testing.T, pat, text string) []Re2Set_startEnd_t {
 	t.Helper()
 	rs, err := NewRegexpSetReverseMaxMem([]string{pat}, 64<<20)
 	if err != nil {
@@ -26,9 +26,9 @@ func msrScan(t *testing.T, pat, text string) []Re2Set_startEnd_t {
 	return scanList(t, ms.Scan, text)
 }
 
-// msrBrute 是穷举出来的 rightmost-longest 不重叠序列 —— 与本库无关, 只用 stdlib。
+// rrlBrute 是穷举出来的 rightmost-longest 不重叠序列 —— 与本库无关, 只用 stdlib。
 // 在还没被占掉的 [0,bound) 里反复取【起点最靠右】的匹配, 同起点取【最长】, 吐出去再往左。
-func msrBrute(pat, text string) []Re2Set_startEnd_t {
+func rrlBrute(pat, text string) []Re2Set_startEnd_t {
 	re := regexp.MustCompile(`\A(?:` + pat + `)\z`)
 	var out []Re2Set_startEnd_t
 	bound := len(text)
@@ -55,7 +55,7 @@ func msrBrute(pat, text string) []Re2Set_startEnd_t {
 // 外加 rightmost-longest 与 leftmost-longest 真的会给不同答案 (否则下面的对拍是空转)。
 func TestRe2SetRrl_Shape(t *testing.T) {
 	// ab|b 撞 "aab": 最左最长是 [1,3)="ab", 最右最长是 [2,3)="b" —— 方向定输赢。
-	got := msrScan(t, `ab|b`, "aab")
+	got := rrlScan(t, `ab|b`, "aab")
 	if len(got) != 1 || got[0].Start != 2 || got[0].End != 3 {
 		t.Fatalf("rightmost-longest 不对: 要 [[2,3)] 得到 %v", got)
 	}
@@ -66,23 +66,23 @@ func TestRe2SetRrl_Shape(t *testing.T) {
 	}
 
 	// a|ab 撞 "abab": 两边命中集相同, 只是顺序反过来 —— 降序这件事在这里最好看。
-	got = msrScan(t, `a|ab`, "abab")
+	got = rrlScan(t, `a|ab`, "abab")
 	if fmt.Sprint(got) != "[{0 2 4} {0 0 2}]" {
 		t.Fatalf("降序不对: 要 [{0 2 4} {0 0 2}] 得到 %v", got)
 	}
 
 	// 定长走的是那句加法, 不进正则引擎。"12 345 6789" 里最靠右的三位数起点是 8 ("789"),
 	// 不是 7 ("678") —— 这一处正是 rightmost 与 leftmost 分家的地方。
-	got = msrScan(t, `\d{3}`, "12 345 6789")
+	got = rrlScan(t, `\d{3}`, "12 345 6789")
 	if fmt.Sprint(got) != "[{0 8 11} {0 3 6}]" {
 		t.Fatalf("定长档不对: 要 [{0 8 11} {0 3 6}] 得到 %v", got)
 	}
 }
 
-// msrGen 按 pattern 自己的 AST 造一个真匹配。
+// astGen 按 pattern 自己的 AST 造一个真匹配。
 // 🔴 只取 ASCII 可见字符: 判据是拿 text[s:e] 切片跑 stdlib 的, 切在多字节 UTF-8 中间会被当成
 //    U+FFFD 从而多报一处起点 —— 那是判据的伪影, 不是被测对象的。
-func msrGen(re *syntax.Regexp, rng *rand.Rand, sb *strings.Builder, depth int) {
+func astGen(re *syntax.Regexp, rng *rand.Rand, sb *strings.Builder, depth int) {
 	if depth > 12 {
 		return
 	}
@@ -110,17 +110,17 @@ func msrGen(re *syntax.Regexp, rng *rand.Rand, sb *strings.Builder, depth int) {
 		sb.WriteByte(byte('a' + rng.Intn(26)))
 	case syntax.OpCapture, syntax.OpPlus, syntax.OpConcat:
 		for _, s := range re.Sub {
-			msrGen(s, rng, sb, depth+1)
+			astGen(s, rng, sb, depth+1)
 		}
 	case syntax.OpAlternate:
-		msrGen(re.Sub[rng.Intn(len(re.Sub))], rng, sb, depth+1)
+		astGen(re.Sub[rng.Intn(len(re.Sub))], rng, sb, depth+1)
 	case syntax.OpQuest:
 		if rng.Intn(2) == 0 {
-			msrGen(re.Sub[0], rng, sb, depth+1)
+			astGen(re.Sub[0], rng, sb, depth+1)
 		}
 	case syntax.OpStar:
 		for i := rng.Intn(3); i > 0; i-- {
-			msrGen(re.Sub[0], rng, sb, depth+1)
+			astGen(re.Sub[0], rng, sb, depth+1)
 		}
 	case syntax.OpRepeat:
 		hi := re.Max
@@ -129,7 +129,7 @@ func msrGen(re *syntax.Regexp, rng *rand.Rand, sb *strings.Builder, depth int) {
 		}
 		n := re.Min + rng.Intn(hi-re.Min+1)
 		for i := 0; i < n; i++ {
-			msrGen(re.Sub[0], rng, sb, depth+1)
+			astGen(re.Sub[0], rng, sb, depth+1)
 		}
 	}
 }
@@ -152,7 +152,7 @@ func TestRe2SetRrl_VsBrute(t *testing.T) {
 		`(?i)(?:routing|aba|rtn)\D{0,24}\d{9}`,
 		`\d{3}-\d{2}-\d{4}`, // 定长
 	}
-	noise := " ,;:\"'\n\tabcXYZ019-_/@." // 全 ASCII, 理由同 msrGen 那段红字
+	noise := " ,;:\"'\n\tabcXYZ019-_/@." // 全 ASCII, 理由同 astGen 那段红字
 	rng := rand.New(rand.NewSource(20260827))
 	for _, pat := range pats {
 		ast, err := syntax.Parse(pat, syntax.Perl)
@@ -168,13 +168,13 @@ func TestRe2SetRrl_VsBrute(t *testing.T) {
 					sb.WriteByte(noise[rng.Intn(len(noise))])
 					continue
 				}
-				msrGen(ast, rng, &sb, 0)
+				astGen(ast, rng, &sb, 0)
 				sb.WriteByte(noise[rng.Intn(len(noise))])
 			}
 			text := sb.String()
-			want := msrBrute(pat, text)
+			want := rrlBrute(pat, text)
 			hits += len(want)
-			got := msrScan(t, pat, text)
+			got := rrlScan(t, pat, text)
 			if fmt.Sprint(got) != fmt.Sprint(want) {
 				t.Fatalf("pat=%q text=%q\n  本路 %v\n  判据 %v", pat, text, got, want)
 			}

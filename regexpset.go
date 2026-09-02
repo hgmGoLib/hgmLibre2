@@ -30,7 +30,7 @@ type RegexpSet struct {
 	h    *C.cre2_set
 	size int // Add 成功的 pattern 数 (= Match 输出 index 的上界)
 	// lens 是每条 pattern 的匹配字节长度区间 (见 patlen.go), 建集期算一次。
-	// NewMatchScanner 靠它决定"这条的 start 怎么找": 定长 = 减法, 别的 = 回推。
+	// NewRe2Set_fll 靠它决定"这条的 start 怎么找": 定长 = 减法, 别的 = 回推。
 	lens []patLen_t
 	// pats / maxMem 留着建集期用 (以及给调用方查)。存的是切片头和调用方那份字符串, 不复制内容。
 	pats   []string

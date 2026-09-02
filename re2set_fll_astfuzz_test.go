@@ -4,7 +4,7 @@ package hgmLibre2
 // stdlib 的 re.Longest().FindAllStringIndex, 300 轮逐字节对拍。
 //
 // 🔴 语料必须从 AST 生成再拌噪声, 不能纯随机撒字节: 纯随机正文上这批 pattern 一处都撞不上,
-//    那就是【空转绿】(同 TestRe2SetRrl_VsBrute 的红字)。生成器 msrGen 在
+//    那就是【空转绿】(同 TestRe2SetRrl_VsBrute 的红字)。生成器 astGen 在
 //    re2set_rrl_test.go。测试末尾那道 "nSpan < 1000 就 Fatal" 是这件事的哨兵。
 //
 // 🔴 oracle 必须是 Longest() 那个。stdlib 默认的 FindAll 是 leftmost-first (贪心),
@@ -77,7 +77,7 @@ func TestRe2SetFllAstFuzzVsLongest(t *testing.T) {
 				sb.WriteRune(noiseR[rng.Intn(len(noiseR))])
 				continue
 			}
-			msrGen(asts[rng.Intn(len(asts))], rng, &sb, 0)
+			astGen(asts[rng.Intn(len(asts))], rng, &sb, 0)
 			sb.WriteRune(noiseR[rng.Intn(len(noiseR))])
 		}
 		text := sb.String()

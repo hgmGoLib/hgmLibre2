@@ -87,7 +87,7 @@ struct SpanDFA {
   static int Resolve(DFA* dfa, bool run_forward, const char* text, int textlen,
                      int from, int bound, int id, int32_t* out);
 
-  // ── 可行前缀回推 (MatchScanner2 / 路 D2 用) ────────────────────────────────
+  // ── 可行前缀回推 (fll 那条路补起点用) ─────────────────────────────────────
   // ViableStart  : 拿"种全部指令"的那个起始状态 (按 flags 缓存在 start_[base|kStartViable])。
   // ViableStarts : 从 from 往左走一趟, 沿途把每一个【候选起点】收下来。
   static DFA::State* ViableStart(DFA* dfa, int base, uint32_t flags);
@@ -293,7 +293,7 @@ class DFASpanScan {
   //   ② 结束位置的游程留在 native 侧, 每条 pattern 一块, 从 8 个 int32 (= 4 条) 起二倍扩;
   //   ③ 分量收口时把整块游程数组交给调用方 —— 命中【不逐条过桥】, 一个分量交一次。
   // (位图版试过了: 内存和 CPU 都更差, 因为结束位置天生连号, 游程本来就是它的最优压缩。
-  //  换算与实测见 doc/plan12/20260831_219re2scanFast.txt。)
+  //  换算与实测在原型阶段量过, 结论就是这一句。)
   inline void GMark(int32_t id) {
     int b = id % DFA::kGBits;
     int w = b >> 6;

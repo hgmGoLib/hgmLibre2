@@ -95,7 +95,7 @@ static int cre2_match_at_common(const cre2_re *h, const char *text, int textlen,
 	const char *base = text ? text : "";
 	re2::StringPiece full(base, textlen);
 	// 🔴 小 nmatch 走栈上那块, 不要每次调用 new 一个 vector. 这条路是【按处命中调用】的
-	//    (MatchScanner 补端点每处一次), 一次 malloc/free 在那个量级上是能量出来的常数 ——
+	//    (fll/frel/rrl 补端点每处一次), 一次 malloc/free 在那个量级上是能量出来的常数 ——
 	//    实测把它去掉之前, 路 A 在低命中密度语料上比走 set 的老路子慢 2%.
 	//    8 是随手够用的界: group0 + 7 个子组, 超了才落回 vector.
 	re2::StringPiece stackbuf[8];
