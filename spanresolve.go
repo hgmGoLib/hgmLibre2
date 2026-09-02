@@ -13,7 +13,7 @@
 // 🔴 也不要在 Go 这侧自己补。自己补只能另编一条 \A(?:pat) 的锚定正则 —— 每条 pattern 一个
 //    Regexp 对象、一份独立的 DFA 缓存, 还得手工保证它和 set 里那条语义一致; 而【非锚定】的
 //    那种补法 (拿原正则去扫 text[from:]) 更糟: `.*?` 前缀让每个位置都能当起点, 状态数对
-//    计数上界指数增长 (doc/状态数为什么会相乘.txt 里同形状差 967 倍), 等于把 FindAllIndex
+//    计数上界指数增长 (doc/状态数为什么会相乘.md 里同形状差 967 倍), 等于把 FindAllIndex
 //    刚省下来的又赔回去。这里走的是 set 自己那份程序、那份 DFA 缓存, 且真锚定。
 package hgmLibre2
 
@@ -67,14 +67,14 @@ func (s *RegexpSet) ResolveSpanBytes(text []byte, from, id int32) (pos int32, ok
 //
 //	from = 匹配右端(不含), 返回左端(含) —— text[pos:from] 就是这条 pattern 的匹配
 //
-// 这就是"补左端"该走的那条路: 单点、锚定、代价与正文长度无关。上面那层 (matchscan.go)
-// 给每条 pattern 惰性建一个【只有这一条】的反向 set, 就是为了在这里问这一句。
+// 这就是"补左端"该走的那条路: 单点、锚定、代价与正文长度无关。上面那层 (re2set_fll.go 的
+// Re2Set_fll_t) 给每条 pattern 惰性建一个【只有这一条】的反向 set, 就是为了在这里问这一句。
 func (r *RegexpSetReverse) ResolveSpan(text string, from, id int32) (pos int32, ok bool, err error) {
 	return resolveSpanWithin(r.s, text, from, -1, id)
 }
 
 // ResolveSpanWithin 同 ResolveSpan, 但限定【最远看到哪】: 反向的 bound 是左下界 (回看不越过
-// 它), 负数 = 不限。上面那层把 bound 掐在游标上 —— 那是【正确性】不是省钱, 见 matchscan.go。
+// 它), 负数 = 不限。上面那层把 bound 掐在游标上 —— 那是【正确性】不是省钱, 见 re2set_fll.go。
 func (r *RegexpSetReverse) ResolveSpanWithin(text string, from, bound, id int32) (pos int32, ok bool, err error) {
 	return resolveSpanWithin(r.s, text, from, bound, id)
 }

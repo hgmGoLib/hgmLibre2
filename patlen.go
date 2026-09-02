@@ -1,6 +1,6 @@
 // patlen.go —— 每条 pattern 的【匹配字节长度区间】(min, max), 建集期算一次。
 //
-// 用来干什么: NewMatchScanner 拿到"这条 pattern 的匹配在第几字节结束"之后, 还得知道它从哪开始。
+// 用来干什么: NewRe2Set_fll 拿到"这条 pattern 的匹配在第几字节结束"之后, 还得知道它从哪开始。
 // 怎么找开始, 完全由这个区间决定, 三档差着数量级:
 //
 //	min == max        定长 (NRIC 9 字节 · 身份证 18 字节 · 邮编…): start = end - min, 一句减法,
@@ -14,6 +14,11 @@
 //    而这只在【建集期】跑一次 (155 条 < 1ms), 所以选了不动 native 的那条。
 //    解析不出来 (RE2 支持而 Go 不支持的写法) 一律【当没上限】—— 保守方向: 只会让这条落回老路,
 //    不会给出错误的 start。
+//
+// 🔴 【别把这套理由抄到判对错的地方去】: 上面那条"解析不出来就当没上限"之所以站得住, 是因为
+//    它保守的方向恰好是安全的一侧 (慢, 但不错)。同样的写法搬到"拒空串"那道门上就是个 bug ——
+//    在那儿"解析不出来就放行"保守的方向是【不安全】的一侧, \C* 正是那么漏过去的。
+//    那道门因此改在 C 侧用 RE2 自己的解析器做, 见 emptymatch.go / cre2_emptymatch.cpp。
 package hgmLibre2
 
 import (
@@ -25,9 +30,9 @@ import (
 // PatLenUnbounded 是 max 的"没有上限"取值。
 const PatLenUnbounded = -1
 
-// PatternLenRange 算一条 pattern 的匹配字节长度区间。max = PatLenUnbounded 表示没有上限。
+// GetPatternLenRange 算一条 pattern 的匹配字节长度区间。max = PatLenUnbounded 表示没有上限。
 // pattern 解析不了时返回 (0, PatLenUnbounded) —— 与"没上限"同一档, 调用方照兜底路走即可。
-func PatternLenRange(pattern string) (min, max int) {
+func GetPatternLenRange(pattern string) (min, max int) {
 	re, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
 		return 0, PatLenUnbounded
@@ -35,9 +40,9 @@ func PatternLenRange(pattern string) (min, max int) {
 	return lenRangeOf(re) // 不 Simplify: {1000} 那种会被展开成一千个节点, 而 OpRepeat 这里本来就直接算
 }
 
-// PatternLenRange 返回集合里第 i 条的长度区间, 越界返回 (0, PatLenUnbounded)。
+// GetPatternLenRange 返回集合里第 i 条的长度区间, 越界返回 (0, PatLenUnbounded)。
 // 结果在建集期算好存着, 这里只是查表。
-func (s *RegexpSet) PatternLenRange(i int) (min, max int) {
+func (s *RegexpSet) GetPatternLenRange(i int) (min, max int) {
 	if i < 0 || i >= len(s.lens) {
 		return 0, PatLenUnbounded
 	}
@@ -53,7 +58,7 @@ type patLen_t struct {
 func buildPatLens(patterns []string) []patLen_t {
 	out := make([]patLen_t, len(patterns))
 	for i, p := range patterns {
-		lo, hi := PatternLenRange(p)
+		lo, hi := GetPatternLenRange(p)
 		if hi > maxCInt || hi < 0 {
 			hi = PatLenUnbounded
 		}

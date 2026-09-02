@@ -102,8 +102,8 @@ func MustCompileReverse(pattern string) *RegexpReverse {
 // String 返回编译时的源 pattern (不是反转后的文本 —— 反的是程序, 不是 pattern 文本)。
 func (rr *RegexpReverse) String() string { return rr.re.String() }
 
-// MaxMem 返回实际生效的内存预算 (字节)。
-func (rr *RegexpReverse) MaxMem() int64 { return rr.re.MaxMem() }
+// GetMaxMem 返回实际生效的内存预算 (字节)。
+func (rr *RegexpReverse) GetMaxMem() int64 { return rr.re.GetMaxMem() }
 
 // FreeC 立即释放原生资源, 语义与 (*Regexp).FreeC 一致 (非线程安全, 释放后不可再用)。
 func (rr *RegexpReverse) FreeC() { rr.re.FreeC() }
@@ -111,7 +111,7 @@ func (rr *RegexpReverse) FreeC() { rr.re.FreeC() }
 // MatchString 报告 s 是否含任意匹配 (非锚定) —— 命中与否与正向 Regexp.MatchString 逐字相同,
 // 只是 DFA 从正文末尾往前走【原始 buffer】(不反转正文, 不复制正文)。
 //
-// 反向程序在首次调用时惰性编出来 (线程安全, 预算用这条 pattern 的 MaxMem)。
+// 反向程序在首次调用时惰性编出来 (线程安全, 预算用这条 pattern 的 GetMaxMem)。
 // 万一反向程序编不出来 / 反向 DFA 中途放弃, 自动退回一次正向匹配: 答案永远正确, 只是那次没省到
 // 状态 (退回走的是这个对象内部自己的正向程序, 也只有退回时才会建正向那份缓存)。
 // 想知道有没有退回过, 用 MatchStats 看 FellBack。
@@ -172,7 +172,7 @@ func (rr *RegexpReverse) MatchStats(s string, st *ScanStats) bool {
 // 实践做法是把表按方向拆成两张, 各扫一遍 —— 正文过两遍 DFA 仍然远比一张表在悬崖上跑便宜
 // (两份 Match 结果按下标并集即可; 注意 Match 返回的下标【无序】, 要比对得先排)。
 // 拆之前先量: 每条 pattern 各建一个单条的正向 set 和反向 set, 用同一批真语料跑一遍比
-// MemInfo().States, 小的那边就是它该去的那一组。
+// GetMemInfo().States, 小的那边就是它该去的那一组。
 func NewRegexpSetReverseMaxMem(patterns []string, maxMem int64) (*RegexpSetReverse, error) {
 	s, err := newRegexpSet(patterns, maxMem, true)
 	if err != nil {
@@ -181,13 +181,13 @@ func NewRegexpSetReverseMaxMem(patterns []string, maxMem int64) (*RegexpSetRever
 	return &RegexpSetReverse{s: s}, nil
 }
 
-// MemInfo 查这条 pattern 的【反向程序】当前那份 DFA 缓存的水位 (字段含义同
-// (*RegexpSet).MemInfo)。没走过反向 (程序还没惰性编出来 / DFA 还没建) 返回 Built=false ——
+// GetMemInfo 查这条 pattern 的【反向程序】当前那份 DFA 缓存的水位 (字段含义同
+// (*RegexpSet).GetMemInfo)。没走过反向 (程序还没惰性编出来 / DFA 还没建) 返回 Built=false ——
 // 量具不制造被量的东西, 查询【不会】把 DFA 建出来。
 //
-// 用途与 (*RegexpSet).MemInfo 一样: 标定这条 pattern 反着走到底花了多少状态。
+// 用途与 (*RegexpSet).GetMemInfo 一样: 标定这条 pattern 反着走到底花了多少状态。
 // 单条反向的意义正是把状态数从指数塌回线性, 所以这个数应该【很小】; 大了就是选错方向了。
-func (rr *RegexpReverse) MemInfo() SetMemInfo {
+func (rr *RegexpReverse) GetMemInfo() SetMemInfo {
 	var mi C.cre2_set_mem
 	C.cre2_rev_mem_info(rr.re.h, &mi)
 	runtime.KeepAlive(rr.re)

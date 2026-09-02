@@ -1,20 +1,20 @@
-// spanviable.go —— ViableStarts: 给一个匹配【右端】, 把它左边全部【候选起点】收下来。
+// spanviable.go —— GetViableStarts: 给一个匹配【右端】, 把它左边全部【候选起点】收下来。
 //
 // ── 它和 ResolveSpan 差在哪 (只有一处, 但是决定性的) ─────────────────────────
 // 反向 set 的 ResolveSpan  : 反向机器只种【accept】—— 回答的是"哪些 s 使 text[s,e) 【正好】
 //                            是一个匹配", 而且只给最靠左的那一个。
-// 反向 set 的 ViableStarts : 反向机器种【全部指令】—— 回答的是"哪些 s 起头的匹配【路过】了 e",
+// 反向 set 的 GetViableStarts : 反向机器种【全部指令】—— 回答的是"哪些 s 起头的匹配【路过】了 e",
 //                            即 text[s,e) 是个【可行前缀】(还能被某个后缀补成真匹配)。
 //                            后者是前者的超集, 而且【全部】给出来。
 //
-// 🔴 为什么需要这个超集: 门 (正向 set + kManyMatch) 只给右端, 不给"起点终点的配对"。
-//    拿最小的那个右端去只种 accept 地回推, 得到的起点未必是真正的最左起点 ——
-//      \b(?:ab cd ef|cd)\b 撞 "ab cd ef": 门给的最小右端是 "cd" 那一处的右端 (偏移 5),
+// 🔴 为什么需要这个超集: 第一趟正向扫描 (正向 set + kManyMatch) 只给右端, 不给"起点终点的
+//    配对"。拿最小的那个右端去只种 accept 地回推, 得到的起点未必是真正的最左起点 ——
+//      \b(?:ab cd ef|cd)\b 撞 "ab cd ef": 扫描给的最小右端是 "cd" 那一处的右端 (偏移 5),
 //      只种 accept 只能回推到 3 ("cd" 的左端); 而真正的 leftmost 起点是 0 ——
 //      text[0:5) = "ab cd" 【不是】匹配, 但它是可行前缀 (再补 " ef" 就成了)。
-//    种全部状态才看得见 0 这个候选。2026-08-28 之前 MatchScanner 有一档 spanFast 走的正是
+//    种全部状态才看得见 0 这个候选。2026-08-28 之前 Re2Set_fll_t 有一档 spanFast 走的正是
 //    "只种 accept"那条路 (老的"路 A"), 上面这个例子就是它那个"第三种口径"的病根;
-//    整档删了, 现在 MatchScanner 补起点【只走本函数这一条路】, 换来的就是严格 leftmost-longest。
+//    整档删了, 现在 Re2Set_fll_t 补起点【只走本函数这一条路】, 换来的就是严格 leftmost-longest。
 //
 // 🔴 为什么"种全部状态"就等于可行前缀 (证明): 反向 set 的程序 R 认的是 reverse(L)。
 //    这一趟从 e 往左吃字节, 吃进去的串正好是 reverse(text[s,e)); 种子是 R 的【全部活状态】,
@@ -41,7 +41,7 @@ import (
 	"unsafe"
 )
 
-// ViableStarts 把 [bound, from) 里全部候选起点写进 out, 返回【找到的总条数】n。
+// GetViableStarts 把 [bound, from) 里全部候选起点写进 out, 返回【找到的总条数】n。
 //
 //	from  匹配右端 (不含) —— 就是正向 set 的 FindAllIndex 吐出来的那种端点;
 //	bound 回看的左下界 (含), 负数 = 不限。判定用的上下文恒是【整篇正文】, 所以 \b / ^ / $
@@ -56,7 +56,7 @@ import (
 // 🔴 from 这个位置本身【不算】候选 (text[from:from) 是空的可行前缀, 对调用方没有意义)。
 //
 // 无状态、只读 (自己拿 DFA 的缓存读锁), 可以和别的 goroutine 的扫描并发调。
-func (r *RegexpSetReverse) ViableStarts(text string, from, bound, id int32, out []int32) (n int, err error) {
+func (r *RegexpSetReverse) GetViableStarts(text string, from, bound, id int32, out []int32) (n int, err error) {
 	s := r.s
 	if s.size == 0 {
 		return 0, errors.New("re2native: viable starts on empty set")
