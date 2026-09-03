@@ -202,6 +202,9 @@ func main() {
   stdlib **没有**; **锚定在 `from`** 且不越过 `bound` 的搜索, 偏移仍按原串计,
   所以 `\b` / `^` / `$` 看到的还是真邻居。配上 longest 模式的对象, 它就是单条 pattern 的
   `ResolveSpan` —— 但它走 `RE2::Match`, 因而继承了 set 那条路没有的 NFA 回落
+- `Regexp.FindStringIndexFrom`(同样有 `FindStringIndex_ctx_t` 上的零分配版)——
+  stdlib **没有**; 与上面那条的差别**只有"锚不锚"**: 这个是"起点**不早于** `pos`",
+  上面那个是"起点**就是** `from`"。偏移同样按原串计
 - `RegexpReverse.ResolveSpanWithin` —— stdlib **没有**;
   `RegexpSetReverse.ResolveSpanWithin` 的单条孪生: 给一个匹配末端, 求最左的起点, 带上界。
   实现就是 `RE2::Match` 内部找左端时发的那一句(反向 program + `kAnchored` + `kLongestMatch`)
